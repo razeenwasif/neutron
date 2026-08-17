@@ -32,7 +32,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/razeen/neutron"
+repository = "https://github.com/razeenwasif/neutron"
 
 [workspace.dependencies]
 # --- internal ---
