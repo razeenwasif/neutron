@@ -1,0 +1,33 @@
+[package]
+name = "neutron-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "neutron"
+path = "src/main.rs"
+
+[dependencies]
+neutron-core.workspace = true
+neutron-ui.workspace = true
+neutron-shell.workspace = true
+neutron-fuzzy.workspace = true
+neutron-index.workspace = true
+neutron-cloud.workspace = true
+
+egui.workspace = true
+eframe.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Version must track eframe's, since the handle crosses the API boundary.
+raw-window-handle = "0.6"
+
+[build-dependencies]
+winresource = "0.1"

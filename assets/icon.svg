@@ -1,0 +1,50 @@
+<!--
+  Neutron application icon.
+
+  A folder with a document peeking out — says "file explorer" at a glance, which
+  a purely abstract mark would not. Colours come from the Prism ramp used
+  throughout the UI (see neutron-ui/src/theme.rs), so the icon and the app read
+  as the same product.
+
+  Flat fills, no gradients or <defs>: ImageMagick's built-in SVG renderer
+  silently ignores gradient definitions and falls back to black, and flat colour
+  survives downscaling to 16px far better anyway. Depth comes from the two
+  panels differing in value, not from shading.
+
+  Drawn for legibility at 16px first — two large shapes with one light accent
+  between them. Fine detail is deliberately absent, because at taskbar size it
+  turns to mush.
+-->
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <!-- Back panel with the folder tab. Deeper purple, so the front reads nearer. -->
+  <path fill="#6A25BC"
+        d="M22 74
+           a18 18 0 0 1 18-18
+           h58
+           l22 22
+           h98
+           a18 18 0 0 1 18 18
+           v100
+           a18 18 0 0 1 -18 18
+           H40
+           a18 18 0 0 1 -18 -18
+           Z"/>
+
+  <!-- Document, sitting between the panels. -->
+  <rect x="78" y="82" width="100" height="82" rx="9" fill="#F5EEFF"/>
+  <rect x="95" y="104" width="66" height="8" rx="4" fill="#B785F2"/>
+  <rect x="95" y="122" width="46" height="8" rx="4" fill="#D7BFFF"/>
+
+  <!-- Front panel. -->
+  <path fill="#9747FF"
+        d="M22 124
+           h212
+           v70
+           a18 18 0 0 1 -18 18
+           H40
+           a18 18 0 0 1 -18 -18
+           Z"/>
+
+  <!-- Rim light along the front's top edge — the same cue the glass panels use. -->
+  <rect x="22" y="124" width="212" height="3" fill="#D7BFFF"/>
+</svg>

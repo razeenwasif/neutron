@@ -1,0 +1,8 @@
+# `cargo xtask <cmd>` drives the Windows build from WSL. See xtask/src/main.rs
+# for why a plain `cargo build` cannot target Windows directly from here.
+[alias]
+xtask = "run --quiet --package xtask --"
+
+# Linux-side builds exist only to run the pure-logic unit tests fast
+# (neutron-core, neutron-ui, neutron-fuzzy). The shipped artifact is always
+# built by the Windows toolchain through xtask.

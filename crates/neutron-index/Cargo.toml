@@ -1,0 +1,28 @@
+[package]
+name = "neutron-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+neutron-core.workspace = true
+neutron-fuzzy.workspace = true
+crossbeam-channel.workspace = true
+rayon.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_System_WindowsProgramming",
+]

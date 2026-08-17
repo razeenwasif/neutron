@@ -1,0 +1,366 @@
+# Performance baseline
+
+Measured numbers, not estimates. Every figure came from running the actual
+binary on the target machine.
+
+Re-measure after each milestone and update this file. A target that is never
+checked is decoration.
+
+**Machine:** Windows 11, WSL2 host, 6 fixed NTFS volumes (A, B, C, F, G, I),
+hybrid graphics (integrated + discrete).
+
+---
+
+## ⚠ Measuring from WSL: `WSLENV` is mandatory
+
+Environment variables set in a WSL shell **do not reach a Windows process**
+unless they are also named in `WSLENV`:
+
+```bash
+NEUTRON_LOG=debug ./neutron.exe              # variable never arrives
+WSLENV=NEUTRON_LOG NEUTRON_LOG=debug ./neutron.exe   # correct
+```
+
+This is not a footnote — it silently invalidated a whole round of measurement
+here. An earlier version of this document reported a backend comparison
+(“Vulkan is 35% slower than DX12”) that was **wrong**: `NEUTRON_GPU_BACKEND`
+never reached the process, so all three "backends" were the DX12 default and
+the table was recording nothing but run-to-run variance. The same problem had
+already bitten the build wrapper via `CARGO_TARGET_DIR`, which is why `xtask`
+passes `--target-dir` as a flag instead.
+
+**Any measurement configured through an environment variable must set `WSLENV`,
+and should be sanity-checked by confirming the setting actually took effect.**
+
+---
+
+## M1 — real browsing (2026-08-14)
+
+Release build, `neutron.exe` ~11 MB.
+
+### Directory scaling — `neutron --bench <path> <iterations>`
+
+Enumerate and sort measured headless, so the numbers are not confounded by GPU
+bring-up or frame pacing. First iteration is reported but excluded from the
+summary; it warms the OS directory cache, and averaging a cold run with warm
+runs measures neither.
+
+| Directory | Entries | Enumerate | Sort | Total | µs/entry |
+|---|---:|---:|---:|---:|---:|
+| `C:\Windows\System32` | 5,020 | 2.4 ms | 1.0 ms | **3.4 ms** | 0.67 |
+| `C:\Windows\WinSxS` | 27,437 | 42.8 ms | 23.3 ms | **66 ms** | 2.45 |
+| synthetic bench dir | 100,200 | 53.4 ms | 34.8 ms | **88 ms** | 0.88 |
+
+**100k target: 88 ms against a 200 ms budget — 2.3× under.** ✅
+
+WinSxS costs ~3× more per entry than the synthetic directory despite being
+smaller. Its entries are almost all directories with long, near-identical names
+(`amd64_microsoft-windows-…`), so the natural-order comparison has to walk deep
+into each string before it can decide. Worth remembering as the realistic
+worst case: per-entry cost depends on name length and shared prefixes, not just
+entry count.
+
+### Frame time — scrolling a 100,200-entry directory
+
+Measured around the app's `ui()` body: the cost of *building* a frame,
+excluding GPU submission and vsync wait.
+
+| Metric | Value | Budget |
+|---|---:|---:|
+| p50 | **0.14 ms** | — |
+| p99 | **0.40 ms** | 8 ms ✅ |
+
+Sustained over 300 PageDown presses through the full list. **20× under budget**,
+and effectively identical to the same measurement on a small directory — which
+is the entire point of virtualizing: `ScrollArea::show_rows` renders roughly 30
+rows whether the directory holds 30 entries or 500,000.
+
+> An earlier version of this metric timed the *interval between* frames rather
+> than the cost of building one. That conflates idle throttling with slowness,
+> and reported ~9 ms where the real figure is 0.14 ms. (At the time the ambient
+> layer was animated and capped repaints at ~30fps, which is what the interval
+> was really measuring; it is static now.)
+
+### Cold start
+
+| Phase | Time | What it covers |
+|---|---:|---|
+| `setup` | 0 ms | Logging init, option construction |
+| `gpu` | ~720–1570 ms | winit window + wgpu adapter, device, surface |
+| `paint` | 2–5 ms | Building and rendering the first frame |
+
+**GPU bring-up is ~99% of cold start.** Our own frame construction is 2–5 ms.
+
+#### Backend comparison (6 runs each, `WSLENV` correctly set)
+
+| Backend | Median | Min | Max |
+|---|---:|---:|---:|
+| **DX12** (selected) | **1040 ms** | 722 ms | 1571 ms |
+| GL | 1618 ms | 1007 ms | 1984 ms |
+| Vulkan (wgpu default) | 1974 ms | 1013 ms | 2173 ms |
+
+DX12 is the fastest of the three at the median, by a wide margin. Two caveats
+worth keeping honest:
+
+* **Run-to-run variance is enormous** — DX12 alone spans 722–1571 ms. Any
+  comparison based on one run per backend is meaningless, which is precisely
+  how the earlier invalid table got written.
+* A second, independent reason to prefer DX12: the Vulkan loader enumerates
+  every registered layer at instance creation, and the logs showed it pulling
+  OBS capture-hook DLLs into the process before the first frame. That is an
+  observed fact rather than an inference, and it holds regardless of timing.
+
+Both backend and power preference stay overridable (`NEUTRON_GPU_BACKEND`,
+`NEUTRON_GPU_POWER`) so this table can be regenerated on other hardware.
+
+### Memory — 100k-entry directory open, idle
+
+| Metric | Value |
+|---|---:|
+| Working set | ~280 MB |
+| Private bytes | ~470 MB |
+| Threads | 43 |
+
+Dominated by the wgpu/DX12 stack and driver allocations. The 100k-entry
+`EntryList` itself is small: one string arena plus eight parallel arrays, on the
+order of 6 MB.
+
+### Idle CPU — window open, focused, untouched
+
+| Build | CPU over the sample | Share of one core |
+|---|---:|---:|
+| Animated background, per-frame title push | 44 ms / 5 s | 8.8% |
+| After both fixes | 0 ms / 5 s | 0.0% |
+| With the static prismatic ground (2026-08-17) | 16 ms / 6 s | 0.3% |
+
+egui only repaints in response to input or an explicit request, so an idle
+window should cost nothing. Two things were quietly preventing that:
+
+1. **An animated background.** Drifting the ground's colour fields required
+   `request_repaint_after(33ms)` forever — a decoration holding the event loop
+   permanently awake. The orbs are now static, which is why they can exist at
+   all.
+2. **`ViewportCommand::Title` sent every frame.** The title only changes when
+   the focused tab does, but it was pushed unconditionally from `drain_loads`,
+   and issuing any viewport command wakes the loop. Now gated on a stored
+   `last_title`.
+
+The 0.3% reading is the whole-window redraw the compositor asks for
+occasionally, not a spin — the background itself is four triangle fans, ~500
+triangles, submitted only when a frame is being drawn anyway.
+
+**Watch for this.** Anything that calls `request_repaint`, `request_repaint_after`
+or `send_viewport_cmd` unconditionally in the frame path costs a permanently
+awake event loop, and it is invisible in frame-time numbers: p99 frame build was
+0.40 ms throughout, because each frame really was fast. There were just tens of
+thousands of them that nobody asked for.
+
+---
+
+## Targets vs. reality
+
+| Metric | Target | Actual | Status |
+|---|---:|---:|---|
+| Enumerate 100k-file dir | <200 ms | 88 ms | ✅ 2.3× under |
+| Frame time p99 scrolling | <8 ms | 0.40 ms | ✅ 20× under |
+| Cold start | <100 ms | ~1040 ms | ❌ **not achievable as architected** |
+| Idle memory | <60 MB | ~280 MB | ❌ **not achievable as architected** |
+| Idle CPU | ~0% | 0.3% | ✅ |
+| Binary size | ~15 MB | 11 MB | ✅ |
+
+### The two failures are the same failure
+
+Both come from one decision: a GPU-accelerated renderer. Creating a D3D12
+device, allocating a swapchain, and compiling the first pipeline costs the best
+part of a second and a few hundred megabytes of driver-side allocation before a
+single pixel of *our* UI exists. No optimization of Neutron's code moves either
+number — which is exactly what `paint 2ms` and `p99 0.40ms` prove.
+
+The `<100 ms` figure was projected from egui's reputation for fast frames. That
+reputation is about *steady-state* frame time, where the measured 0.14 ms
+genuinely is excellent; it was wrong to extend it to process startup.
+
+### Options, if these targets matter
+
+1. **Revise the targets.** ~1 s is ordinary for a GPU desktop app. Explorer only
+   feels instant because `explorer.exe` is already running as the shell.
+2. **Warm-start helper.** Keep a preloaded process resident so perceived launch
+   is instant — the same advantage Explorer gets for free, and the only approach
+   that reaches "instant" while keeping the GPU renderer.
+3. **Change renderer.** A CPU-rasterized or Direct2D backend would start far
+   faster and use far less memory, at the cost of the icon-atlas and
+   smooth-scrolling work that motivated wgpu.
+
+Steady-state performance — the thing the project is actually about, and where
+Explorer really does fall over — is unaffected by any of this.
+
+---
+
+## Pending metrics
+
+| Metric | Target | Milestone |
+|---|---:|---|
+| Full index, all 6 volumes | <10 s | M4 |
+| Search query latency | <1 ms | M4 |
+
+## M3 — shell integration (2026-08-17)
+
+| Metric | Target | Actual |
+|---|---|---|
+| Icon resolution off the UI thread | no frame impact | ✅ — resolved on the STA pool, drawn from an atlas; rows never wait |
+| Distinct icons for `C:\Windows\System32` (5,010 entries) | — | **7** |
+| Idle CPU with a context menu open | — | 0.0 ms / 4 s |
+
+The icon count is the whole design in one number: keyed by extension rather than
+by file, 5,010 entries need seven lookups. Executables are the exception and are
+keyed per path, which is why the count rises as `.exe` files scroll into view.
+
+Not measured, and worth doing before M4: enumerate time for a directory of many
+*distinct* extensions, where the per-frame submission cap (48 keys) rather than
+the cache is the limit.
+
+## M4 — index and search (2026-08-17)
+
+Release build, run elevated. Six fixed volumes; B: and G: have no USN journal
+and are skipped.
+
+### Indexing
+
+| Volume | Records | Cold run | Warm run | µs/record (warm) |
+|---|---:|---:|---:|---:|
+| A: | 178,050 | 1,410 ms | 458 ms | 2.58 |
+| C: | 1,395,666 | 8,464 ms | 2,623 ms | 1.88 |
+| F: | 1,657,296 | 15,729 ms | 2,614 ms | 1.58 |
+| I: | 56,387 | 9,071 ms | 219 ms | 3.89 |
+| **total** | **3,287,399** | **34.68 s** | **2.62 s** | — |
+
+**Target <10s: met on the warm run at 2.62s, missed cold at 34.7s.**
+
+Three changes separate the runs:
+
+* **Volumes index in parallel.** They are independent and usually separate
+  physical devices, so wall time becomes the slowest volume rather than the sum.
+* **The sort is skipped.** `FSCTL_ENUM_USN_DATA` already returns ascending FRN
+  order, so `build` verifies rather than sorts — `sort_unstable_by_key` over
+  three million `RawRecord`s moves a 48-byte struct carrying an owned `String`
+  on every swap.
+* **The FRN map uses a multiply, not SipHash.** File reference numbers are dense
+  and filesystem-assigned, not attacker-chosen, so a cryptographic mixer is work
+  done for nothing three million times.
+
+> **The two runs are not a clean comparison.** The second ran against a warm MFT
+> cache. `I:` is the tell: 160.88 → 3.89 µs/record is 41×, which no amount of
+> skipped sorting explains for 56k records — that volume's cold cost was device
+> I/O. Some part of C:'s and F:'s improvement is warmth too, and separating them
+> needs a reboot between runs. **Treat 2.62s as the warm figure and expect the
+> first index after a boot to be several times that.**
+
+### Query latency
+
+Against all 3.29M records.
+
+| Query | Matches | Full scan | Next keystroke | Which path |
+|---|---:|---:|---:|---|
+| `e` | 2,280,312 | 5.78 ms | 10.54 ms | rescan (capped) |
+| `config` | 16,356 | 9.39 ms | 9.04 ms | rescan (capped) |
+| `neutron` | 639 | 8.69 ms | 0.025 ms | narrow |
+| `setup.exe` | 109 | 7.45 ms | 0.003 ms | narrow |
+
+**Target <1ms: met for the incremental path, missed for a full scan at 6–9ms.**
+
+The narrowing works exactly as designed — once a result set is complete, further
+typing is effectively free. The gap is the first character of any query, and any
+query whose result set stays above the 4,096 hit cap, since a capped set cannot
+be narrowed without hiding matches.
+
+8ms is half a frame, so this is below the threshold where a keystroke feels
+delayed — but the target says <1ms and it is not met, which is worth stating
+plainly rather than redefining. Closing it would mean an n-gram or suffix
+structure over the name arena, which is a real memory cost for a latency nobody
+can perceive; not obviously worth it.
+
+### Memory
+
+202 MB resident for 3.29M records, in the helper process rather than the UI.
+Roughly: names ~100MB, FRNs 26MB, parents 13MB, offsets 13MB.
+
+## M5 — finder and command palette (2026-08-17)
+
+| Path | Corpus | Measured |
+|---|---|---:|
+| `Ctrl+P` fuzzy, scoped to one folder | 3.29M records scanned, scoped | **14.3 ms** |
+| `Ctrl+Shift+P` command palette | 21 commands, in-process | instant |
+| `Ctrl+Shift+F` substring, global | 3.29M records | 6–9 ms |
+
+The scoped fuzzy search is three stages, each feeding the next a smaller set:
+
+1. A subsequence test over every name — no allocation, rejects almost
+   everything, and cannot reject anything the scorer could have matched.
+2. Path reconstruction and a scope prefix test, only for survivors.
+3. Real fuzzy scoring, only for what is left.
+
+Order matters: reconstructing a path costs a parent-chain walk, so doing it
+before the subsequence gate would pay that walk 3.3 million times per keystroke.
+
+14.3 ms is slower than the global substring search despite touching fewer
+candidates, which is the expected shape — fuzzy scoring is far more expensive
+per candidate, and the parent walk for survivors is not free. It is still under
+a frame.
+
+> **The one-off indexing cost is variable.** This session's restart took 10.5s
+> against 2.6s earlier, on the same machine and binary. Cache state is the
+> difference, as documented above — worth remembering before reading any single
+> index timing as the number.
+
+## M6 — shell namespace (2026-08-18)
+
+| Location | Items | Enumerate |
+|---|---:|---:|
+| This PC | 8 | 79 ms |
+| Recycle Bin | 9 | — |
+| Inside a zip | 2 | — |
+
+79ms for eight items is three orders of magnitude worse per entry than the
+filesystem path, and that is expected rather than a regression: each item costs
+a `GetAttributesOf`, a `GetDisplayNameOf`, an `ILCombine` and an
+`SHGetNameFromIDList`, all COM, and the drive entries additionally spin up
+volume queries. It is why the dispatch exists — ordinary directories must never
+take this path.
+
+Neither size nor timestamps are read for shell items. `IShellFolder2::GetDetailsEx`
+would supply them at a COM call per column per row; these places are browsed,
+not audited, and a blank column beats a listing that takes a second.
+
+### Not yet re-measured
+
+The UI was rebuilt on 2026-08-17 — translucent cards over a static three-orb
+ground, per-pane headers, 36pt rows. Idle CPU was re-measured (above); enumerate,
+frame time, cold start and memory were not, since none of those paths changed.
+The background is a fixed ~500 triangles regardless of window size and the
+listing still paints only visible rows, so frame time should be unmoved — but
+that is reasoning, not a measurement, and it is worth confirming before the next
+milestone's numbers are quoted against it.
+
+---
+
+## Reproducing
+
+```bash
+cargo xtask build -- --release
+
+# Directory scaling (headless).
+cd /mnt/c && ./Users/Razeen/.neutron-target/release/neutron.exe \
+    --bench 'C:\Windows\WinSxS' 6
+
+# Frame time while scrolling — note WSLENV.
+WSLENV=NEUTRON_LOG NEUTRON_LOG=debug ./neutron.exe 'C:\some\big\folder'
+```
+
+The 100k-entry directory is synthetic; recreate it with
+[`scripts/make-bench-dir.ps1`](../scripts/make-bench-dir.ps1). It is not kept on
+disk between runs.
+
+> Killing the WSL-side wrapper (Ctrl-C, `timeout`) does **not** kill the Windows
+> process. Stale instances hold a lock on `neutron.exe` and make the next build
+> fail with "Access is denied". Clear them with
+> `taskkill.exe /IM neutron.exe /F`.

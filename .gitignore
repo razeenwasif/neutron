@@ -1,0 +1,15 @@
+/target
+target/
+**/*.rs.bk
+*.pdb
+
+# Windows-side target dir used by xtask
+.neutron-target/
+
+# Local secrets: Google Drive OAuth client, etc.
+.env
+secrets.toml
+
+# WSL surfaces NTFS alternate data streams as separate files. These appear
+# beside anything downloaded on the Windows side and are pure noise.
+*:Zone.Identifier
