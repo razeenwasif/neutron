@@ -10,3 +10,10 @@ where
 {
     Err("context menus are Windows-only".to_owned())
 }
+
+pub fn open_background<F>(_folder: &std::path::Path, _choose: F) -> Result<(), String>
+where
+    F: FnOnce(Vec<MenuItem>) -> Option<u32>,
+{
+    Err("context menus are Windows-only".to_owned())
+}

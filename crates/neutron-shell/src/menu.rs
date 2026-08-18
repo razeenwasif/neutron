@@ -66,7 +66,7 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFOEX, GCS_VERBW, IContextMenu, IContextMenu2,
-    IContextMenu3, IShellFolder, SHBindToParent, SHParseDisplayName,
+    IContextMenu3, IShellFolder, SHBindToObject, SHBindToParent, SHParseDisplayName,
 };
 
 use neutron_core::menu::{MenuItem, parse_label, tidy};
@@ -137,19 +137,62 @@ where
     let menu: IContextMenu = unsafe { folder.GetUIObjectOf(window_placeholder(), &children, None) }
         .map_err(|e| format!("no context menu for this item: {}", e.message()))?;
 
+    present(menu, CMF_NORMAL | CMF_EXPLORE, choose)
+}
+
+/// Builds the context menu for a folder's *background* — the one with New,
+/// Paste, Sort by and Properties, which Explorer shows on empty space.
+///
+/// **STA pool only**, same contract as [`open`].
+///
+/// A different COM object entirely from the item menu: `GetUIObjectOf` asks a
+/// folder about the things *inside* it, while `CreateViewObject` asks the
+/// folder about itself. Showing the folder's own item menu here instead — which
+/// is what happens if you take the obvious shortcut of selecting nothing and
+/// reusing [`open`] — offers Cut, Copy and Delete for the folder you are
+/// standing in, which is actively dangerous.
+pub fn open_background<F>(folder: &Path, choose: F) -> Result<(), String>
+where
+    F: FnOnce(Vec<MenuItem>) -> Option<u32>,
+{
+    let pidl = Pidl::parse(folder)?;
+
+    // SAFETY: `pidl` is a valid absolute PIDL; a null parent folder means "bind
+    // from the desktop", which is how an absolute PIDL is resolved.
+    let shell_folder: IShellFolder = unsafe { SHBindToObject(None, pidl.0, None) }
+        .map_err(|e| format!("could not open this folder: {}", e.message()))?;
+
+    // SAFETY: `shell_folder` is live; a null owner window is allowed, and the
+    // real one is created below.
+    let menu: IContextMenu = unsafe { shell_folder.CreateViewObject(window_placeholder()) }
+        .map_err(|e| format!("no background menu for this folder: {}", e.message()))?;
+
+    // No CMF_EXPLORE: the background menu has no tree-pane variant, and asking
+    // for one gets the same menu with an extra separator.
+    present(menu, CMF_NORMAL, choose)
+}
+
+/// Reads a populated `IContextMenu` into plain data, shows it through `choose`,
+/// and invokes the answer.
+///
+/// Shared by the item and background menus, which differ only in where the
+/// interface came from.
+fn present<F>(
+    menu: IContextMenu,
+    flags: u32,
+    choose: F,
+) -> Result<(), String>
+where
+    F: FnOnce(Vec<MenuItem>) -> Option<u32>,
+{
     let window = HiddenWindow::new()?;
     let popup = Popup::new()?;
 
-    // CMF_EXPLORE asks for the menu Explorer's file pane shows, rather than the
-    // shorter desktop-style one.
-    //
     // Returns a raw HRESULT rather than a Result: on success its low word is
     // the number of items added, so a plain `?` would reject every populated
     // menu as an error.
     // SAFETY: `popup` is a live empty menu; the id range is ours to hand out.
-    let hr = unsafe {
-        menu.QueryContextMenu(popup.0, 0, CMD_FIRST, CMD_LAST, CMF_NORMAL | CMF_EXPLORE)
-    };
+    let hr = unsafe { menu.QueryContextMenu(popup.0, 0, CMD_FIRST, CMD_LAST, flags) };
     if hr.is_err() {
         return Err(format!("could not build the menu: {}", hr.message()));
     }
@@ -160,7 +203,7 @@ where
     ACTIVE.with(|a| *a.borrow_mut() = None);
 
     if items.is_empty() {
-        return Err("the shell offered no commands for this item".to_owned());
+        return Err("the shell offered no commands here".to_owned());
     }
 
     if let Some(id) = choose(items) {

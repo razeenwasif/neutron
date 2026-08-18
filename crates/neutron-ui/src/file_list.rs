@@ -282,26 +282,24 @@ fn show_list(
             }
         }
 
-
-        // Clicking below the last row clears the selection, as in Explorer.
-        let leftover = ui.available_size();
-        if leftover.y > 0.0 {
-            let (rect, response) = ui.allocate_exact_size(leftover, Sense::click());
-            if response.clicked() {
-                action = Some(FileListAction::ClearSelection);
-            }
-            if response.secondary_clicked() {
-                action = Some(FileListAction::ContextMenu {
-                    idx: None,
-                    pos: response
-                        .interact_pointer_pos()
-                        .unwrap_or_else(|| rect.center()),
-                });
-            }
-        }
     });
 
     state.scroll_offset = output.state.offset.y;
+
+    // Empty space below the last row: clears the selection, or opens the
+    // folder's own menu.
+    //
+    // Handled here against the viewport rather than inside the scroll closure,
+    // where the obvious `ui.available_size()` is zero — `show_rows` sizes its
+    // content to exactly the rows it was told about, so there is no leftover to
+    // allocate and the whole area was dead. Clicking below the files did
+    // nothing at all.
+    if let Some(dead) = dead_space(viewport, row_count as f32 * ROW_HEIGHT, output.state.offset.y)
+    {
+        if let Some(a) = empty_space(ui, dead) {
+            action = Some(a);
+        }
+    }
 
     // Rubber band, tracked after the rows so it paints over them.
     let start_area =
@@ -569,6 +567,41 @@ fn header(
 }
 
 const RADIUS_SMALL_F: f32 = 8.0;
+
+/// The part of `viewport` below the last row, or `None` when the content fills
+/// it.
+///
+/// `content_height` is the height of every row, not only the drawn ones.
+fn dead_space(viewport: Rect, content_height: f32, scroll_offset: f32) -> Option<Rect> {
+    let bottom_of_content = viewport.top() + (content_height - scroll_offset);
+    (bottom_of_content < viewport.bottom()).then(|| {
+        Rect::from_min_max(
+            pos2(viewport.left(), bottom_of_content.max(viewport.top())),
+            viewport.max,
+        )
+    })
+}
+
+/// Clicks on the empty area below the files.
+///
+/// Left clears the selection and right opens the folder's own menu — the one
+/// with New and Paste — both as Explorer does.
+fn empty_space(ui: &Ui, rect: Rect) -> Option<FileListAction> {
+    let response = ui.interact(rect, ui.id().with("empty-space"), Sense::click());
+
+    if response.clicked() {
+        return Some(FileListAction::ClearSelection);
+    }
+    if response.secondary_clicked() {
+        return Some(FileListAction::ContextMenu {
+            idx: None,
+            pos: response
+                .interact_pointer_pos()
+                .unwrap_or_else(|| rect.center()),
+        });
+    }
+    None
+}
 
 /// The id of the rename box for the `generation`-th rename.
 ///
@@ -1008,6 +1041,14 @@ fn show_grid(
 
     state.scroll_offset = output.state.offset.y;
 
+    // See the list view: `show_rows` leaves no allocatable space after the
+    // tiles, so the area below them has to be interacted with directly.
+    if let Some(dead) = dead_space(viewport, rows as f32 * row_pitch, output.state.offset.y) {
+        if let Some(a) = empty_space(ui, dead) {
+            action = Some(a);
+        }
+    }
+
     let start_area =
         band_start_area(ui.spacing().scroll, viewport, output.content_size.y > viewport.height());
     let band = track_band(ui, viewport, start_area, output.state.offset.y);
@@ -1230,6 +1271,40 @@ mod tests {
     /// Guards the redesign: 26pt rows were part of what made the list read as a
     /// 2005 file manager. Checked at compile time, since it is a constant.
     const _: () = assert!(ROW_HEIGHT >= 30.0);
+
+    #[test]
+    fn a_short_listing_leaves_dead_space_below_it() {
+        let viewport = Rect::from_min_size(pos2(0.0, 100.0), egui::vec2(400.0, 300.0));
+        let dead = dead_space(viewport, 50.0, 0.0).expect("one row in a tall pane");
+        assert_eq!(dead.top(), 150.0);
+        assert_eq!(dead.bottom(), viewport.bottom());
+    }
+
+    #[test]
+    fn a_full_listing_leaves_none() {
+        // Clicking "below the files" when there is no below must not clear the
+        // selection out from under a click meant for a row.
+        let viewport = Rect::from_min_size(pos2(0.0, 100.0), egui::vec2(400.0, 300.0));
+        assert!(dead_space(viewport, 900.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn scrolling_to_the_end_of_a_long_listing_can_expose_dead_space() {
+        // The content is taller than the viewport, but scrolled far enough that
+        // its end is on screen with room to spare.
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let dead = dead_space(viewport, 900.0, 800.0).expect("scrolled past the end");
+        assert_eq!(dead.top(), 100.0);
+    }
+
+    #[test]
+    fn dead_space_never_starts_above_the_viewport() {
+        // An over-scrolled offset would otherwise put the rect's top above the
+        // list and swallow clicks on the rows.
+        let viewport = Rect::from_min_size(pos2(0.0, 100.0), egui::vec2(400.0, 300.0));
+        let dead = dead_space(viewport, 50.0, 400.0).unwrap();
+        assert!(dead.top() >= viewport.top());
+    }
 
     #[test]
     fn a_band_may_not_start_on_the_scroll_bar() {

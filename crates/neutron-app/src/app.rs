@@ -1183,12 +1183,27 @@ impl NeutronApp {
             }
         }
 
-        // With nothing selected the menu would be for the folder itself. That
-        // needs a different IContextMenu (the background menu, with New and
-        // Paste); until it exists, showing the folder's own item menu would be
-        // actively misleading.
-        let Some((tab_id, _, paths)) = self.selection_paths() else {
-            return;
+        // Nothing selected means the click was on empty space, and the menu is
+        // the folder's own — New, Paste, Sort by. A different COM object, so it
+        // is fetched differently below.
+        let background = self.selection_paths();
+        let (tab_id, dir, paths) = match background {
+            Some(found) => found,
+            None => {
+                let Some(tab_id) = self.workspace.active_tab_id() else {
+                    return;
+                };
+                let Some(dir) = self
+                    .workspace
+                    .tabs
+                    .get(&tab_id)
+                    .and_then(|t| t.location().as_path())
+                    .map(|p| p.to_path_buf())
+                else {
+                    return;
+                };
+                (tab_id, dir, Vec::new())
+            }
         };
 
         // A menu already up is replaced, not stacked. Dropping the reply
@@ -1203,7 +1218,7 @@ impl NeutronApp {
         self.sta.submit(move || {
             // Blocks this apartment for as long as the menu is open. The UI
             // thread keeps painting — that is the entire reason it is here.
-            let result = neutron_shell::menu::open(&paths, |items| {
+            let present = |items: Vec<neutron_core::MenuItem>| {
                 // The shell's menu, now plain data. Hand it to the UI and wait
                 // for the answer; the COM object stays on this thread.
                 let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
@@ -1215,7 +1230,13 @@ impl NeutronApp {
                 // window, or a second right-click replacing this menu. Either
                 // way there is nothing to invoke.
                 reply_rx.recv().unwrap_or(None)
-            });
+            };
+
+            let result = if paths.is_empty() {
+                neutron_shell::menu::open_background(&dir, present)
+            } else {
+                neutron_shell::menu::open(&paths, present)
+            };
             if let Err(e) = result {
                 tracing::warn!("context menu: {e}");
             }
