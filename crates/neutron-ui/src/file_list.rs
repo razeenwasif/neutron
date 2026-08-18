@@ -254,7 +254,9 @@ fn show_list(
     state.scroll_offset = output.state.offset.y;
 
     // Rubber band, tracked after the rows so it paints over them.
-    let band = track_band(ui, viewport, output.state.offset.y);
+    let start_area =
+        band_start_area(ui.spacing().scroll, viewport, output.content_size.y > viewport.height());
+    let band = track_band(ui, viewport, start_area, output.state.offset.y);
     if let Some(rect) = band.rect {
         draw_band(ui, p, rect, viewport, output.state.offset.y);
 
@@ -306,9 +308,46 @@ fn band_origin_id(ui: &Ui) -> egui::Id {
     ui.id().with("marquee-origin")
 }
 
-/// Updates the band state from this frame's pointer, given the viewport rect
-/// and the current scroll offset.
-fn track_band(ui: &Ui, viewport: Rect, scroll_offset: f32) -> Band {
+/// The width down the right edge of a scroll area that belongs to the scroll
+/// bar, and where a rubber band must therefore not start.
+///
+/// egui senses the bar over `bar_width` inset by `bar_outer_margin`, and it
+/// senses that full width even while the bar is drawn as a thin floating line —
+/// so the strip is wider than what is on screen. Without excluding it, grabbing
+/// the scroll bar swept a selection across everything the drag passed: the list
+/// still scrolled, but it came back with eighty rows selected, which is not
+/// what anyone means by dragging a scroll bar.
+///
+/// Zero when the content fits, because then there is no bar and the last few
+/// pixels of the list should still start a band.
+fn scrollbar_strip(scroll: egui::style::ScrollStyle, overflowing: bool) -> f32 {
+    if !overflowing {
+        return 0.0;
+    }
+    scroll.bar_width + scroll.bar_outer_margin
+}
+
+/// `viewport` with the scroll bar's strip taken off its right edge.
+fn band_start_area(
+    scroll: egui::style::ScrollStyle,
+    viewport: Rect,
+    overflowing: bool,
+) -> Rect {
+    Rect::from_min_max(
+        viewport.min,
+        pos2(
+            viewport.right() - scrollbar_strip(scroll, overflowing),
+            viewport.bottom(),
+        ),
+    )
+}
+
+/// Updates the band state from this frame's pointer.
+///
+/// `viewport` is the scroll area's rect, used to convert screen positions into
+/// content ones. `start_area` is where a press may *begin* a band, which is
+/// `viewport` minus the scroll bar's strip.
+fn track_band(ui: &Ui, viewport: Rect, start_area: Rect, scroll_offset: f32) -> Band {
     let (pointer, primary_down, primary_released, ctrl) = ui.input(|i| {
         (
             i.pointer.interact_pos(),
@@ -336,7 +375,7 @@ fn track_band(ui: &Ui, viewport: Rect, scroll_offset: f32) -> Band {
     // two gestures will have to be told apart — most likely by whether the
     // press landed on an already-selected row.
     if primary_down && stored.is_none() {
-        if let Some(p) = pointer.filter(|p| viewport.contains(*p)) {
+        if let Some(p) = pointer.filter(|p| start_area.contains(*p)) {
             let origin = to_content(p);
             ui.ctx().data_mut(|d| d.insert_temp(id, origin));
         }
@@ -783,7 +822,9 @@ fn show_grid(
 
     state.scroll_offset = output.state.offset.y;
 
-    let band = track_band(ui, viewport, output.state.offset.y);
+    let start_area =
+        band_start_area(ui.spacing().scroll, viewport, output.content_size.y > viewport.height());
+    let band = track_band(ui, viewport, start_area, output.state.offset.y);
     if let Some(rect) = band.rect {
         draw_band(ui, p, rect, viewport, output.state.offset.y);
 
@@ -1003,4 +1044,35 @@ mod tests {
     /// Guards the redesign: 26pt rows were part of what made the list read as a
     /// 2005 file manager. Checked at compile time, since it is a constant.
     const _: () = assert!(ROW_HEIGHT >= 30.0);
+
+    #[test]
+    fn a_band_may_not_start_on_the_scroll_bar() {
+        // Grabbing the bar used to sweep a selection across everything the drag
+        // passed. The list still scrolled, but came back with eighty rows
+        // selected, which is not what dragging a scroll bar means.
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let area = band_start_area(egui::style::ScrollStyle::solid(), viewport, true);
+        assert!(area.right() < viewport.right(), "the bar's strip is still band area");
+        assert_eq!(area.left(), viewport.left());
+        assert_eq!(area.height(), viewport.height());
+    }
+
+    #[test]
+    fn with_nothing_to_scroll_the_band_reaches_the_right_edge() {
+        // There is no bar to protect, and losing the last dozen pixels of a
+        // short listing to a strip that is not drawn would be arbitrary.
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let area = band_start_area(egui::style::ScrollStyle::solid(), viewport, false);
+        assert_eq!(area.right(), viewport.right());
+    }
+
+    #[test]
+    fn the_reserved_strip_covers_what_egui_senses_not_what_it_draws() {
+        // A floating bar is drawn as a thin line but sensed over its full
+        // width, so reserving only the visible width leaves most of the grab
+        // target inside the band area.
+        let floating = egui::style::ScrollStyle::floating();
+        assert!(scrollbar_strip(floating, true) >= floating.bar_width);
+        assert!(floating.bar_width > floating.floating_width);
+    }
 }
