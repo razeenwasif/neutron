@@ -88,6 +88,9 @@ windows = "0.62"
 # be nameable at the root of anything that implements a COM interface.
 windows-core = "0.62"
 
+# SIMD substring scanning for the index. Already in the tree via other crates.
+memchr = "2"
+
 # Release builds: optimize hard. This is a file manager whose entire pitch is
 # speed, so the extra link time is worth it.
 [profile.release]

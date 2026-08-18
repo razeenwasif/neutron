@@ -135,9 +135,9 @@ impl Searcher {
     /// Scans every record across every volume, in parallel.
     ///
     /// This is the expensive path — the first character of any search, and
-    /// every keystroke of one whose results stay capped. Measured at ~80ms
-    /// single-threaded over 3.3M names, which is far too slow to run per
-    /// keystroke; split across cores it is a fraction of that.
+    /// every keystroke of one whose results stay capped. The scanning itself
+    /// is [`VolumeIndex::scan`], which sweeps the name arena as one contiguous
+    /// buffer; see there for why that is not a loop over individual names.
     ///
     /// Every match is counted even once the hit list is full, so the total is
     /// exact. An earlier version stopped at the cap, which made a one-letter
@@ -150,7 +150,12 @@ impl Searcher {
         // Chunked by record range rather than by volume: one volume routinely
         // holds ten times another, so per-volume tasks leave most cores idle
         // waiting for the largest.
-        const CHUNK: usize = 32_768;
+        //
+        // Large chunks, because each one is a contiguous sweep and the setup
+        // cost of a vectorised search is paid per sweep. Small chunks would
+        // reintroduce, at a coarser grain, exactly the overhead that scanning
+        // the arena in one piece exists to avoid.
+        const CHUNK: usize = 262_144;
 
         let tasks: Vec<(u16, usize, usize)> = volumes
             .iter()
@@ -169,20 +174,18 @@ impl Searcher {
                 let mut local = Vec::new();
                 let mut count = 0usize;
 
-                for record in start..end {
-                    if contains_ignore_ascii_case(index.name(record), lowered) {
-                        count += 1;
-                        // Each chunk keeps at most the cap, so the merged list
-                        // is bounded by cores × cap rather than by the match
-                        // count — which for a one-letter query is millions.
-                        if local.len() < MAX_HITS {
-                            local.push(Hit {
-                                volume,
-                                record: record as u32,
-                            });
-                        }
+                index.scan(start..end, lowered, |record| {
+                    count += 1;
+                    // Each chunk keeps at most the cap, so the merged list is
+                    // bounded by cores × cap rather than by the match count —
+                    // which for a one-letter query is millions.
+                    if local.len() < MAX_HITS {
+                        local.push(Hit {
+                            volume,
+                            record: record as u32,
+                        });
                     }
-                }
+                });
                 (local, count)
             })
             .reduce(
@@ -343,11 +346,23 @@ pub fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
     // matched exactly.
     let first_upper = first.to_ascii_uppercase();
 
-    for start in 0..=(hay.len() - nee.len()) {
-        let h = hay[start];
-        if h != first && h != first_upper {
-            continue;
-        }
+    // The last position a match could still start at. Searching past it wastes
+    // work and, worse, would report a candidate that cannot be compared.
+    let last_start = hay.len() - nee.len();
+
+    // `memchr2` rather than a byte loop. Almost every name in an index does not
+    // contain the first character at all, so this function is overwhelmingly a
+    // rejection test, and the rejection is the part worth vectorising: a scalar
+    // loop compares one byte per iteration where this compares a register full
+    // at a time.
+    let mut from = 0;
+    while from <= last_start {
+        let window = &hay[from..=last_start];
+        let Some(offset) = memchr::memchr2(first, first_upper, window) else {
+            return false;
+        };
+        let start = from + offset;
+
         if hay[start..start + nee.len()]
             .iter()
             .zip(nee)
@@ -355,6 +370,7 @@ pub fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
         {
             return true;
         }
+        from = start + 1;
     }
     false
 }

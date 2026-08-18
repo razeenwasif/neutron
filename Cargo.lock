@@ -1792,6 +1792,7 @@ name = "neutron-index"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "memchr",
  "neutron-core",
  "neutron-fuzzy",
  "parking_lot",

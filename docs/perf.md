@@ -165,7 +165,8 @@ thousands of them that nobody asked for.
 | Frame time p99 scrolling | <8 ms | 0.40 ms | ✅ 20× under |
 | Cold start | <100 ms | ~1040 ms | ❌ **not achievable as architected** |
 | Idle memory | <60 MB | ~280 MB | ❌ **not achievable as architected** |
-| Idle CPU | ~0% | 0.3% | ✅ |
+| Idle CPU, focused | ~0% | 1.17% | ➖ 10 fps for a drifting ground |
+| Idle CPU, unfocused | ~0% | 0.39% | ✅ |
 | Binary size | ~15 MB | 11 MB | ✅ |
 
 ### The two failures are the same failure
@@ -330,6 +331,91 @@ take this path.
 Neither size nor timestamps are read for shell items. `IShellFolder2::GetDetailsEx`
 would supply them at a COM call per column per row; these places are browsed,
 not audited, and a blank column beats a listing that takes a second.
+
+## Perf pass (2026-08-19)
+
+All figures below are **release** builds on the development machine (16 cores),
+re-measured together so they are comparable with each other. The earlier numbers
+in this file were a mix of debug and release, and some were taken with a sampling
+script that read a stale `TotalProcessorTime` before its first interval — the
+idle-CPU figures above are inflated by roughly the process's startup burst.
+Treat this section as the current state.
+
+### Idle CPU — the ground was repainting far faster than it moves
+
+Sampled over 12 s after a 5 s settle, window open on a 149-entry folder.
+
+| | before | after |
+|---|---:|---:|
+| Focused | 4.69% of one core | **1.17%** |
+| Unfocused | 5.99% | **0.39%** |
+| Working set | 305 MB | 310 MB |
+
+The repaint interval was a flat 30 fps, chosen as "a sensible frame rate" rather
+than from anything about the animation. The two colour fields loop over 41 s and
+57 s; at their fastest that is about 8 px/s across a 1500 px window, so 10 fps
+moves a soft gradient by under a pixel per frame. Twenty of those thirty frames
+a second were producing no visible change at all.
+
+Now 10 fps focused, 2 fps unfocused, 0.5 fps minimised. This governs only the
+*idle* rate — input, an arriving icon and a finished background job each request
+their own repaint, so scrolling and hovering are unaffected.
+
+### Search — 3× faster, and now bandwidth-bound rather than overhead-bound
+
+Measured with `crates/neutron-index/tests/scan_throughput.rs`, which builds
+3.3M synthetic records (58.2 MB of names, 17.6 bytes each) and times full scans.
+It is `#[ignore]`d and asserts nothing: a timing that fails on a busy machine
+teaches nobody anything. Synthetic because a real index needs the USN journal
+and therefore elevation, and the question — what is the limit? — is answered by
+throughput over a realistic *volume* of realistic-shaped names.
+
+| Query | Matches | Before | After |
+|---|---:|---:|---:|
+| `e` | 2,352,634 | 4.53 ms | **2.79 ms** |
+| `config` | 173,685 | 5.08 ms | **1.38 ms** |
+| `neutron` | 0 | 4.02 ms | **1.43 ms** |
+| `setup.exe` | 0 | 3.79 ms | **1.48 ms** |
+| `zzqx` | 0 | 5.37 ms | **1.49 ms** |
+| next keystroke (narrowing) | — | 0.001 ms | 0.001 ms |
+
+Two changes, and the first was the one that mattered:
+
+**Scan the arena, not the names.** The names are already one contiguous buffer
+and the old scan threw that away, calling a substring search 3.3M times on
+18-byte slices. The measurement that settled it: sweeping the *whole* 58 MB
+arena with a single vectorised call takes **0.74 ms on one core**, while the
+same bytes searched name by name took **3.4 ms across sixteen**. Nearly all the
+cost was per-call setup. The scan now sweeps the byte range a chunk of records
+occupies and walks a cursor along the record boundaries beside it.
+
+The names are packed with no separator, so a candidate can straddle two records
+— `…report` followed by `card…` contains "portca". The boundary test that
+rejects those is not optional, and has its own test.
+
+**Hunt the rarest byte of the needle, not the first.** A sweep is only as cheap
+as its candidate rate: searching `setup.exe` by its `s` stops on every `s` on
+the disk, and each stop costs a comparison and a cursor advance. Its `x` occurs
+a hundredth as often and rejects just as conclusively. Worth 3.5 ms → 1.5 ms on
+its own.
+
+**Where the remaining time goes.** Effective throughput rose from ~13 GB/s to
+~40 GB/s, which is DRAM bandwidth on this machine. The scan is no longer
+limited by the matcher; it is limited by having to read every name.
+
+**Target <1ms: still missed, and now for a reason that can be stated.** On this
+58 MB corpus a full scan is ~1.4 ms; real filenames average nearer 30 bytes, so
+a real 3.3M-record index is ~100 MB and should land around 2.5 ms. Getting under
+a millisecond means touching fewer bytes, not scanning faster — a per-record
+signature (say a 64-bit mask of which character pairs a name contains) would cut
+the bytes read by roughly four, at a cost of ~26 MB on top of the index's 202 MB.
+That is a real trade for a latency that is already a fraction of a frame and sits
+behind a 30 ms debounce. Not taken; recorded so the option is a decision rather
+than an oversight.
+
+> The real-index figures earlier in this file (6–9 ms) were measured on the
+> actual USN index, which needs an elevated helper. They have **not** been
+> re-measured since this change; expect roughly a third of them.
 
 ### Not yet re-measured
 
