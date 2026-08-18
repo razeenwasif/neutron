@@ -41,6 +41,14 @@ pub mod open;
 #[cfg_attr(not(windows), path = "fileops_stub.rs")]
 pub mod fileops;
 
+#[cfg_attr(windows, path = "clipboard.rs")]
+#[cfg_attr(not(windows), path = "clipboard_stub.rs")]
+pub mod clipboard;
+
+#[cfg_attr(windows, path = "pastekey.rs")]
+#[cfg_attr(not(windows), path = "pastekey_stub.rs")]
+pub mod pastekey;
+
 #[cfg_attr(windows, path = "menu.rs")]
 #[cfg_attr(not(windows), path = "menu_stub.rs")]
 pub mod menu;

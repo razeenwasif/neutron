@@ -29,6 +29,8 @@
 //! Nothing here touches the filesystem. Rows render from the in-memory
 //! [`EntryList`] snapshot only; anything that could block belongs on a worker.
 
+use std::collections::HashSet;
+
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, TextStyle, Ui, pos2, vec2};
 use neutron_core::entry::{EntryKind, SyncState};
 use neutron_core::{EntryList, SelectMode, Selection, SortColumn, SortOrder, SortSpec};
@@ -153,17 +155,42 @@ pub trait IconSource {
 }
 
 /// Draws the listing in whichever view mode is active.
+/// What is flagged on the rows of this listing.
+///
+/// Bundled rather than passed as separate arguments because both are read at
+/// every level of the draw, and a fifth and sixth positional `&` parameter
+/// threaded through five functions is where mix-ups live.
+pub struct Marks<'a> {
+    pub selection: &'a Selection,
+    /// Names *in this directory* that sit on the clipboard as a cut.
+    ///
+    /// A set of bare names rather than paths, tested per visible row, so a
+    /// pending cut costs nothing on a listing of half a million entries — the
+    /// alternative, matching full paths across the whole listing, is an O(n)
+    /// scan every frame for something that is almost always three files.
+    ///
+    /// `None` when nothing is cut, or when the cut happened in a different
+    /// directory than the one being drawn.
+    pub cut: Option<&'a HashSet<String>>,
+}
+
+impl Marks<'_> {
+    fn is_cut(&self, name: &str) -> bool {
+        self.cut.is_some_and(|names| names.contains(name))
+    }
+}
+
 pub fn show(
     ui: &mut Ui,
     state: &mut FileListState,
     list: &EntryList,
-    selection: &Selection,
+    marks: &Marks<'_>,
     p: &Palette,
     icons: Option<&dyn IconSource>,
 ) -> Option<FileListAction> {
     match state.view {
-        ViewMode::List => show_list(ui, state, list, selection, p, icons),
-        ViewMode::Grid => show_grid(ui, state, list, selection, p, icons),
+        ViewMode::List => show_list(ui, state, list, marks, p, icons),
+        ViewMode::Grid => show_grid(ui, state, list, marks, p, icons),
     }
 }
 
@@ -172,7 +199,7 @@ fn show_list(
     ui: &mut Ui,
     state: &mut FileListState,
     list: &EntryList,
-    selection: &Selection,
+    marks: &Marks<'_>,
     p: &Palette,
     icons: Option<&dyn IconSource>,
 ) -> Option<FileListAction> {
@@ -227,7 +254,7 @@ fn show_list(
         // large the directory is.
         for row in visible {
             let idx = list.at(row);
-            if let Some(a) = draw_row(ui, list, selection, p, idx, name_width, icons) {
+            if let Some(a) = draw_row(ui, list, marks, p, idx, name_width, icons) {
                 action = Some(a);
             }
         }
@@ -524,7 +551,7 @@ const RADIUS_SMALL_F: f32 = 8.0;
 fn draw_row(
     ui: &mut Ui,
     list: &EntryList,
-    selection: &Selection,
+    marks: &Marks<'_>,
     p: &Palette,
     idx: usize,
     name_width: f32,
@@ -545,8 +572,8 @@ fn draw_row(
         pos2(outer.right() - LIST_PAD * 0.5, outer.bottom() - 1.0),
     );
 
-    let selected = selection.is_selected(idx);
-    let is_cursor = selection.cursor() == Some(idx);
+    let selected = marks.selection.is_selected(idx);
+    let is_cursor = marks.selection.cursor() == Some(idx);
 
     if selected {
         ui.painter().rect(
@@ -572,7 +599,11 @@ fn draw_row(
     }
 
     let kind = list.kind(idx);
-    let hidden = list.is_hidden(idx);
+    // A file that is cut is drawn like a hidden one: still there, but faded,
+    // because that is exactly its status — it has not moved yet and it will
+    // stay put if the paste never comes. Reusing the dimming rather than
+    // inventing a second faded state keeps one meaning for one appearance.
+    let hidden = list.is_hidden(idx) || marks.is_cut(list.name(idx));
 
     // Hidden files are dimmed rather than being identical to normal ones.
     let name_colour = if hidden { p.text_muted } else { p.text };
@@ -727,7 +758,7 @@ fn show_grid(
     ui: &mut Ui,
     state: &mut FileListState,
     list: &EntryList,
-    selection: &Selection,
+    marks: &Marks<'_>,
     p: &Palette,
     icons: Option<&dyn IconSource>,
 ) -> Option<FileListAction> {
@@ -791,7 +822,7 @@ fn show_grid(
                     ),
                     vec2(TILE_W, TILE_H),
                 );
-                if let Some(a) = draw_tile(ui, list, selection, p, idx, rect, icons) {
+                if let Some(a) = draw_tile(ui, list, marks, p, idx, rect, icons) {
                     action = Some(a);
                 }
             }
@@ -858,7 +889,7 @@ fn show_grid(
 fn draw_tile(
     ui: &mut Ui,
     list: &EntryList,
-    selection: &Selection,
+    marks: &Marks<'_>,
     p: &Palette,
     idx: usize,
     rect: Rect,
@@ -866,8 +897,8 @@ fn draw_tile(
 ) -> Option<FileListAction> {
     let response = ui.interact(rect, ui.id().with(("tile", idx)), Sense::click());
 
-    let selected = selection.is_selected(idx);
-    let is_cursor = selection.cursor() == Some(idx);
+    let selected = marks.selection.is_selected(idx);
+    let is_cursor = marks.selection.cursor() == Some(idx);
 
     if selected {
         ui.painter()

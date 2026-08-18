@@ -12,4 +12,5 @@ pub mod icons;
 pub mod theme;
 
 pub use context_menu::{MenuOutcome, MenuState};
+pub use file_list::Marks;
 pub use theme::{Palette, ROW_HEIGHT, ThemeMode};

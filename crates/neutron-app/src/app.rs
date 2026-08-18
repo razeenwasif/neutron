@@ -57,6 +57,10 @@ enum Action {
     SetFilter(String),
     /// Put the caret in the focused pane's filter field.
     FocusFilter,
+    /// Put the selection on the clipboard. `cut` marks it for a move.
+    Clip { cut: bool },
+    /// Paste whatever is on the clipboard into the focused tab's folder.
+    Paste,
     /// Delete the selection. `permanent` skips the Recycle Bin.
     Delete { permanent: bool },
     /// How many tiles the grid fitted per row, reported back after layout.
@@ -153,6 +157,23 @@ pub struct NeutronApp {
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
 
+    /// Names marked by the last `Ctrl+X`, and the folder they live in.
+    ///
+    /// Held so those rows can be drawn faded, which is the only sign a cut
+    /// happened — the files do not move until the paste. Names rather than full
+    /// paths because that is what a row has, and the folder is compared once
+    /// per pane instead of per row.
+    cut_dir: Option<PathBuf>,
+    cut_names: std::collections::HashSet<String>,
+    /// Reports a clipboard write that did not land, so the rows faded in
+    /// anticipation get un-faded rather than lying about a cut that never
+    /// reached the clipboard.
+    clip_fail_tx: crossbeam_channel::Sender<()>,
+    clip_fail_rx: crossbeam_channel::Receiver<()>,
+    /// `Ctrl+V` presses, seen by a window subclass because egui drops them.
+    /// See `neutron_shell::pastekey` for why that is necessary.
+    paste_rx: crossbeam_channel::Receiver<()>,
+
     /// The open context menu, if any.
     ///
     /// While this is `Some`, an apartment thread is parked inside
@@ -210,6 +231,17 @@ impl NeutronApp {
         let (open_as_tx, open_as_rx) = crossbeam_channel::unbounded();
         let (drive_tx, drive_rx) = crossbeam_channel::unbounded();
         let (menu_tx, menu_rx) = crossbeam_channel::unbounded();
+        let (clip_fail_tx, clip_fail_rx) = crossbeam_channel::unbounded();
+
+        // `Ctrl+V` never reaches the application through egui when the
+        // clipboard holds files rather than text, which is the only case that
+        // matters here. A window subclass sees the key first.
+        let (paste_tx, paste_rx) = crossbeam_channel::unbounded();
+        if let Some(h) = hwnd {
+            if let Err(e) = neutron_shell::pastekey::watch(h, paste_tx) {
+                tracing::warn!("{e}; Ctrl+V will not work");
+            }
+        }
         let drive_state = neutron_cloud::google::GoogleDrive::new().state();
 
         // Attaches to a helper left running by an earlier session, so search is
@@ -262,6 +294,11 @@ impl NeutronApp {
             drive_state,
             drive_tx,
             drive_rx,
+            cut_dir: None,
+            cut_names: std::collections::HashSet::new(),
+            clip_fail_tx,
+            clip_fail_rx,
+            paste_rx,
             menu: None,
             menu_reply: None,
             menu_tx,
@@ -401,6 +438,9 @@ impl NeutronApp {
                     t.selection.select_span(&t.list, from, to, additive);
                 }
             }
+
+            Action::Clip { cut } => self.clip_selection(cut),
+            Action::Paste => self.paste(),
 
             Action::ClearSelection => {
                 if let Some(t) = self.workspace.active_tab_mut() {
@@ -703,6 +743,159 @@ impl NeutronApp {
         }
     }
 
+    /// The focused tab, the folder it shows, and the paths of its selection.
+    ///
+    /// Every command that acts on files needs exactly this triple, and each one
+    /// used to rebuild it — including the `i < len` guard, which is what stops
+    /// a selection left over from a previous listing indexing into the new one.
+    fn selection_paths(&self) -> Option<(TabId, PathBuf, Vec<PathBuf>)> {
+        let tab_id = self.workspace.active_tab_id()?;
+        let tab = self.workspace.tabs.get(&tab_id)?;
+        let dir = tab.location().as_path()?.to_path_buf();
+
+        let paths: Vec<PathBuf> = tab
+            .selection
+            .iter()
+            .filter(|&i| i < tab.list.len())
+            .map(|i| dir.join(tab.list.name(i)))
+            .collect();
+
+        (!paths.is_empty()).then_some((tab_id, dir, paths))
+    }
+
+    /// Puts the selection on the clipboard.
+    ///
+    /// Nothing is copied or moved here — that happens on paste, possibly in
+    /// another application, possibly never. All this does is publish the list.
+    fn clip_selection(&mut self, cut: bool) {
+        let Some((_, dir, paths)) = self.selection_paths() else {
+            return;
+        };
+
+        use neutron_shell::fileops::Transfer;
+        let how = if cut { Transfer::Move } else { Transfer::Copy };
+
+        // Marked before the worker runs, not after: the fade is feedback for a
+        // keystroke and has to land on the next frame, and a failed clipboard
+        // write clears it again below.
+        if cut {
+            self.cut_dir = Some(dir);
+            self.cut_names = paths
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect();
+        } else {
+            self.clear_cut_marks();
+        }
+
+        let wake = self.ctx.clone();
+        let failed = self.clip_fail_tx.clone();
+
+        tracing::info!(count = paths.len(), ?how, "clipboard");
+        self.sta.submit(move || {
+            if let Err(e) = neutron_shell::clipboard::write(&paths, how) {
+                tracing::warn!("clipboard write failed: {e}");
+                let _ = failed.send(());
+            }
+            wake.request_repaint();
+        });
+    }
+
+    /// Turns the clipboard chords into actions.
+    ///
+    /// `Ctrl+C` and `Ctrl+X` arrive as `Event::Copy` and `Event::Cut`, because
+    /// egui-winit converts them before they become key presses — so there is no
+    /// `Key::C` to bind and these have to be read from the event stream.
+    ///
+    /// `Ctrl+V` does not arrive at all: egui-winit turns it into
+    /// `Event::Paste(text)` and drops it when the clipboard holds no text,
+    /// which is exactly what a copied *file* looks like. It comes in through
+    /// the window subclass instead.
+    fn clipboard_keys(&self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        // A menu or a text field is using the keyboard; its own copy and paste
+        // win.
+        if self.menu.is_some() || ctx.egui_wants_keyboard_input() {
+            // Still drained, so a press held while a field had focus does not
+            // fire the moment focus leaves.
+            while self.paste_rx.try_recv().is_ok() {}
+            return;
+        }
+
+        ctx.input(|i| {
+            for event in &i.events {
+                match event {
+                    egui::Event::Copy => actions.push(Action::Clip { cut: false }),
+                    egui::Event::Cut => actions.push(Action::Clip { cut: true }),
+                    _ => {}
+                }
+            }
+        });
+
+        // Collapsed to one: several presses between frames still mean one
+        // paste, and a repeated file operation is not a harmless duplicate.
+        let mut pasted = false;
+        while self.paste_rx.try_recv().is_ok() {
+            pasted = true;
+        }
+        if pasted {
+            actions.push(Action::Paste);
+        }
+    }
+
+    fn clear_cut_marks(&mut self) {
+        self.cut_dir = None;
+        self.cut_names.clear();
+    }
+
+    /// Pastes the clipboard into the focused tab's folder.
+    ///
+    /// Reading the clipboard is itself a blocking call — another process may
+    /// hold it — so the whole operation, decision included, happens on the
+    /// worker. The UI thread never learns what was on the clipboard, only that
+    /// the listing should be re-read.
+    fn paste(&mut self) {
+        let Some(tab_id) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let Some(dir) = self
+            .workspace
+            .tabs
+            .get(&tab_id)
+            .and_then(|t| t.location().as_path())
+            .map(|p| p.to_path_buf())
+        else {
+            return;
+        };
+
+        // A cut is spent by the paste that consumes it, whatever the outcome:
+        // the files have either moved or the paste failed, and in both cases
+        // leaving rows faded would be a lie about a clipboard we no longer own.
+        self.clear_cut_marks();
+
+        let owner = self.hwnd.unwrap_or(0);
+        let wake = self.ctx.clone();
+        let done = self.refresh_tx.clone();
+
+        self.sta.submit(move || {
+            let Some((paths, how)) = neutron_shell::clipboard::read() else {
+                tracing::debug!("nothing on the clipboard to paste");
+                return;
+            };
+            if !neutron_shell::clipboard::can_paste_into(&paths, &dir) {
+                tracing::warn!("refusing to paste a folder into itself");
+                return;
+            }
+
+            tracing::info!(count = paths.len(), ?how, dest = %dir.display(), "paste");
+            if let Err(e) = neutron_shell::fileops::transfer(&paths, &dir, how, owner) {
+                tracing::warn!("paste failed: {e}");
+            }
+            let _ = done.send(tab_id);
+            wake.request_repaint();
+        });
+    }
+
     /// Sends the focused tab's selection to the Recycle Bin.
     ///
     /// The listing is refreshed when the operation finishes rather than
@@ -711,25 +904,9 @@ impl NeutronApp {
     /// the rest succeeds. Re-reading the directory is the only account of what
     /// actually happened that is guaranteed to be true.
     fn delete_selection(&mut self, permanent: bool) {
-        let Some(tab_id) = self.workspace.active_tab_id() else {
+        let Some((tab_id, _, paths)) = self.selection_paths() else {
             return;
         };
-        let Some(tab) = self.workspace.tabs.get(&tab_id) else {
-            return;
-        };
-        let Some(dir) = tab.location().as_path() else {
-            return;
-        };
-
-        let paths: Vec<PathBuf> = tab
-            .selection
-            .iter()
-            .filter(|&i| i < tab.list.len())
-            .map(|i| dir.join(tab.list.name(i)))
-            .collect();
-        if paths.is_empty() {
-            return;
-        }
 
         let disposal = if permanent {
             neutron_shell::fileops::Disposal::Permanent
@@ -816,29 +993,13 @@ impl NeutronApp {
             }
         }
 
-        let Some(tab_id) = self.workspace.active_tab_id() else {
-            return;
-        };
-        let Some(tab) = self.workspace.tabs.get(&tab_id) else {
-            return;
-        };
-        let Some(dir) = tab.location().as_path() else {
-            return;
-        };
-
         // With nothing selected the menu would be for the folder itself. That
         // needs a different IContextMenu (the background menu, with New and
         // Paste); until it exists, showing the folder's own item menu would be
         // actively misleading.
-        let paths: Vec<PathBuf> = tab
-            .selection
-            .iter()
-            .filter(|&i| i < tab.list.len())
-            .map(|i| dir.join(tab.list.name(i)))
-            .collect();
-        if paths.is_empty() {
+        let Some((tab_id, _, paths)) = self.selection_paths() else {
             return;
-        }
+        };
 
         // A menu already up is replaced, not stacked. Dropping the reply
         // sender releases whichever apartment thread is parked on the old one.
@@ -1000,6 +1161,10 @@ impl eframe::App for NeutronApp {
         while let Ok(state) = self.drive_rx.try_recv() {
             self.drive_state = state;
         }
+        if self.clip_fail_rx.try_recv().is_ok() {
+            self.clear_cut_marks();
+        }
+        self.clipboard_keys(&ctx, &mut actions);
         // Before drawing: installs icons that arrived since the last frame, so
         // rows painted below pick them up immediately rather than a frame late.
         self.icons.pump();
@@ -1518,6 +1683,9 @@ impl NeutronApp {
 
             C::SelectAll => Some(Action::SelectAll),
             C::ClearSelection => Some(Action::ClearSelection),
+            C::Copy => Some(Action::Clip { cut: false }),
+            C::Cut => Some(Action::Clip { cut: true }),
+            C::Paste => Some(Action::Paste),
             C::DeleteSelection => Some(Action::Delete { permanent: false }),
 
             C::ToggleHidden => Some(Action::ToggleHidden),
@@ -2069,11 +2237,18 @@ impl NeutronApp {
             dir: tab.location().as_path().map(|p| p.to_path_buf()),
         };
 
+        // Only when the cut happened in the folder this pane is showing:
+        // otherwise a file called `notes.txt` cut from somewhere else would
+        // fade an unrelated `notes.txt` here.
+        let cut = (self.cut_dir.as_deref() == tab.location().as_path())
+            .then_some(&self.cut_names)
+            .filter(|names| !names.is_empty());
+
         let drawn = file_list::show(
             ui,
             &mut view,
             &tab.list,
-            &tab.selection,
+            &file_list::Marks { selection: &tab.selection, cut },
             p,
             Some(&source as &dyn file_list::IconSource),
         );
