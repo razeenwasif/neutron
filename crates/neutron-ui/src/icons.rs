@@ -48,6 +48,10 @@ pub enum Glyph {
     File,
     Link,
     Diamond,
+    /// Four squares — switch to the grid view.
+    Grid,
+    /// Stacked lines — switch to the list view.
+    List,
 }
 
 /// Draws `glyph` centred on `centre`.
@@ -70,6 +74,8 @@ pub fn draw(painter: &Painter, centre: Pos2, glyph: Glyph, colour: Color32) {
         Glyph::File => file(painter, centre, stroke),
         Glyph::Link => link(painter, centre, stroke, colour),
         Glyph::Diamond => diamond(painter, centre, stroke),
+        Glyph::Grid => grid(painter, centre, stroke),
+        Glyph::List => list_rows(painter, centre, stroke),
     }
 }
 
@@ -300,6 +306,27 @@ fn diamond(painter: &Painter, c: Pos2, stroke: Stroke) {
         Color32::TRANSPARENT,
         stroke,
     ));
+}
+
+fn grid(painter: &Painter, c: Pos2, stroke: Stroke) {
+    for (dx, dy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let centre = pos2(c.x + dx * 3.4, c.y + dy * 3.4);
+        painter.rect_stroke(
+            Rect::from_center_size(centre, vec2(5.2, 5.2)),
+            1.2,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+fn list_rows(painter: &Painter, c: Pos2, stroke: Stroke) {
+    for i in -1..=1 {
+        let y = c.y + i as f32 * 4.6;
+        // A leading dot per row, as a list marker does.
+        painter.circle_filled(pos2(c.x - 5.6, y), 1.1, stroke.color);
+        painter.line_segment([pos2(c.x - 2.6, y), pos2(c.x + 6.5, y)], stroke);
+    }
 }
 
 /// Sort-direction triangle for the active column header. Solid rather than

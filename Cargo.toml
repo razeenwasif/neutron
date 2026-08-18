@@ -49,6 +49,8 @@ eframe = { version = "0.36", default-features = false, features = [
     "wgpu",
     "default_fonts",
     "persistence",
+    "x11",
+    "wayland",
 ] }
 
 # --- concurrency ---

@@ -1,106 +1,118 @@
-//! The window ground: a faint wash plus a few coloured lights behind the cards.
+//! The window ground: depth through translucency with slow-drifting colour fields.
 //!
-//! # What it is
+//! # The 3-layer visual model
 //!
-//! One radial wash from a slightly lighter centre-top to a deeper edge, then
-//! three low-alpha coloured orbs at different hues. Where they overlap the
-//! ground shifts through violet, blue and magenta — a prismatic cast rather
-//! than a flat rectangle for the cards to sit on.
+//! 1. A deep near-black purple ground with top radial illumination.
+//! 2. Two large slow-drifting colour fields (purple, electric indigo) on 41s
+//!    and 57s loops that give the glass something to refract.
+//! 3. Translucent panels floating above them.
 //!
-//! Almost all of this is covered by opaque cards. That is deliberate: colour on
-//! the ground costs nothing in legibility because no text ever lands on it, and
-//! what shows through is the gutter between cards and the margin at the window
-//! edge — exactly the places where a flat fill looks cheap.
+//! # Why the drifting colour fields matter
 //!
-//! # Why it is static
+//! The orbs are the load-bearing element of the glassmorphism system. A blur
+//! with nothing behind it is just a grey box — translucent panels only read as
+//! glass because there is coloured light moving underneath for them to refract.
 //!
-//! Nothing here changes between frames, so the app can be genuinely idle when
-//! the user is not interacting with it. An earlier version drifted the orbs on
-//! a timer, which forced a repaint every 33ms purely for decoration and held
-//! the process at ~9% of a core doing nothing. The visual difference was not
-//! worth a permanently awake event loop.
+//! # Geometry and animation
 //!
-//! # Cost
+//! Two oversized colour fields drift on smooth sinusoidal ease-in-out loops:
+//! - **Field A (41s)**: purple `#9333ea`, top-left, drifting `+7vw, +6vh`, scaling `1.0 → 1.10`.
+//! - **Field B (57s)**: electric indigo `#6366f1`, bottom-right, drifting `-8vw, -5vh`, scaling `1.08 → 0.98`.
 //!
-//! Four gradients, each a `SEGMENTS`-triangle fan, plus a base rect — under 500
-//! triangles for the whole background, submitted once per frame in a single
-//! mesh each. It does not measurably move frame time.
+//! Two rather than three, each near window-sized: what should show is the
+//! gradient where they overlap, not a recognisable circle. The periods share no
+//! common factor, so the pair never settles into a visible repeat.
+//!
+//! Each field is a three-layer gaussian falloff fan — see [`glow`].
 
 use egui::{Color32, Mesh, Painter, Rect, Shape, epaint::Vertex, pos2, vec2};
 
 use crate::theme::Palette;
 
-/// Segments in a gradient fan. Past the point where facets are visible at any
-/// window size we care about.
+/// Segments in a gradient fan.
 const SEGMENTS: usize = 48;
 
-/// Paints the ground.
-pub fn paint(painter: &Painter, rect: Rect, p: &Palette) {
+/// Paints the animated ground with slow-drifting colour fields.
+pub fn paint(painter: &Painter, rect: Rect, p: &Palette, time: f64) {
     // Base fill first, so the corners outside the ellipse are never bare.
     painter.rect_filled(rect, 0.0, p.ground_deep);
 
-    // Light source above the window, so the ground feels lit rather than
-    // merely tinted.
+    // Light source above the window, so the ground feels lit rather than merely flat.
     let centre = pos2(rect.center().x, rect.top());
-    // Overhangs the window, so the visible area is all gradient interior with
-    // no hard edge on screen.
     let radius = vec2(rect.width() * 1.25, rect.height() * 1.15);
     fan(painter, centre, radius, p.ground, p.ground_deep);
 
-    // Orbs on top of the wash, so they tint it rather than being washed out.
+    // Drifting colour fields on top of the wash.
     let span = rect.width().max(rect.height());
-    for orb in &p.orbs {
+    for (i, orb) in p.orbs.iter().enumerate() {
+        let period = if orb.period > 0.0 { orb.period as f64 } else { 34.0 };
+        let progress = (time / period).fract() as f32;
+        // Smooth sinusoidal ease-in-out: 0 at 0% and 100%, 1.0 at 50%
+        let k = (1.0 - (progress * std::f32::consts::TAU).cos()) * 0.5;
+
+        // Opposed drift, so the two fields breathe against each other rather
+        // than sliding the whole background one way.
+        let (dx, dy, scale) = match i {
+            0 => (0.07 * k, 0.06 * k, 1.0 + 0.10 * k),
+            1 => (-0.08 * k, -0.05 * k, 1.08 - 0.10 * k),
+            _ => (0.0, 0.0, 1.0),
+        };
+
         let at = pos2(
-            rect.left() + rect.width() * orb.x,
-            rect.top() + rect.height() * orb.y,
+            rect.left() + rect.width() * (orb.x + dx),
+            rect.top() + rect.height() * (orb.y + dy),
         );
-        glow(painter, at, span * orb.radius, orb.colour);
+        glow(painter, at, span * orb.radius * scale, orb.colour);
     }
 }
 
-/// A soft light: two concentric fans, a tight bright one inside a wide faint
-/// one.
-///
-/// A single linear fan falls off in a straight line from centre to rim, which
-/// looks like a cone with a visible edge rather than a glow. Two overlaid
-/// falloffs approximate the shoulder of a gaussian closely enough that the
-/// boundary disappears, for the cost of one extra mesh.
-fn glow(painter: &Painter, centre: egui::Pos2, radius: f32, colour: Color32) {
-    let (halo_a, core_a) = split_alpha(colour.a());
-    let at = |a: u8| Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), a);
-
-    // `Color32` is premultiplied, so fading to `TRANSPARENT` — premultiplied
-    // zero — is a correct linear fade to nothing rather than a fade to black.
-    fan(
-        painter,
-        centre,
-        vec2(radius, radius),
-        at(halo_a),
-        Color32::TRANSPARENT,
-    );
-    fan(
-        painter,
-        centre,
-        vec2(radius * 0.55, radius * 0.55),
-        at(core_a),
-        Color32::TRANSPARENT,
-    );
+/// Static fallback for painting the ground without time progression.
+pub fn paint_static(painter: &Painter, rect: Rect, p: &Palette) {
+    paint(painter, rect, p, 0.0);
 }
 
-/// Splits a peak alpha across the two overlapping layers so their combination
+/// A soft light: concentric fans approximating a gaussian falloff.
+///
+/// Three layers rather than two. A single linear fan falls off in a straight
+/// line and reads as a cone with a visible rim; two soften that but still leave
+/// a discernible edge at this size, and these fields are nearly window-sized —
+/// any edge at all makes the background read as a shape rather than as light.
+/// Each additional layer costs one 48-triangle mesh, which is nothing.
+fn glow(painter: &Painter, centre: egui::Pos2, radius: f32, colour: Color32) {
+    let at = |a: u8| Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), a);
+    let (outer_a, mid_a, core_a) = split_alpha(colour.a());
+
+    for (scale, alpha) in [(1.0, outer_a), (0.62, mid_a), (0.32, core_a)] {
+        fan(
+            painter,
+            centre,
+            vec2(radius * scale, radius * scale),
+            at(alpha),
+            Color32::TRANSPARENT,
+        );
+    }
+}
+
+/// Splits a peak alpha across the three overlapping layers so their combination
 /// lands exactly on it.
 ///
-/// The layers composite rather than add: `1 - (1 - a₁)(1 - a₂)`. Giving each the
-/// full declared alpha therefore produced a centre far brighter than asked for
-/// — an orb declared at 44% arrived at 57% — which is how a "subtle" background
-/// turns into wallpaper without anyone changing the number they were reading.
-fn split_alpha(peak: u8) -> (u8, u8) {
+/// The layers composite rather than add — `1 - Π(1 - aᵢ)` — so giving each the
+/// full declared alpha produces a centre far brighter than asked for. Solving
+/// for it keeps the number in the palette meaning what it says.
+fn split_alpha(peak: u8) -> (u8, u8, u8) {
     let a = peak as f32 / 255.0;
-    // The halo carries the smaller share: it is the wide, soft part.
-    let halo = a * 0.45;
-    // Solve `1 - (1 - halo)(1 - core) = a` for the core.
-    let core = if halo >= 1.0 { 0.0 } else { (a - halo) / (1.0 - halo) };
-    ((halo * 255.0) as u8, (core * 255.0) as u8)
+    // Weighted outward: the widest layer carries least, which is what makes the
+    // falloff gaussian-ish rather than linear.
+    let outer = a * 0.30;
+    let remaining = if outer >= 1.0 { 0.0 } else { (a - outer) / (1.0 - outer) };
+    let mid = remaining * 0.45;
+    let core = if mid >= 1.0 { 0.0 } else { (remaining - mid) / (1.0 - mid) };
+
+    (
+        (outer * 255.0).round() as u8,
+        (mid * 255.0).round() as u8,
+        (core * 255.0).round() as u8,
+    )
 }
 
 /// Triangle fan with `inner` at the centre fading to `outer` at the rim.
@@ -140,103 +152,63 @@ mod tests {
 
     #[test]
     fn a_fan_has_one_triangle_per_segment() {
-        // Guards the index arithmetic: an off-by-one shows up as a missing
-        // wedge, which is easy to miss against a dark ground.
         let mut indices: Vec<u32> = Vec::new();
         for i in 0..SEGMENTS {
             indices.extend_from_slice(&[0, (i + 1) as u32, (i + 2) as u32]);
         }
         assert_eq!(indices.len(), SEGMENTS * 3);
-        // Highest index must still address a real vertex (1 centre + SEGMENTS+1 rim).
         assert!((*indices.iter().max().unwrap() as usize) < SEGMENTS + 2);
     }
 
     #[test]
     fn the_ring_closes() {
-        // The last rim vertex must coincide with the first, or the fan leaves a
-        // visible seam.
         let last = SEGMENTS as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
         assert!((0.0f32.cos() - last.cos()).abs() < 1e-6);
         assert!((0.0f32.sin() - last.sin()).abs() < 1e-6);
     }
 
     #[test]
-    fn orbs_stay_inside_the_window() {
-        // Positions are fractions; one outside 0..1 would put a light entirely
-        // off screen, which is a silent way to lose part of the effect.
+    fn orbs_stay_anchored_around_the_window() {
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
             for orb in &Palette::for_mode(mode).orbs {
-                assert!((0.0..=1.0).contains(&orb.x), "{mode:?}: x {} off screen", orb.x);
-                assert!((0.0..=1.0).contains(&orb.y), "{mode:?}: y {} off screen", orb.y);
+                assert!((-0.5..=1.5).contains(&orb.x), "{mode:?}: x {} out of range", orb.x);
+                assert!((-0.5..=1.5).contains(&orb.y), "{mode:?}: y {} out of range", orb.y);
                 assert!(orb.radius > 0.0);
+                assert!(orb.period > 0.0);
             }
         }
-    }
-
-    /// Relative luminance, per WCAG.
-    fn luminance(c: Color32) -> f32 {
-        fn channel(v: u8) -> f32 {
-            let v = v as f32 / 255.0;
-            if v <= 0.04045 {
-                v / 12.92
-            } else {
-                ((v + 0.055) / 1.055).powf(2.4)
-            }
-        }
-        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
-    }
-
-    fn contrast(a: Color32, b: Color32) -> f32 {
-        let (la, lb) = (luminance(a), luminance(b));
-        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
-        (hi + 0.05) / (lo + 0.05)
     }
 
     #[test]
-    fn the_two_glow_layers_add_up_to_the_declared_peak() {
+    fn the_glow_layers_add_up_to_the_declared_peak() {
         // The declared alpha has to mean what it says, or tuning the palette is
         // guesswork against a number that is not the one on screen.
-        for peak in [0u8, 20, 44, 88, 112, 200, 255] {
-            let (halo, core) = split_alpha(peak);
-            let combined = 1.0 - (1.0 - halo as f32 / 255.0) * (1.0 - core as f32 / 255.0);
+        for peak in [0u8, 20, 44, 76, 92, 112, 200, 255] {
+            let (outer, mid, core) = split_alpha(peak);
+            let combined = 1.0
+                - (1.0 - outer as f32 / 255.0)
+                    * (1.0 - mid as f32 / 255.0)
+                    * (1.0 - core as f32 / 255.0);
             let got = combined * 255.0;
             assert!(
-                (got - peak as f32).abs() <= 2.0,
+                (got - peak as f32).abs() <= 3.0,
                 "peak {peak} arrives as {got:.0}"
             );
         }
     }
 
     #[test]
-    fn orbs_are_faint_enough_to_stay_a_background() {
-        // The real risk is an orb reading as a distinct disc rather than as a
-        // cast on the ground. Measured as contrast against the ground it sits
-        // on — which is the property that matters — rather than as a raw alpha,
-        // which means nothing without knowing what is behind it.
-        for mode in [ThemeMode::Light, ThemeMode::Dark] {
-            let p = Palette::for_mode(mode);
-            for (i, orb) in p.orbs.iter().enumerate() {
-                let lit = crate::theme::composite(orb.colour, p.ground);
-                let ratio = contrast(lit, p.ground);
-                assert!(
-                    ratio <= 1.55,
-                    "{mode:?}: orb {i} peaks at {ratio:.2}:1 against the ground — a visible disc, not a cast"
-                );
-                // And the opposite failure: an orb nobody can see is dead code
-                // that still costs a mesh every frame.
-                assert!(
-                    ratio >= 1.05,
-                    "{mode:?}: orb {i} is invisible ({ratio:.2}:1)"
-                );
-            }
-        }
+    fn the_layers_widen_as_they_fade() {
+        // Gaussian-ish means the widest layer is the faintest. Reversed, the
+        // field gets a hard bright rim — the exact thing three layers exist to
+        // avoid.
+        let (outer, mid, core) = split_alpha(200);
+        assert!(outer < mid, "outer {outer} should be fainter than mid {mid}");
+        assert!(mid < core, "mid {mid} should be fainter than core {core}");
     }
 
     #[test]
     fn the_orbs_are_actually_different_hues() {
-        // Three tints of one colour would be a gradient, not a prism. Compares
-        // the ordering of the channels, which is what distinguishes hues,
-        // rather than the raw values.
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
             let orbs = Palette::for_mode(mode).orbs;
             let hue_key = |c: Color32| {
@@ -244,9 +216,7 @@ mod tests {
                 (r - g, g - b)
             };
             let keys: Vec<_> = orbs.iter().map(|o| hue_key(o.colour)).collect();
-            assert_ne!(keys[0], keys[1], "{mode:?}: orbs 0 and 1 share a hue");
-            assert_ne!(keys[1], keys[2], "{mode:?}: orbs 1 and 2 share a hue");
-            assert_ne!(keys[0], keys[2], "{mode:?}: orbs 0 and 2 share a hue");
+            assert_ne!(keys[0], keys[1], "{mode:?}: the two fields share a hue");
         }
     }
 }

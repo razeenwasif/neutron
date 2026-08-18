@@ -52,10 +52,38 @@ const MIN_NAME_WIDTH: f32 = 120.0;
 /// is sampled from, which is what keeps it crisp on a high-DPI display.
 const ICON_DRAW: f32 = 20.0;
 
+/// How the listing is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// One row per entry, with size, date and type columns.
+    #[default]
+    List,
+    /// A grid of tiles. Trades the metadata columns for a much larger icon,
+    /// which is what makes a folder of images or executables recognisable at a
+    /// glance rather than a column of near-identical filenames.
+    Grid,
+}
+
+impl ViewMode {
+    pub fn toggled(self) -> Self {
+        match self {
+            ViewMode::List => ViewMode::Grid,
+            ViewMode::Grid => ViewMode::List,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileListState {
     pub sort: SortSpec,
     pub show_hidden: bool,
+    pub view: ViewMode,
+    /// Tiles per row as last laid out.
+    ///
+    /// Written during paint and read by the app's key handling: in a grid,
+    /// Up and Down move by a whole row, and only the layout knows how wide a
+    /// row is. Zero until the grid has been drawn once.
+    pub columns: usize,
     /// Live narrowing filter from the pane header's field. Empty means no
     /// filter; see [`neutron_core::sort::apply_filtered`].
     pub filter: String,
@@ -72,6 +100,8 @@ impl Default for FileListState {
         Self {
             sort: SortSpec::default(),
             show_hidden: false,
+            view: ViewMode::default(),
+            columns: 0,
             filter: String::new(),
             scroll_to: None,
             scroll_offset: 0.0,
@@ -115,8 +145,23 @@ pub trait IconSource {
     fn uv_for(&self, name: &str, kind: EntryKind) -> Option<egui::Rect>;
 }
 
-/// Draws the header and the virtualized rows.
+/// Draws the listing in whichever view mode is active.
 pub fn show(
+    ui: &mut Ui,
+    state: &mut FileListState,
+    list: &EntryList,
+    selection: &Selection,
+    p: &Palette,
+    icons: Option<&dyn IconSource>,
+) -> Option<FileListAction> {
+    match state.view {
+        ViewMode::List => show_list(ui, state, list, selection, p, icons),
+        ViewMode::Grid => show_grid(ui, state, list, selection, p, icons),
+    }
+}
+
+/// Draws the header and the virtualized rows.
+fn show_list(
     ui: &mut Ui,
     state: &mut FileListState,
     list: &EntryList,
@@ -319,8 +364,13 @@ fn draw_row(
     let is_cursor = selection.cursor() == Some(idx);
 
     if selected {
-        ui.painter()
-            .rect_filled(rect, RADIUS_CONTROL as f32, p.selection);
+        ui.painter().rect(
+            rect,
+            RADIUS_CONTROL as f32,
+            p.selection,
+            Stroke::new(1.0, p.border_strong),
+            egui::StrokeKind::Inside,
+        );
     } else if response.hovered() {
         ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
     }
@@ -373,7 +423,13 @@ fn draw_row(
             ui.painter(),
             centre,
             icons::for_kind(kind),
-            if hidden { p.text_faint } else { p.icon },
+            if selected {
+                p.accent
+            } else if hidden {
+                p.text_faint
+            } else {
+                p.icon
+            },
         ),
     }
     x += ICON_SLOT;
@@ -461,6 +517,231 @@ fn draw_row(
         });
     }
 
+    None
+}
+
+
+// --- grid view ------------------------------------------------------------
+
+/// Tile geometry, in points.
+const TILE_W: f32 = 128.0;
+const TILE_H: f32 = 116.0;
+const TILE_GAP: f32 = 10.0;
+/// Icon size inside a tile. Sampled from the 32px atlas cell, so this is a
+/// modest upscale — soft rather than crisp, which is the price of one atlas
+/// shared with the list view. A second atlas at 64px would double its memory
+/// to sharpen an icon nobody reads at arm's length.
+const TILE_ICON: f32 = 44.0;
+
+/// Draws the grid, virtualized a row of tiles at a time.
+///
+/// Same trick as the list: `show_rows` is told the number of tile *rows*, so a
+/// 500k-entry directory costs the same per frame as a 50-entry one. What
+/// changes is that one "row" now holds several entries.
+fn show_grid(
+    ui: &mut Ui,
+    state: &mut FileListState,
+    list: &EntryList,
+    selection: &Selection,
+    p: &Palette,
+    icons: Option<&dyn IconSource>,
+) -> Option<FileListAction> {
+    let mut action = None;
+
+    let avail = (ui.available_width() - LIST_PAD * 2.0).max(TILE_W);
+    // At least one column, however narrow the pane: a grid with zero columns
+    // divides by zero and shows nothing.
+    let columns = (((avail + TILE_GAP) / (TILE_W + TILE_GAP)).floor() as usize).max(1);
+    state.columns = columns;
+
+    let count = list.order().len();
+    let rows = count.div_ceil(columns);
+    let viewport_height = ui.available_height();
+
+    let mut scroll = egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .id_salt("file_grid_scroll");
+
+    // Scroll-into-view, in tile rows rather than list rows.
+    if let Some(target) = state.scroll_to.take() {
+        if let Some(index) = list.rank(target) {
+            let row = index / columns;
+            let top = row as f32 * (TILE_H + TILE_GAP);
+            let bottom = top + TILE_H + TILE_GAP;
+            let current = state.scroll_offset;
+
+            let desired = if top < current {
+                Some(top)
+            } else if bottom > current + viewport_height {
+                Some(bottom - viewport_height)
+            } else {
+                None
+            };
+            if let Some(offset) = desired {
+                scroll = scroll.vertical_scroll_offset(offset.max(0.0));
+            }
+        }
+    }
+
+    let output = scroll.show_rows(ui, TILE_H + TILE_GAP, rows, |ui, visible| {
+        let full = ui.available_width();
+        for row in visible {
+            let (band, response) =
+                ui.allocate_exact_size(vec2(full, TILE_H + TILE_GAP), Sense::click());
+
+            for column in 0..columns {
+                let index = row * columns + column;
+                if index >= count {
+                    break;
+                }
+                let idx = list.at(index);
+                let rect = Rect::from_min_size(
+                    pos2(
+                        band.left() + LIST_PAD + column as f32 * (TILE_W + TILE_GAP),
+                        band.top() + TILE_GAP / 2.0,
+                    ),
+                    vec2(TILE_W, TILE_H),
+                );
+                if let Some(a) = draw_tile(ui, list, selection, p, idx, rect, icons) {
+                    action = Some(a);
+                }
+            }
+
+            // Clicking the empty space to the right of the last tile in a row
+            // clears the selection, matching the list view's dead space.
+            if response.clicked() && action.is_none() {
+                action = Some(FileListAction::ClearSelection);
+            }
+        }
+
+        let leftover = ui.available_size();
+        if leftover.y > 0.0 {
+            let (rect, response) = ui.allocate_exact_size(leftover, Sense::click());
+            if response.clicked() {
+                action = Some(FileListAction::ClearSelection);
+            }
+            if response.secondary_clicked() {
+                action = Some(FileListAction::ContextMenu {
+                    idx: None,
+                    pos: response
+                        .interact_pointer_pos()
+                        .unwrap_or_else(|| rect.center()),
+                });
+            }
+        }
+    });
+
+    state.scroll_offset = output.state.offset.y;
+    action
+}
+
+/// One tile: a large icon over a wrapped, centred name.
+fn draw_tile(
+    ui: &mut Ui,
+    list: &EntryList,
+    selection: &Selection,
+    p: &Palette,
+    idx: usize,
+    rect: Rect,
+    icons: Option<&dyn IconSource>,
+) -> Option<FileListAction> {
+    let response = ui.interact(rect, ui.id().with(("tile", idx)), Sense::click());
+
+    let selected = selection.is_selected(idx);
+    let is_cursor = selection.cursor() == Some(idx);
+
+    if selected {
+        ui.painter()
+            .rect_filled(rect, RADIUS_CONTROL as f32, p.selection);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
+    }
+    if is_cursor && !selected {
+        ui.painter().rect_stroke(
+            rect,
+            RADIUS_CONTROL as f32,
+            Stroke::new(1.0, p.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let kind = list.kind(idx);
+    let hidden = list.is_hidden(idx);
+    let name = list.name(idx);
+
+    let icon_centre = pos2(rect.center().x, rect.top() + 14.0 + TILE_ICON / 2.0);
+    let uv = icons.and_then(|src| src.uv_for(name, kind));
+
+    match (icons, uv) {
+        (Some(src), Some(uv)) => {
+            let icon_rect = Rect::from_center_size(icon_centre, vec2(TILE_ICON, TILE_ICON));
+            let mut mesh = egui::Mesh::with_texture(src.texture());
+            let tint = if hidden {
+                Color32::from_white_alpha(110)
+            } else {
+                Color32::WHITE
+            };
+            mesh.add_rect_with_uv(icon_rect, uv, tint);
+            ui.painter().add(egui::Shape::mesh(mesh));
+        }
+        // The drawn glyphs are built for a 16pt slot, so they are scaled up by
+        // drawing several concentric copies rather than stretched — simplest is
+        // to draw the outline at its natural size, centred. A placeholder is
+        // only on screen for a frame or two.
+        _ => icons::draw(
+            ui.painter(),
+            icon_centre,
+            icons::for_kind(kind),
+            if hidden { p.text_faint } else { p.icon },
+        ),
+    }
+
+    // Name: up to two lines, centred, ellipsised. Two rather than one because a
+    // grid of truncated names is unusable — the distinguishing part of a
+    // filename is very often at the end.
+    let colour = if hidden { p.text_muted } else { p.text };
+    let mut job = egui::text::LayoutJob::simple(
+        name.to_owned(),
+        FontId::proportional(11.5),
+        colour,
+        TILE_W - 12.0,
+    );
+    job.halign = Align2::CENTER_TOP.x();
+    job.wrap = egui::text::TextWrapping {
+        max_width: TILE_W - 12.0,
+        max_rows: 2,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(
+        pos2(rect.center().x, rect.top() + 14.0 + TILE_ICON + 8.0),
+        galley,
+        colour,
+    );
+
+    if response.double_clicked() {
+        return Some(FileListAction::Activate(idx));
+    }
+    if response.clicked() {
+        let mods = ui.input(|i| i.modifiers);
+        let mode = if mods.shift {
+            SelectMode::Range
+        } else if mods.ctrl || mods.command {
+            SelectMode::Toggle
+        } else {
+            SelectMode::Replace
+        };
+        return Some(FileListAction::Select { idx, mode });
+    }
+    if response.secondary_clicked() {
+        return Some(FileListAction::ContextMenu {
+            idx: Some(idx),
+            pos: response
+                .interact_pointer_pos()
+                .unwrap_or_else(|| rect.center()),
+        });
+    }
     None
 }
 

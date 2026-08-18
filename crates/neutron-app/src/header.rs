@@ -57,6 +57,7 @@ pub enum HeaderAction {
     SetFilter(String),
     ToggleHidden,
     Split(Axis),
+    ToggleView,
 }
 
 /// Everything the header needs to draw itself. Passed as a struct rather than
@@ -67,6 +68,7 @@ pub struct Header<'a> {
     pub can_forward: bool,
     pub has_parent: bool,
     pub show_hidden: bool,
+    pub grid: bool,
     pub filter: &'a str,
     /// Number of entries currently listed, shown beside the title.
     pub shown: usize,
@@ -149,6 +151,27 @@ pub fn show(
         }
         right -= 30.0;
     }
+
+    // View toggle. Shows the view it switches *to*, which is the convention
+    // every image browser uses — a button showing the current state looks like
+    // a status light rather than a control.
+    let view = Rect::from_center_size(pos2(right - 14.0, nav.center().y), vec2(28.0, 28.0));
+    if icon_button(
+        ui,
+        p,
+        view,
+        if h.grid { Glyph::List } else { Glyph::Grid },
+        true,
+        false,
+        if h.grid {
+            "List view (Ctrl+Shift+L)"
+        } else {
+            "Grid view (Ctrl+Shift+L)"
+        },
+    ) {
+        action = Some(HeaderAction::ToggleView);
+    }
+    right -= 30.0;
 
     let eye = Rect::from_center_size(pos2(right - 14.0, nav.center().y), vec2(28.0, 28.0));
     if icon_button(
@@ -305,19 +328,29 @@ fn filter_field(
 ) -> Option<String> {
     let id = filter_id(group);
     let mut text = current.to_owned();
+    let has_focus = ui.memory(|m| m.has_focus(id));
 
     ui.painter().rect(
         rect,
         RADIUS_CONTROL as f32,
         p.inset,
-        egui::Stroke::new(1.0, p.border),
+        egui::Stroke::new(1.0, if has_focus { p.accent } else { p.border }),
         egui::StrokeKind::Inside,
     );
+    if has_focus {
+        let focus_glow = egui::epaint::Shadow {
+            offset: [0, 0],
+            blur: 8,
+            spread: 0,
+            color: p.selection,
+        };
+        ui.painter().add(focus_glow.as_shape(rect, egui::CornerRadius::same(RADIUS_CONTROL)));
+    }
     icons::draw(
         ui.painter(),
         pos2(rect.left() + 15.0, rect.center().y),
         Glyph::Search,
-        p.text_faint,
+        if has_focus { p.accent } else { p.text_faint },
     );
 
     let text_rect = Rect::from_min_max(

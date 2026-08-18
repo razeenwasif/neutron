@@ -49,6 +49,7 @@ enum Action {
     ClearSelection,
     SelectAll,
     ToggleHidden,
+    ToggleView,
     ToggleTheme,
     /// Narrow the focused tab's listing. Empty clears the filter.
     SetFilter(String),
@@ -56,6 +57,8 @@ enum Action {
     FocusFilter,
     /// Delete the selection. `permanent` skips the Recycle Bin.
     Delete { permanent: bool },
+    /// How many tiles the grid fitted per row, reported back after layout.
+    SetGridColumns { group: GroupId, columns: usize },
     /// Native shell context menu. `idx` is the row clicked, or `None` for the
     /// empty space below the rows.
     ContextMenu { idx: Option<usize>, pos: egui::Pos2 },
@@ -71,6 +74,8 @@ enum Action {
     ActivateFinderRow(usize),
     StartIndexer,
     MoveCursor { delta: isize, extend: bool },
+    /// One tile left or right. Ignored outside the grid.
+    MoveWithinRow { delta: isize, extend: bool },
     MoveTo { pos: usize, extend: bool },
     TypeAhead(char),
 
@@ -392,6 +397,15 @@ impl NeutronApp {
                 }
             }
 
+            Action::ToggleView => {
+                if let Some(t) = self.workspace.active_tab_mut() {
+                    t.view.view = t.view.view.toggled();
+                    // Bring the cursor back into view: a row that was on screen
+                    // in the list is on a completely different line of a grid.
+                    t.view.scroll_to = t.selection.cursor();
+                }
+            }
+
             Action::SetFilter(text) => {
                 if let Some(t) = self.workspace.active_tab_mut() {
                     if t.view.filter != text {
@@ -409,6 +423,19 @@ impl NeutronApp {
             }
 
             Action::Delete { permanent } => self.delete_selection(permanent),
+
+            Action::SetGridColumns { group, columns } => {
+                if let Some(tab) = self
+                    .workspace
+                    .groups
+                    .get(&group)
+                    .and_then(|g| g.active_tab())
+                {
+                    if let Some(t) = self.workspace.tabs.get_mut(&tab) {
+                        t.view.columns = columns;
+                    }
+                }
+            }
 
             Action::ContextMenu { idx, pos } => self.context_menu(ctx, idx, pos),
 
@@ -443,10 +470,27 @@ impl NeutronApp {
 
             Action::MoveCursor { delta, extend } => {
                 if let Some(t) = self.workspace.active_tab_mut() {
-                    t.selection.move_cursor(&t.list, delta, extend);
+                    // In a grid, Up and Down move by a whole row. The layout is
+                    // the only thing that knows how wide a row is, so it
+                    // records the column count during paint.
+                    let step = if t.view.view == neutron_ui::file_list::ViewMode::Grid {
+                        (t.view.columns.max(1)) as isize
+                    } else {
+                        1
+                    };
+                    t.selection.move_cursor(&t.list, delta * step, extend);
                     t.view.scroll_to = t.selection.cursor();
                 }
             }
+            Action::MoveWithinRow { delta, extend } => {
+                if let Some(t) = self.workspace.active_tab_mut() {
+                    if t.view.view == neutron_ui::file_list::ViewMode::Grid {
+                        t.selection.move_cursor(&t.list, delta, extend);
+                        t.view.scroll_to = t.selection.cursor();
+                    }
+                }
+            }
+
             Action::MoveTo { pos, extend } => {
                 if let Some(t) = self.workspace.active_tab_mut() {
                     t.selection.move_to(&t.list, pos, extend);
@@ -859,17 +903,15 @@ impl eframe::App for NeutronApp {
         let p = self.palette();
         let mut actions: Vec<Action> = Vec::new();
 
-        // The ground the cards sit on. Painted onto a background layer so it
-        // stays beneath every panel regardless of declaration order.
-        //
-        // Static: no repaint is requested for it. The app is genuinely idle
-        // when nothing is happening, which an animated background prevented.
+        // The ground the cards sit on: 3 slow-drifting colour fields behind the translucent glass panels.
+        // Painted onto a background layer so it stays beneath every panel regardless of declaration order.
         let screen = ctx.content_rect();
         let bg = ui
             .painter()
             .clone()
             .with_layer_id(egui::LayerId::background());
-        neutron_ui::ambient::paint(&bg, screen, &p);
+        neutron_ui::ambient::paint(&bg, screen, &p, ui.ctx().input(|i| i.time));
+        ctx.request_repaint_after(Duration::from_millis(33));
 
         self.drain_places();
         self.drain_loads(&ctx);
@@ -1039,6 +1081,16 @@ impl NeutronApp {
                         egui::Key::ArrowUp,
                         Action::MoveCursor { delta: -1, extend: shift },
                     ),
+                    // Horizontal movement only means anything in a grid; in the
+                    // list it is a no-op, which is what `MoveWithin` reports.
+                    (
+                        egui::Key::ArrowRight,
+                        Action::MoveWithinRow { delta: 1, extend: shift },
+                    ),
+                    (
+                        egui::Key::ArrowLeft,
+                        Action::MoveWithinRow { delta: -1, extend: shift },
+                    ),
                     (
                         egui::Key::PageDown,
                         Action::MoveCursor { delta: page, extend: shift },
@@ -1069,6 +1121,8 @@ impl NeutronApp {
                 bindings.extend([
                     (egui::Key::A, Action::SelectAll),
                     (egui::Key::H, Action::ToggleHidden),
+                    // Shift+L rather than plain L, which type-ahead owns.
+                    (egui::Key::L, Action::ToggleView),
                     // Filters the current listing. Index-wide search takes
                     // this binding at M4; until then narrowing what is already
                     // on screen is what Ctrl+F can honestly do.
@@ -1328,6 +1382,7 @@ impl NeutronApp {
             C::DeleteSelection => Some(Action::Delete { permanent: false }),
 
             C::ToggleHidden => Some(Action::ToggleHidden),
+            C::ToggleView => Some(Action::ToggleView),
             C::ToggleTheme => Some(Action::ToggleTheme),
 
             C::FindInFolder => Some(Action::ToggleFinder(crate::finder::Mode::Files)),
@@ -1528,6 +1583,17 @@ impl NeutronApp {
             )
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+
+                // The panes paint their own card and so get the glass edges
+                // from `draw_card`; the sidebar is an `egui::Frame`, which
+                // draws only fill and stroke. Without this it was the one
+                // panel on screen that was translucent but not glass.
+                theme::glass_highlight(
+                    ui.painter(),
+                    ui.max_rect().expand2(egui::vec2(10.0, 12.0)),
+                    egui::CornerRadius::same(theme::RADIUS_CARD),
+                );
+
                 sidebar::brand(ui, p);
                 ui.add_space(6.0);
 
@@ -1725,6 +1791,7 @@ impl NeutronApp {
             can_forward: tab.history.can_go_forward(),
             has_parent: tab.location().parent().is_some(),
             show_hidden: tab.view.show_hidden,
+            grid: tab.view.view == neutron_ui::file_list::ViewMode::Grid,
             filter: &tab.view.filter,
             shown,
             total,
@@ -1743,6 +1810,7 @@ impl NeutronApp {
                 header::HeaderAction::Navigate(id) => Action::Navigate(id),
                 header::HeaderAction::SetFilter(text) => Action::SetFilter(text),
                 header::HeaderAction::ToggleHidden => Action::ToggleHidden,
+                header::HeaderAction::ToggleView => Action::ToggleView,
                 header::HeaderAction::Split(axis) => Action::Split(axis),
             });
         }
@@ -1820,14 +1888,28 @@ impl NeutronApp {
             dir: tab.location().as_path().map(|p| p.to_path_buf()),
         };
 
-        if let Some(a) = file_list::show(
+        let drawn = file_list::show(
             ui,
             &mut view,
             &tab.list,
             &tab.selection,
             p,
             Some(&source as &dyn file_list::IconSource),
-        ) {
+        );
+
+        // The grid works out its own column count from the pane width, and
+        // that number is what Up and Down have to step by. It is computed on a
+        // *clone* of the view state — this method holds only `&self` — so
+        // without reporting it back the count stayed zero and the arrow keys
+        // moved one tile at a time instead of one row.
+        if view.columns != tab.view.columns {
+            actions.push(Action::SetGridColumns {
+                group: group_id,
+                columns: view.columns,
+            });
+        }
+
+        if let Some(a) = drawn {
             // Interacting with a pane also focuses it, so keystrokes go where
             // the user just clicked.
             if group_id != self.workspace.focused {

@@ -92,26 +92,28 @@ pub fn show(
     }
 }
 
-/// Paints a pane card: shadow, fill, and hairline.
+/// Paints a pane card: shadow, translucent fill, glass highlight, and hairline.
 fn draw_card(ui: &Ui, rect: Rect, p: &Palette, focused: bool) {
     let radius = egui::CornerRadius::same(RADIUS_CARD);
 
-    let shadow = egui::epaint::Shadow {
-        offset: [0, 2],
-        blur: 12,
-        spread: 0,
-        color: egui::Color32::from_black_alpha(38),
-    };
+    let shadow = theme::card_shadow(p);
     ui.painter().add(shadow.as_shape(rect, radius));
 
     ui.painter().rect_filled(rect, radius, p.card);
+    theme::glass_highlight(ui.painter(), rect, radius);
 
-    // Focus is shown by tinting the card's own border rather than by adding a
-    // second ring inside it. One border, two states.
+    // One hairline, the same in both states. An accent ring plus a glow around
+    // the focused pane put the loudest colour on screen around the largest
+    // element — it read as a selection box rather than as a pane, and with a
+    // single pane open it framed the entire window.
+    //
+    // Focus still has to be visible with several panes open. It is carried by
+    // the active tab's accent underline in the tab strip, which is small,
+    // unambiguous, and already there.
     ui.painter().rect_stroke(
         rect,
         radius,
-        egui::Stroke::new(1.0, if focused { p.accent } else { p.border }),
+        egui::Stroke::new(1.0, if focused { p.border_strong } else { p.border }),
         egui::StrokeKind::Inside,
     );
 }

@@ -30,6 +30,7 @@ pub enum CommandId {
     DeleteSelection,
 
     ToggleHidden,
+    ToggleView,
     ToggleTheme,
 
     FindInFolder,
@@ -83,6 +84,11 @@ pub const ALL: &[CommandDef] = &[
     },
 
     CommandDef { id: CommandId::ToggleHidden, title: "Show hidden files", hint: "Ctrl+H" },
+    CommandDef {
+        id: CommandId::ToggleView,
+        title: "Switch list / grid view",
+        hint: "Ctrl+Shift+L",
+    },
     CommandDef { id: CommandId::ToggleTheme, title: "Switch light / dark", hint: "Ctrl+D" },
 
     CommandDef { id: CommandId::FindInFolder, title: "Find file in this folder", hint: "Ctrl+P" },

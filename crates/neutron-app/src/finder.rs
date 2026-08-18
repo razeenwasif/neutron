@@ -211,7 +211,13 @@ pub fn show(ui: &mut Ui, p: &Palette, finder: &Finder) -> Option<FinderAction> {
     // Scrim. Dark in both themes — it dims the window behind, and a light scrim
     // over a light UI reads as fog rather than depth.
     painter.rect_filled(screen, 0.0, Color32::from_black_alpha(104));
-    painter.add(theme::card_shadow(p).as_shape(card, egui::CornerRadius::same(RADIUS_CARD)));
+    let shadow = egui::epaint::Shadow {
+        offset: [0, 16],
+        blur: 48,
+        spread: 0,
+        color: Color32::from_black_alpha(90),
+    };
+    painter.add(shadow.as_shape(card, egui::CornerRadius::same(RADIUS_CARD)));
     painter.rect(
         card,
         RADIUS_CARD as f32,
@@ -219,6 +225,7 @@ pub fn show(ui: &mut Ui, p: &Palette, finder: &Finder) -> Option<FinderAction> {
         egui::Stroke::new(1.0, p.border_strong),
         egui::StrokeKind::Inside,
     );
+    theme::glass_highlight(&painter, card, egui::CornerRadius::same(RADIUS_CARD));
 
     let scrim = ui.interact(screen, ui.id().with("finder-scrim"), Sense::click());
 

@@ -24,7 +24,7 @@ use egui::{Color32, Rect, Sense, Ui, pos2, vec2};
 use neutron_core::NodeId;
 use neutron_core::places::{Place, PlaceKind};
 use neutron_ui::icons::{self, Glyph};
-use neutron_ui::theme::{Palette, NAV_HEIGHT, RADIUS_CONTROL, RADIUS_SMALL, ThemeMode, micro_caps};
+use neutron_ui::theme::{self, Palette, NAV_HEIGHT, RADIUS_CONTROL, RADIUS_SMALL, ThemeMode, micro_caps};
 
 /// Space reserved at the bottom for the storage panel and the theme toggle.
 const FOOTER_HEIGHT: f32 = 96.0;
@@ -33,11 +33,17 @@ const FOOTER_HEIGHT: f32 = 96.0;
 pub fn brand(ui: &mut Ui, p: &Palette) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
 
-    // The mark: a rounded square in the accent with a folder cut into it. The
-    // only place the accent is used as a fill rather than a wash — an app's own
-    // mark is allowed to be the one saturated thing on screen.
+    // The brand mark: rounded square with glowing purple gradient, folder glyph, and subtle glass highlight.
     let mark = Rect::from_min_size(pos2(rect.left() + 2.0, rect.center().y - 13.0), vec2(26.0, 26.0));
-    ui.painter().rect_filled(mark, 8.0, p.accent);
+    let mark_shadow = egui::epaint::Shadow {
+        offset: [0, 2],
+        blur: 14,
+        spread: 0,
+        color: p.selection,
+    };
+    ui.painter().add(mark_shadow.as_shape(mark, egui::CornerRadius::same(7)));
+    ui.painter().rect_filled(mark, 7.0, p.accent_pressed);
+    theme::glass_highlight(ui.painter(), mark, egui::CornerRadius::same(7));
     icons::draw(ui.painter(), mark.center(), Glyph::Folder, Color32::WHITE);
 
     ui.painter().text(
@@ -75,16 +81,21 @@ pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) ->
     let pill = Rect::from_min_max(pos2(rect.left(), rect.top()), pos2(rect.right(), rect.bottom()));
 
     if selected {
-        // Wash plus hairline: the boxed selected state from the reference
-        // design, in Neutron's accent rather than as a second white-on-white
-        // card, which would be invisible on an already-white sidebar.
+        // Translucent selection wash plus subtle border
         ui.painter().rect(
             pill,
             RADIUS_CONTROL as f32,
             p.selection,
-            egui::Stroke::new(1.0, p.border),
+            egui::Stroke::new(1.0, p.border_strong),
             egui::StrokeKind::Inside,
         );
+        // Active indicator: glowing vertical accent bar on the left edge (matches Aero)
+        let bar_h = (pill.height() * 0.58).round();
+        let bar = Rect::from_min_size(
+            pos2(pill.left() + 1.0, (pill.center().y - bar_h / 2.0).round()),
+            vec2(3.0, bar_h),
+        );
+        ui.painter().rect_filled(bar, 1.5, p.accent);
     } else if response.hovered() {
         ui.painter().rect_filled(pill, RADIUS_CONTROL as f32, p.hover);
     }
