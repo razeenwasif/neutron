@@ -62,9 +62,29 @@
   - Not carried over: per-item icons supplied as `HBITMAP`. A fully owner-drawn
     item with no menu string falls back to its verb.
 
-#### 6. Known Cost
+#### 6. Everyday File Operations
+- **Clipboard**: `Ctrl+C` / `Ctrl+X` / `Ctrl+V` through the real Windows
+  clipboard, written as raw `CF_HDROP` plus `Preferred DropEffect` — so it
+  interoperates with Explorer both ways and survives Neutron exiting. Cut files
+  are drawn faded, matched per visible row so a pending cut costs nothing on a
+  large listing.
+  - `Ctrl+V` arrives through a window subclass. egui-winit turns the chord into
+    `Event::Paste(text)` and drops it when the clipboard holds no text — which
+    is exactly what a copied *file* looks like.
+- **Rename**: `F2` opens a box over the name column with the stem selected.
+  Invalid names show a red border and Enter leaves the box open.
+- **New folder**: `Ctrl+Shift+N`, created and immediately renameable.
+- **Background menu**: right-clicking empty space opens the folder's own shell
+  menu (New, Open in Terminal, Properties) via `CreateViewObject`. Paste is
+  absent — Explorer's copy comes from its own view object, not the folder.
+- **Drag out**: pressing an already-selected row and moving hands the selection
+  to the system as an OLE drag, using `SHCreateDataObject` so every format a
+  target might ask for is answered. Runs on the STA pool with the input queues
+  joined, so the window keeps painting for the whole drag.
+
+#### 7. Known Cost
 - The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
 
-#### 7. Test Suite
+#### 8. Test Suite
 - Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`, `neutron-index`) passing on Linux.
-- Full suite on the Windows target: 305 tests, clippy clean.
+- Full suite on the Windows target: 337 tests, clippy clean.
