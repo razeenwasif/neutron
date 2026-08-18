@@ -7,6 +7,8 @@ target/
 .neutron-target/
 
 # Local secrets: Google Drive OAuth client, etc.
+# The client id is supplied through NEUTRON_GOOGLE_CLIENT_ID, never committed —
+# see the Google Drive section of the README.
 .env
 secrets.toml
 

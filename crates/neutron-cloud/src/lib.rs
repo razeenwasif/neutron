@@ -15,6 +15,12 @@
 //!
 //! Filled in at M2 (OneDrive) and M7 (Google Drive).
 
+pub mod credentials;
+pub mod drive;
+pub mod flow;
+pub mod google;
+pub mod oauth;
+
 use neutron_core::entry::SyncState;
 
 /// A location within a provider. Drive addresses objects by opaque id rather

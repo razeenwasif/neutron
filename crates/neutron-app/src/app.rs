@@ -73,6 +73,8 @@ enum Action {
     /// Activate the row at this index in the finder.
     ActivateFinderRow(usize),
     StartIndexer,
+    /// Begin the Google Drive consent flow.
+    ConnectDrive,
     MoveCursor { delta: isize, extend: bool },
     /// One tile left or right. Ignored outside the grid.
     MoveWithinRow { delta: isize, extend: bool },
@@ -148,6 +150,12 @@ pub struct NeutronApp {
     /// apartment thread, because only the shell knows and asking blocks.
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
+
+    /// Whether Drive is configured, signed in, or unavailable. Cached because
+    /// answering it reads the credential store, which is not a per-frame cost.
+    drive_state: neutron_cloud::google::DriveState,
+    drive_tx: crossbeam_channel::Sender<neutron_cloud::google::DriveState>,
+    drive_rx: crossbeam_channel::Receiver<neutron_cloud::google::DriveState>,
 }
 
 impl NeutronApp {
@@ -184,6 +192,8 @@ impl NeutronApp {
         let icons = IconService::new(sta.clone(), cc.egui_ctx.clone());
         let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
         let (open_as_tx, open_as_rx) = crossbeam_channel::unbounded();
+        let (drive_tx, drive_rx) = crossbeam_channel::unbounded();
+        let drive_state = neutron_cloud::google::GoogleDrive::new().state();
 
         // Attaches to a helper left running by an earlier session, so search is
         // available with no prompt at all in the common case.
@@ -232,6 +242,9 @@ impl NeutronApp {
             refresh_rx,
             open_as_tx,
             open_as_rx,
+            drive_state,
+            drive_tx,
+            drive_rx,
         }
     }
 
@@ -456,6 +469,8 @@ impl NeutronApp {
             Action::MoveFinderCursor(delta) => self.finder.move_cursor(delta),
             Action::ActivateFinderRow(index) => self.activate_finder_row(index),
             Action::StartIndexer => self.index.start_helper(),
+
+            Action::ConnectDrive => self.connect_drive(),
 
             Action::FocusFilter => {
                 if let Some(group) = self.workspace.focused_group().map(|g| g.id) {
@@ -917,6 +932,9 @@ impl eframe::App for NeutronApp {
         self.drain_loads(&ctx);
         self.drain_refreshes();
         self.drain_open_as();
+        while let Ok(state) = self.drive_rx.try_recv() {
+            self.drive_state = state;
+        }
         // Before drawing: installs icons that arrived since the last frame, so
         // rows painted below pick them up immediately rather than a frame late.
         self.icons.pump();
@@ -1201,6 +1219,35 @@ impl NeutronApp {
 // --- chrome ----------------------------------------------------------------
 
 impl NeutronApp {
+    /// Runs the Google Drive consent flow on a worker.
+    ///
+    /// Opens a browser and blocks until the user finishes, so it cannot be on
+    /// the paint thread — and the STA pool is where every other blocking,
+    /// user-facing operation already lives.
+    fn connect_drive(&mut self) {
+        if matches!(self.drive_state, neutron_cloud::google::DriveState::NotConfigured) {
+            tracing::warn!("no Google client id configured; not starting the flow");
+            return;
+        }
+
+        self.drive_state = neutron_cloud::google::DriveState::Error("Connecting…".to_owned());
+        let wake = self.ctx.clone();
+        let done = self.drive_tx.clone();
+
+        self.sta.submit(move || {
+            let drive = neutron_cloud::google::GoogleDrive::new();
+            let state = match drive.sign_in() {
+                Ok(()) => neutron_cloud::google::DriveState::SignedIn,
+                Err(e) => {
+                    tracing::warn!("Google Drive sign-in failed: {e}");
+                    neutron_cloud::google::DriveState::Error(e.to_string())
+                }
+            };
+            let _ = done.send(state);
+            wake.request_repaint();
+        });
+    }
+
     /// Recomputes the finder's rows for the current mode and needle.
     ///
     /// Commands are matched here and now — a few dozen entries, so a round trip
@@ -1659,13 +1706,47 @@ impl NeutronApp {
                         actions.push(Action::Navigate(place.id.clone()));
                     }
                 }
-                sidebar::placeholder_row(
-                    ui,
-                    p,
-                    "Google Drive",
-                    neutron_ui::icons::Glyph::Cloud,
-                    "Not connected — arrives at M7",
-                );
+                use neutron_cloud::google::DriveState;
+                match &self.drive_state {
+                    DriveState::SignedIn => {
+                        let place = neutron_core::places::Place {
+                            name: "Google Drive".to_owned(),
+                            id: NodeId::Cloud {
+                                provider: neutron_core::namespace::CloudProviderId::GoogleDrive,
+                                id: neutron_cloud::drive::ROOT_ID.into(),
+                            },
+                            kind: neutron_core::places::PlaceKind::Cloud,
+                            capacity: None,
+                        };
+                        if sidebar::row(ui, p, &place, current) {
+                            actions.push(Action::Navigate(place.id.clone()));
+                        }
+                    }
+                    DriveState::SignedOut => {
+                        if sidebar::action_row(
+                            ui,
+                            p,
+                            "Connect Google Drive",
+                            neutron_ui::icons::Glyph::Cloud,
+                        ) {
+                            actions.push(Action::ConnectDrive);
+                        }
+                    }
+                    DriveState::NotConfigured => sidebar::placeholder_row(
+                        ui,
+                        p,
+                        "Google Drive",
+                        neutron_ui::icons::Glyph::Cloud,
+                        "Set NEUTRON_GOOGLE_CLIENT_ID to enable Drive",
+                    ),
+                    DriveState::Error(why) => sidebar::placeholder_row(
+                        ui,
+                        p,
+                        "Google Drive",
+                        neutron_ui::icons::Glyph::Cloud,
+                        why,
+                    ),
+                }
 
                 // Only shown when WSL is actually installed. An empty "Linux"
                 // heading on a machine without it is a permanent reminder of a

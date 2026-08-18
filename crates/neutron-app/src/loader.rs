@@ -145,6 +145,9 @@ fn worker(
 
     let fs = neutron_shell::fs::FsNamespace;
     let shell = neutron_shell::shell_ns::ShellNamespace;
+    // One provider for the thread's life: it caches the access token, and a
+    // fresh one per request would refresh on every listing.
+    let drive = neutron_cloud::google::GoogleDrive::new();
 
     while let Ok(req) = requests.recv() {
         // Cheapest possible staleness check: skip superseded work before
@@ -157,10 +160,10 @@ fn worker(
         // Dispatch on what the location *is*. Ordinary directories must never
         // touch COM — that is the whole performance argument — so the shell
         // backend is asked only for the nodes it claims.
-        let outcome = if shell.handles(&req.id) {
-            shell.enumerate(&req.id)
-        } else {
-            fs.enumerate(&req.id)
+        let outcome = match &req.id {
+            NodeId::Cloud { id, .. } => drive.list(id),
+            id if shell.handles(id) => shell.enumerate(id),
+            id => fs.enumerate(id),
         };
         let enumerate_time = started.elapsed();
 

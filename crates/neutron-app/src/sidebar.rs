@@ -373,3 +373,33 @@ mod tests {
         assert_eq!(with.iter().map(|c| c.total).sum::<u64>(), 1000);
     }
 }
+
+/// A row that starts something rather than navigating somewhere.
+///
+/// Visually distinct from a destination: the accent glyph says this is a
+/// control, not a place you can already go.
+pub fn action_row(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), NAV_HEIGHT), Sense::click());
+
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
+    }
+
+    icons::draw(
+        ui.painter(),
+        pos2(rect.left() + 18.0, rect.center().y),
+        glyph,
+        p.accent,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.5),
+        if response.hovered() { p.text } else { p.text_muted },
+    );
+
+    response.clicked()
+}

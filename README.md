@@ -21,7 +21,7 @@ zip all browse like folders. A 100k-entry folder opens in 88ms and scrolls at 0.
 | Large folders stall the UI while icons load | All shell/COM work on dedicated STA threads; the UI thread never blocks | ✅ M3 |
 | Tabs, but no split view | Recursive pane tree — arbitrary splits, tabs per pane | ✅ M2 |
 | Mouse-centric | Command palette and fzf/telescope overlay, full keyboard nav | ✅ M5 |
-| Cloud drives are second-class | OneDrive pinned as a first-class root; Google Drive at M7 | ✅ / M7 |
+| Cloud drives are second-class | OneDrive pinned as a first-class root; Google Drive over the API | ✅ M7 |
 | No way to reach a WSL filesystem short of typing a UNC path | Every installed distribution pinned in the sidebar | ✅ M2 |
 
 ---
@@ -199,6 +199,49 @@ call on the paint thread. A parsing name — `::{20D04FE0-…}` for This PC,
 the shell knows a namespace handler is registered for that extension. So opening
 a file asks the shell, on a worker, rather than matching against a list of
 extensions that would go stale.
+
+---
+
+## Google Drive
+
+Drive has no local presence unless Drive for Desktop is installed, so Neutron
+talks to the API directly. `Connect Google Drive` in the sidebar opens a browser
+once; after that the session is restored silently.
+
+**Set up a client id.** Neutron does not ship one — an installed-app client id
+is public rather than secret, but shipping one would tie every build to a single
+Google Cloud project's quota and audit trail. Create an OAuth client of type
+*Desktop app* in a Google Cloud project with the Drive API enabled, then:
+
+```bash
+WSLENV=NEUTRON_GOOGLE_CLIENT_ID NEUTRON_GOOGLE_CLIENT_ID=<id>.apps.googleusercontent.com
+```
+
+Without it the sidebar row stays greyed with that instruction; the rest of
+Neutron is unaffected.
+
+**Security.** The flow is PKCE with a loopback redirect. A desktop app cannot
+keep a secret — anything compiled in is readable by whoever has the binary — so
+PKCE generates a fresh verifier per attempt and an intercepted authorisation
+code is useless without it. The redirect binds `127.0.0.1:0` rather than a
+custom URI scheme, which any other program on the machine could register and
+intercept. The `state` parameter is checked before the code is even read.
+
+The refresh token lives in Windows Credential Manager, not on disk. That is not
+a strong boundary — anything running as the user can read it back, which is what
+Neutron does — but it is encrypted under the login, scoped to the account, and
+markedly better than a config file that ends up in backups. Only
+`drive.readonly` is requested: Neutron browses and downloads, and asking for
+write access it never uses is a worse consent screen and a larger blast radius.
+
+**Drive is not a filesystem**, and three differences shape the code: objects are
+addressed by id rather than path (a file can live in several folders), names are
+not unique within a folder, and native Google formats have no bytes to download
+without an export format.
+
+> If you install Google Drive for Desktop, Drive becomes a drive letter and a
+> shell namespace extension — which M6 already handles, for free. This path
+> exists for machines without it.
 
 ---
 

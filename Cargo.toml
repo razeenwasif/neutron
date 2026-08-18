@@ -63,6 +63,17 @@ nucleo-matcher = "0.3"
 
 # --- serialization / storage ---
 serde = { version = "1", features = ["derive"] }
+# --- google drive (M7) ---
+# `rustls` rather than the platform TLS: schannel drags in a different cert
+# path per Windows version, and Drive is the only host we talk to.
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
 serde_json = "1"
 
 # --- diagnostics ---
