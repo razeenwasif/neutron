@@ -1398,7 +1398,7 @@ impl eframe::App for NeutronApp {
             .clone()
             .with_layer_id(egui::LayerId::background());
         neutron_ui::ambient::paint(&bg, screen, &p, ui.ctx().input(|i| i.time));
-        ctx.request_repaint_after(Duration::from_millis(33));
+        ctx.request_repaint_after(ambient_interval(&ctx));
 
         self.drain_places();
         self.drain_loads(&ctx);
@@ -1479,6 +1479,43 @@ struct PendingMenu {
     /// reported, so no conversion to physical screen pixels is needed any more.
     pos: egui::Pos2,
     reply: crossbeam_channel::Sender<Option<u32>>,
+}
+
+/// How long to wait before repainting the drifting ground.
+///
+/// This is the *idle* rate and nothing else: input, an arriving icon and a
+/// finished background job all request a repaint of their own, so scrolling and
+/// hovering stay at the display's rate whatever this returns. All it governs is
+/// how often the window redraws when nobody is touching it — which, for an
+/// application that sits open all day, is nearly always.
+///
+/// The rate is chosen against how fast the ground actually moves rather than
+/// against what looks like a sensible frame rate. The two colour fields loop
+/// over 41 and 57 seconds; at their fastest that is about 8 px/s across a
+/// 1500 px window, so 10 fps moves a soft gradient by under a pixel per frame.
+/// The 30 fps this used to run at was buying nothing at all, and it cost 5% of
+/// a core continuously.
+fn ambient_interval(ctx: &egui::Context) -> Duration {
+    let (focused, minimized) = ctx.input(|i| {
+        (
+            i.focused,
+            i.viewport().minimized.unwrap_or(false),
+        )
+    });
+
+    if minimized {
+        // Nothing to see. Not `Duration::MAX`, because the window can be
+        // restored without an input event reaching us, and a ground frozen at
+        // the moment of minimising would then need a click to start again.
+        Duration::from_secs(2)
+    } else if focused {
+        Duration::from_millis(100)
+    } else {
+        // Visible but in the background — a split-screen pane, a second
+        // monitor. Still drifting, because a stopped background beside a live
+        // one reads as a hung window, but at a rate that costs almost nothing.
+        Duration::from_millis(500)
+    }
 }
 
 // --- background results ----------------------------------------------------
