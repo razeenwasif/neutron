@@ -84,6 +84,9 @@ thiserror = "2"
 
 # --- windows ---
 windows = "0.62"
+# The `implement` macro expands to `windows_core::…` paths, so the crate has to
+# be nameable at the root of anything that implements a COM interface.
+windows-core = "0.62"
 
 # Release builds: optimize hard. This is a file manager whose entire pitch is
 # speed, so the extra link time is worth it.

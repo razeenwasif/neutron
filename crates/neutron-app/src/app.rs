@@ -57,6 +57,8 @@ enum Action {
     SetFilter(String),
     /// Put the caret in the focused pane's filter field.
     FocusFilter,
+    /// Drag the selection out to another application.
+    DragOut,
     /// Start renaming the focused tab's cursor row.
     BeginRename,
     /// The rename box's contents changed.
@@ -467,6 +469,7 @@ impl NeutronApp {
                 }
             }
 
+            Action::DragOut => self.drag_out(),
             Action::BeginRename => self.begin_rename(ctx),
             Action::RenameTyped(text) => {
                 if let Some(r) = self.rename.as_mut() {
@@ -781,6 +784,38 @@ impl NeutronApp {
                 self.launch(path, neutron_shell::open::Verb::Open);
             }
         }
+    }
+
+    /// Hands the selection to the system as a drag.
+    ///
+    /// Returns at once. The drag itself blocks an apartment thread until the
+    /// drop finishes, which is exactly why it is not on this one — the window
+    /// keeps painting for the whole gesture, so the ground goes on drifting and
+    /// hover still responds behind the drag image.
+    fn drag_out(&mut self) {
+        let Some((tab_id, _, paths)) = self.selection_paths() else {
+            return;
+        };
+
+        let owner = self.hwnd.unwrap_or(0);
+        let wake = self.ctx.clone();
+        let done = self.refresh_tx.clone();
+
+        tracing::info!(count = paths.len(), "dragging out");
+        self.sta.submit(move || {
+            match neutron_shell::dragout::drag(&paths, owner) {
+                // Re-listed after any completed drop, not only after a move.
+                // The drag cannot report reliably whether the files left —
+                // Explorer moves them itself and then says it did nothing —
+                // so the listing is the only account that is true.
+                Ok(neutron_shell::dragout::Dropped::Completed) => {
+                    let _ = done.send(tab_id);
+                }
+                Ok(neutron_shell::dragout::Dropped::Cancelled) => {}
+                Err(e) => tracing::warn!("drag failed: {e}"),
+            }
+            wake.request_repaint();
+        });
     }
 
     /// Opens the rename box on the focused tab's cursor row.
@@ -2533,6 +2568,7 @@ impl NeutronApp {
                 FileListAction::ContextMenu { idx, pos } => {
                     actions.push(Action::ContextMenu { idx, pos })
                 }
+                FileListAction::DragOut => actions.push(Action::DragOut),
                 FileListAction::RenameTyped(text) => actions.push(Action::RenameTyped(text)),
                 FileListAction::RenameCommit => actions.push(Action::RenameCommit),
                 FileListAction::RenameCancel => actions.push(Action::RenameCancel),

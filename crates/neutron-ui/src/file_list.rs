@@ -130,6 +130,9 @@ pub enum FileListAction {
         idx: Option<usize>,
         pos: egui::Pos2,
     },
+    /// Drag the selection out of the application, to Explorer or anything else
+    /// that accepts a drop.
+    DragOut,
     /// The rename box's contents changed.
     RenameTyped(String),
     /// Enter, or the box losing focus: keep the typed name.
@@ -304,7 +307,24 @@ fn show_list(
     // Rubber band, tracked after the rows so it paints over them.
     let start_area =
         band_start_area(ui.spacing().scroll, viewport, output.content_size.y > viewport.height());
-    let band = track_band(ui, viewport, start_area, output.state.offset.y);
+    let offset = output.state.offset.y;
+    // Which storage entry sits under a screen position. Arithmetic rather than
+    // a hit test, for the same reason the band covers rows this way: uniform
+    // row height makes it exact and free.
+    let entry_at = |screen: egui::Pos2| -> Option<usize> {
+        let y = screen.y - viewport.top() + offset;
+        if y < 0.0 {
+            return None;
+        }
+        let row = (y / ROW_HEIGHT) as usize;
+        (row < row_count).then(|| list.at(row))
+    };
+    let band = track_band(ui, viewport, start_area, offset, |screen| {
+        entry_at(screen).is_some_and(|idx| marks.selection.is_selected(idx))
+    });
+    if band.drag_out {
+        action = Some(FileListAction::DragOut);
+    }
     if let Some(rect) = band.rect {
         draw_band(ui, p, rect, viewport, output.state.offset.y);
 
@@ -339,9 +359,29 @@ fn show_list(
 /// was pointing at. Anchoring in content space means the origin stays glued to
 /// the row it started on.
 struct Band {
-    /// Rectangle in content coordinates, or `None` when no drag is in progress.
+    /// Rectangle in content coordinates, or `None` when no band is in progress.
     rect: Option<Rect>,
     additive: bool,
+    /// The press was on a selected row and has now travelled: drag the
+    /// selection out of the application.
+    drag_out: bool,
+}
+
+impl Band {
+    fn none(additive: bool) -> Self {
+        Band { rect: None, additive, drag_out: false }
+    }
+}
+
+/// What a press started, remembered until the button comes back up.
+#[derive(Clone, Copy)]
+struct Drag {
+    /// Where it began, in content coordinates.
+    origin: egui::Pos2,
+    /// True if it began on an already-selected row.
+    out: bool,
+    /// Whether the outbound drag has already been handed off.
+    fired: bool,
 }
 
 /// Where this list's band drag started, in content coordinates.
@@ -395,7 +435,13 @@ fn band_start_area(
 /// `viewport` is the scroll area's rect, used to convert screen positions into
 /// content ones. `start_area` is where a press may *begin* a band, which is
 /// `viewport` minus the scroll bar's strip.
-fn track_band(ui: &Ui, viewport: Rect, start_area: Rect, scroll_offset: f32) -> Band {
+fn track_band(
+    ui: &Ui,
+    viewport: Rect,
+    start_area: Rect,
+    scroll_offset: f32,
+    on_selected: impl Fn(egui::Pos2) -> bool,
+) -> Band {
     let (pointer, primary_down, primary_released, ctrl) = ui.input(|i| {
         (
             i.pointer.interact_pos(),
@@ -408,53 +454,74 @@ fn track_band(ui: &Ui, viewport: Rect, start_area: Rect, scroll_offset: f32) -> 
     let to_content = |p: egui::Pos2| pos2(p.x - viewport.left(), p.y - viewport.top() + scroll_offset);
 
     let id = band_origin_id(ui);
-    let stored: Option<egui::Pos2> = ui.ctx().data(|d| d.get_temp(id));
 
-    // A band starts anywhere in the list, including on top of a row.
+    // Which gesture the press started, decided once at press time.
     //
-    // Explorer reserves a press on a row for dragging the file out, and an
-    // earlier version copied that — which made the band nearly unreachable,
-    // since rows occupy almost the whole list. Neutron has no outbound file
-    // drag yet, so that reservation bought nothing and cost the feature.
+    // Explorer's rule: a press on a row that is *already selected* drags the
+    // selection out, and a press anywhere else sweeps a band. It has to be
+    // settled at the press, not when the mouse first moves, because by then the
+    // selection may have changed under it.
+    //
+    // An earlier version reserved every row for dragging, before there was
+    // anything to drag to — which made the band nearly unreachable, since rows
+    // occupy almost the whole list. Only selected rows are reserved.
     //
     // Safe alongside click-selection because egui only reports `clicked()` for
-    // a press and release that did not travel, and the band needs a few pixels
-    // of travel before it starts. When outbound drag lands, this is where the
-    // two gestures will have to be told apart — most likely by whether the
-    // press landed on an already-selected row.
-    if primary_down && stored.is_none() {
+    // a press and release that did not travel, and both gestures need a few
+    // pixels of travel before they start.
+    if primary_down && ui.ctx().data(|d| d.get_temp::<Drag>(id)).is_none() {
         if let Some(p) = pointer.filter(|p| start_area.contains(*p)) {
-            let origin = to_content(p);
-            ui.ctx().data_mut(|d| d.insert_temp(id, origin));
+            let drag = Drag {
+                origin: to_content(p),
+                out: on_selected(p),
+                fired: false,
+            };
+            ui.ctx().data_mut(|d| d.insert_temp(id, drag));
         }
     }
 
     if primary_released {
-        ui.ctx().data_mut(|d| d.remove::<egui::Pos2>(id));
-        return Band { rect: None, additive: ctrl };
+        ui.ctx().data_mut(|d| d.remove::<Drag>(id));
+        return Band::none(ctrl);
     }
 
-    let Some(origin) = ui.ctx().data(|d| d.get_temp::<egui::Pos2>(id)) else {
-        return Band { rect: None, additive: ctrl };
+    let Some(drag) = ui.ctx().data(|d| d.get_temp::<Drag>(id)) else {
+        return Band::none(ctrl);
     };
     let Some(current) = pointer.map(to_content) else {
-        return Band { rect: None, additive: ctrl };
+        return Band::none(ctrl);
     };
 
     // Below a few pixels this is a click with a shaky hand, and treating it as
-    // a band would clear the selection on every imprecise click.
-    let rect = Rect::from_two_pos(origin, current);
+    // a gesture would clear the selection on every imprecise click.
+    let rect = Rect::from_two_pos(drag.origin, current);
     if rect.width() < 3.0 && rect.height() < 3.0 {
-        return Band { rect: None, additive: ctrl };
+        return Band::none(ctrl);
+    }
+
+    if drag.out {
+        // Once only. The drag runs on a worker and blocks there until the drop
+        // finishes, so starting a second one every frame would queue a job per
+        // frame against a pool of four threads.
+        if drag.fired {
+            return Band::none(ctrl);
+        }
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(id, Drag { fired: true, ..drag }));
+        return Band {
+            rect: None,
+            additive: ctrl,
+            drag_out: true,
+        };
     }
 
     Band {
         rect: Some(rect),
         additive: ctrl,
+        drag_out: false,
     }
 }
 
-/// Paints the band over the viewport, converting back to screen coordinates.
 fn draw_band(ui: &Ui, p: &Palette, band: Rect, viewport: Rect, scroll_offset: f32) {
     let screen = Rect::from_min_max(
         pos2(
@@ -1051,7 +1118,27 @@ fn show_grid(
 
     let start_area =
         band_start_area(ui.spacing().scroll, viewport, output.content_size.y > viewport.height());
-    let band = track_band(ui, viewport, start_area, output.state.offset.y);
+    let offset_y = output.state.offset.y;
+    let tile_at = |screen: egui::Pos2| -> Option<usize> {
+        let y = screen.y - viewport.top() + offset_y;
+        let x = screen.x - viewport.left() - LIST_PAD;
+        if y < 0.0 || x < 0.0 {
+            return None;
+        }
+        let row = (y / row_pitch) as usize;
+        let column = (x / (TILE_W + TILE_GAP)) as usize;
+        if column >= columns {
+            return None;
+        }
+        let position = row * columns + column;
+        (position < list.order().len()).then(|| list.at(position))
+    };
+    let band = track_band(ui, viewport, start_area, offset_y, |screen| {
+        tile_at(screen).is_some_and(|idx| marks.selection.is_selected(idx))
+    });
+    if band.drag_out {
+        action = Some(FileListAction::DragOut);
+    }
     if let Some(rect) = band.rect {
         draw_band(ui, p, rect, viewport, output.state.offset.y);
 

@@ -4,7 +4,7 @@
 //!
 //! Most shell COM objects — `IShellFolder`, `IContextMenu`, icon handlers,
 //! `IFileOperation` — are apartment-threaded. They must be created and used on
-//! a thread that called `CoInitializeEx(COINIT_APARTMENTTHREADED)`, and a given
+//! a thread in a single-threaded apartment, and a given
 //! object may only be touched from the thread that made it. Calling them from a
 //! multithreaded apartment either fails outright or silently marshals through a
 //! proxy, which is slower and reintroduces the blocking this design exists to
@@ -51,18 +51,22 @@ impl Apartment {
     pub fn enter() -> Self {
         #[cfg(windows)]
         {
-            use windows::Win32::System::Com::{
-                COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
-            };
+            // `OleInitialize` rather than `CoInitializeEx`. It enters a
+            // single-threaded apartment exactly the same way, and additionally
+            // starts the OLE machinery that drag-and-drop and the OLE clipboard
+            // need. Without it `DoDragDrop` fails with the memorably unhelpful
+            // "CoInitialize has not been called" on a thread where COM is
+            // demonstrably initialised.
+            //
             // SAFETY: called before any COM use on this thread, and balanced in
             // Drop when it was this call that initialised.
-            let hr =
-                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
-            // S_FALSE means the thread was already in a compatible apartment,
-            // which is success — but *not* ours to tear down.
-            Self {
-                owned: hr.is_ok() && hr.0 == 0,
-            }
+            let hr = unsafe { windows::Win32::System::Ole::OleInitialize(None) };
+            // Every success is balanced, including the S_FALSE case where the
+            // thread was already in a compatible apartment. Initialisation is
+            // reference-counted per thread, so one uninitialise per successful
+            // initialise is right either way — and unlike the raw HRESULT this
+            // binding returns, `Result` cannot tell the two apart anyway.
+            Self { owned: hr.is_ok() }
         }
         #[cfg(not(windows))]
         Self { owned: false }
@@ -73,8 +77,8 @@ impl Drop for Apartment {
     fn drop(&mut self) {
         #[cfg(windows)]
         if self.owned {
-            // SAFETY: balances the CoInitializeEx above.
-            unsafe { windows::Win32::System::Com::CoUninitialize() };
+            // SAFETY: balances the OleInitialize above.
+            unsafe { windows::Win32::System::Ole::OleUninitialize() };
         }
     }
 }
@@ -136,26 +140,32 @@ impl StaPool {
 
 #[cfg(windows)]
 fn apartment(jobs: Receiver<Job>, pending: Arc<AtomicUsize>) {
-    use windows::Win32::System::Com::{
-        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
-    };
+    use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 
-    // SAFETY: called once per thread before any COM use, and paired with
-    // CoUninitialize on the way out.
+    // `OleInitialize` rather than `CoInitializeEx(COINIT_APARTMENTTHREADED)`.
+    // It enters a single-threaded apartment in exactly the same way and
+    // additionally starts the OLE machinery that drag-and-drop needs.
     //
-    // DISABLE_OLE1DDE opts out of the OLE1 DDE compatibility layer, which
-    // nothing since the 1990s needs and which costs a hidden window and a
-    // message pump per apartment.
-    let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+    // Without it `DoDragDrop` fails with "CoInitialize has not been called" —
+    // on a thread where COM is demonstrably initialised, which is as
+    // misleading as error messages get. It is a different subsystem asking.
+    //
+    // The cost is giving up `COINIT_DISABLE_OLE1DDE`, which had opted out of
+    // the OLE1 DDE compatibility layer and its hidden window per apartment.
+    // Four hidden windows is a fair price for being able to drag a file out.
+    //
+    // SAFETY: called once per thread before any COM use, and paired with
+    // OleUninitialize on the way out.
+    let init = unsafe { OleInitialize(None) };
     if init.is_err() {
-        tracing::error!(?init, "CoInitializeEx failed; this apartment is unusable");
+        tracing::error!(?init, "OleInitialize failed; this apartment is unusable");
         return;
     }
 
     run_jobs(jobs, pending);
 
-    // SAFETY: balances the CoInitializeEx above; no COM object outlives a job.
-    unsafe { CoUninitialize() };
+    // SAFETY: balances the OleInitialize above; no COM object outlives a job.
+    unsafe { OleUninitialize() };
 }
 
 #[cfg(not(windows))]
