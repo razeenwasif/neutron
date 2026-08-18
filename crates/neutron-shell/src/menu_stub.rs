@@ -2,6 +2,11 @@
 
 use std::path::PathBuf;
 
-pub fn show(_paths: &[PathBuf], _x: i32, _y: i32) -> Result<(), String> {
+use neutron_core::menu::MenuItem;
+
+pub fn open<F>(_paths: &[PathBuf], _choose: F) -> Result<(), String>
+where
+    F: FnOnce(Vec<MenuItem>) -> Option<u32>,
+{
     Err("context menus are Windows-only".to_owned())
 }

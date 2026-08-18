@@ -46,9 +46,25 @@
 - Tiles are virtualized a row at a time, so a 500k-entry folder costs the same per frame as a 50-entry one.
 - Arrow keys move by a whole row in the grid; the layout reports its column count back to the tab, because the pane is drawn from a clone of the view state and the count would otherwise be discarded every frame.
 
-#### 5. Known Cost
+#### 5. Selection & Context Menu
+- **Rubber-band select**: press and drag anywhere in the list or grid to sweep a
+  selection; Ctrl adds to what is already selected. The band is tracked in
+  *content* coordinates so it stays glued to the rows while the list
+  auto-scrolls under it. Its origin lives in egui memory rather than in
+  `FileListState`, because the pane is drawn from a clone of that state and
+  anything written during paint is discarded when the frame ends.
+- **Themed context menu**: the shell still builds the menu — every installed
+  extension (WinRAR, 7-Zip, Git, PowerRename, IntelliJ) is present — but Neutron
+  reads the `HMENU` into plain data and draws the rows itself, so the menu is
+  the same glass as the rest of the window instead of a system-grey rectangle.
+  Submenus populate lazily through a forwarded `WM_INITMENUPOPUP`, the default
+  verb is accent-tinted, and keyboard navigation works.
+  - Not carried over: per-item icons supplied as `HBITMAP`. A fully owner-drawn
+    item with no menu string falls back to its verb.
+
+#### 6. Known Cost
 - The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
 
-#### 6. Test Suite
+#### 7. Test Suite
 - Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`, `neutron-index`) passing on Linux.
-- Full suite on the Windows target: 219 tests, clippy clean.
+- Full suite on the Windows target: 305 tests, clippy clean.

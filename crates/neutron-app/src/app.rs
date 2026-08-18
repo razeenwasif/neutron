@@ -47,6 +47,8 @@ enum Action {
     Select { idx: usize, mode: SelectMode },
     SortBy(SortColumn),
     ClearSelection,
+    /// A rubber band covered these display positions.
+    Marquee { from: usize, to: usize, additive: bool },
     SelectAll,
     ToggleHidden,
     ToggleView,
@@ -151,6 +153,20 @@ pub struct NeutronApp {
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
 
+    /// The open context menu, if any.
+    ///
+    /// While this is `Some`, an apartment thread is parked inside
+    /// `neutron_shell::menu::open` holding the live `IContextMenu`, waiting on
+    /// `menu_reply` for the id the user picks.
+    menu: Option<neutron_ui::MenuState>,
+    /// Where to send the chosen command id. Dropping it without sending — which
+    /// is what closing the window does — releases the parked thread, because a
+    /// disconnected channel makes its `recv` return an error it treats as
+    /// "dismissed".
+    menu_reply: Option<crossbeam_channel::Sender<Option<u32>>>,
+    menu_tx: crossbeam_channel::Sender<PendingMenu>,
+    menu_rx: crossbeam_channel::Receiver<PendingMenu>,
+
     /// Whether Drive is configured, signed in, or unavailable. Cached because
     /// answering it reads the credential store, which is not a per-frame cost.
     drive_state: neutron_cloud::google::DriveState,
@@ -193,6 +209,7 @@ impl NeutronApp {
         let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
         let (open_as_tx, open_as_rx) = crossbeam_channel::unbounded();
         let (drive_tx, drive_rx) = crossbeam_channel::unbounded();
+        let (menu_tx, menu_rx) = crossbeam_channel::unbounded();
         let drive_state = neutron_cloud::google::GoogleDrive::new().state();
 
         // Attaches to a helper left running by an earlier session, so search is
@@ -245,6 +262,10 @@ impl NeutronApp {
             drive_state,
             drive_tx,
             drive_rx,
+            menu: None,
+            menu_reply: None,
+            menu_tx,
+            menu_rx,
         }
     }
 
@@ -375,6 +396,12 @@ impl NeutronApp {
                     t.selection.apply(&t.list, idx, mode);
                 }
             }
+            Action::Marquee { from, to, additive } => {
+                if let Some(t) = self.workspace.active_tab_mut() {
+                    t.selection.select_span(&t.list, from, to, additive);
+                }
+            }
+
             Action::ClearSelection => {
                 if let Some(t) = self.workspace.active_tab_mut() {
                     t.selection.clear();
@@ -450,7 +477,7 @@ impl NeutronApp {
                 }
             }
 
-            Action::ContextMenu { idx, pos } => self.context_menu(ctx, idx, pos),
+            Action::ContextMenu { idx, pos } => self.context_menu(idx, pos),
 
             Action::DropFiles { group, paths, copy } => self.drop_files(group, paths, copy),
 
@@ -767,12 +794,16 @@ impl NeutronApp {
         });
     }
 
-    /// Shows the native shell context menu for the selection.
+    /// Asks the shell for the context menu of the selection.
     ///
     /// Right-clicking a row that is not selected selects it first, as every
     /// file manager does — acting on a hidden selection is how people delete
     /// the wrong thing.
-    fn context_menu(&mut self, ctx: &egui::Context, idx: Option<usize>, pos: egui::Pos2) {
+    ///
+    /// Returns immediately; the menu appears once the apartment thread has
+    /// built it, which is a frame or two later on a folder with slow handlers
+    /// installed.
+    fn context_menu(&mut self, idx: Option<usize>, pos: egui::Pos2) {
         if let Some(idx) = idx {
             let outside = self
                 .workspace
@@ -809,23 +840,32 @@ impl NeutronApp {
             return;
         }
 
-        // egui reports points in logical units with the window's origin at
-        // zero; the shell places menus in physical screen pixels.
-        let scale = ctx.pixels_per_point();
-        let origin = ctx
-            .input(|i| i.viewport().outer_rect)
-            .map(|r| r.min)
-            .unwrap_or_default();
-        let x = ((origin.x + pos.x) * scale).round() as i32;
-        let y = ((origin.y + pos.y) * scale).round() as i32;
+        // A menu already up is replaced, not stacked. Dropping the reply
+        // sender releases whichever apartment thread is parked on the old one.
+        self.menu = None;
+        self.menu_reply = None;
 
         let ctx_wake = self.ctx.clone();
         let done = self.refresh_tx.clone();
+        let offer = self.menu_tx.clone();
 
         self.sta.submit(move || {
             // Blocks this apartment for as long as the menu is open. The UI
             // thread keeps painting — that is the entire reason it is here.
-            if let Err(e) = neutron_shell::menu::show(&paths, x, y) {
+            let result = neutron_shell::menu::open(&paths, |items| {
+                // The shell's menu, now plain data. Hand it to the UI and wait
+                // for the answer; the COM object stays on this thread.
+                let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+                if offer.send(PendingMenu { items, pos, reply: reply_tx }).is_err() {
+                    return None;
+                }
+                ctx_wake.request_repaint();
+                // A disconnected channel means the UI went away — a closed
+                // window, or a second right-click replacing this menu. Either
+                // way there is nothing to invoke.
+                reply_rx.recv().unwrap_or(None)
+            });
+            if let Err(e) = result {
                 tracing::warn!("context menu: {e}");
             }
             // The command may have renamed, deleted, or created something.
@@ -833,6 +873,31 @@ impl NeutronApp {
             let _ = done.send(tab_id);
             ctx_wake.request_repaint();
         });
+    }
+
+    /// Draws the open context menu and answers the thread waiting on it.
+    fn context_menu_overlay(&mut self, ctx: &egui::Context, p: &neutron_ui::Palette) {
+        while let Ok(pending) = self.menu_rx.try_recv() {
+            self.menu = Some(neutron_ui::MenuState::new(pending.items, pending.pos));
+            // Replaces any previous reply sender, which releases the thread
+            // parked on it as dismissed.
+            self.menu_reply = Some(pending.reply);
+        }
+
+        let Some(state) = self.menu.as_mut() else {
+            return;
+        };
+
+        let answer = match neutron_ui::context_menu::show(ctx, p, state) {
+            neutron_ui::MenuOutcome::Open => return,
+            neutron_ui::MenuOutcome::Chosen(id) => Some(id),
+            neutron_ui::MenuOutcome::Dismissed => None,
+        };
+
+        self.menu = None;
+        if let Some(reply) = self.menu_reply.take() {
+            let _ = reply.send(answer);
+        }
     }
 
     /// Opens `path` with the shell, on an apartment thread.
@@ -941,6 +1006,13 @@ impl eframe::App for NeutronApp {
         self.icon_texture = self.icons.texture(&ctx);
         self.index.pump();
         self.sync_finder_results();
+
+        // Before `keyboard`, not after: the menu *consumes* the arrows and
+        // Escape it uses, and `keyboard` only reads them. Drawn after the panes
+        // regardless — it lives on the foreground layer, so painting order is
+        // not what puts it on top.
+        self.context_menu_overlay(&ctx, &p);
+
         self.keyboard(&ctx, &mut actions);
 
         self.status_bar(ui, &p);
@@ -950,6 +1022,7 @@ impl eframe::App for NeutronApp {
         // Drawn last so it covers everything, and after input routing so the
         // overlay's own keys win while it is open.
         self.finder_overlay(ui, &p, &mut actions);
+
 
         // Queued *after* drawing so a `DropTab` pushed by a tab strip this
         // frame is applied first. Pushed before it, this would clear the drag
@@ -964,6 +1037,15 @@ impl eframe::App for NeutronApp {
 
         self.startup.mark_frame(frame_started.elapsed());
     }
+}
+
+/// A shell menu waiting to be shown, from the apartment thread that built it.
+struct PendingMenu {
+    items: Vec<neutron_core::MenuItem>,
+    /// Where to put it, in egui's coordinates — which is where the click was
+    /// reported, so no conversion to physical screen pixels is needed any more.
+    pos: egui::Pos2,
+    reply: crossbeam_channel::Sender<Option<u32>>,
 }
 
 // --- background results ----------------------------------------------------
@@ -1050,6 +1132,13 @@ impl NeutronApp {
         // holds focus, including a button the user merely clicked, which
         // silently disabled every shortcut in the application.
         if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+
+        // A context menu is modal to the pane behind it. Without this, Delete
+        // while the menu is open would bin the selection *and* run whichever
+        // command the cursor was on.
+        if self.menu.is_some() {
             return;
         }
 
@@ -2012,6 +2101,9 @@ impl NeutronApp {
                 FileListAction::Select { idx, mode } => actions.push(Action::Select { idx, mode }),
                 FileListAction::SortBy(col) => actions.push(Action::SortBy(col)),
                 FileListAction::ClearSelection => actions.push(Action::ClearSelection),
+                FileListAction::Marquee { from, to, additive } => {
+                    actions.push(Action::Marquee { from, to, additive })
+                }
                 FileListAction::ContextMenu { idx, pos } => {
                     actions.push(Action::ContextMenu { idx, pos })
                 }

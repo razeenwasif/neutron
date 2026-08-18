@@ -21,6 +21,10 @@ const CONSENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Where the client credentials come from.
 ///
+/// Environment variables are checked first, then `%APPDATA%\\Neutron\\google.json`
+/// — see [`crate::config`]. The file is what makes Drive work when Neutron is
+/// launched from the taskbar rather than a shell.
+///
 /// # Why these are not compiled in
 ///
 /// Neither value is a secret in the cryptographic sense. Google's own
@@ -34,7 +38,10 @@ const CONSENT_TIMEOUT: Duration = Duration::from_secs(300);
 /// building Neutron themselves should use their own rather than inherit someone
 /// else's rate limit and audit trail.
 pub fn client_id() -> Result<String, AuthError> {
-    env_value("NEUTRON_GOOGLE_CLIENT_ID").ok_or(AuthError::NoClientId)
+    resolve(env_value("NEUTRON_GOOGLE_CLIENT_ID"), || {
+        crate::config::load().map(|c| c.client_id)
+    })
+    .ok_or(AuthError::NoClientId)
 }
 
 /// The client secret Google issues alongside a Desktop-app client.
@@ -44,7 +51,27 @@ pub fn client_id() -> Result<String, AuthError> {
 /// exchange rejected with `invalid_request: client_secret is missing`, *after*
 /// the user has already consented in the browser.
 pub fn client_secret() -> Result<String, AuthError> {
-    env_value("NEUTRON_GOOGLE_CLIENT_SECRET").ok_or(AuthError::NoClientSecret)
+    resolve(env_value("NEUTRON_GOOGLE_CLIENT_SECRET"), || {
+        crate::config::load().map(|c| c.client_secret)
+    })
+    .ok_or(AuthError::NoClientSecret)
+}
+
+/// Picks a credential from the environment, falling back to the config file.
+///
+/// The two sources are separated from the lookups themselves so the precedence
+/// rule can be tested. It cannot be tested through [`client_id`]: that reads a
+/// real file in `%APPDATA%`, so on a machine where Drive is actually set up —
+/// which is every machine where anyone would run these tests — a test asserting
+/// "no client id when the variable is unset" fails for the right reason and the
+/// wrong one at once.
+///
+/// The file is read lazily so that setting the variable avoids touching the
+/// disk at all.
+fn resolve(from_env: Option<String>, from_file: impl FnOnce() -> Option<String>) -> Option<String> {
+    from_env
+        .or_else(|| from_file().map(|s| s.trim().to_owned()))
+        .filter(|s| !s.is_empty())
 }
 
 /// Reads an environment variable, trimmed, treating blank as absent.
@@ -305,10 +332,7 @@ mod tests {
 
     #[test]
     fn a_missing_client_id_is_named_rather_than_a_generic_failure() {
-        // Safe to assert: the variable is not set in the test environment, and
-        // the message is the only thing telling a new contributor what to do.
-        unsafe { std::env::remove_var("NEUTRON_GOOGLE_CLIENT_ID") };
-        assert_eq!(client_id(), Err(AuthError::NoClientId));
+        // The message is the only thing telling a new contributor what to do.
         assert!(AuthError::NoClientId.to_string().contains("NEUTRON_GOOGLE_CLIENT_ID"));
     }
 
@@ -317,8 +341,6 @@ mod tests {
         // Google requires it for installed apps despite PKCE. Assuming
         // otherwise cost a full round of consent before the token endpoint
         // said so.
-        unsafe { std::env::remove_var("NEUTRON_GOOGLE_CLIENT_SECRET") };
-        assert_eq!(client_secret(), Err(AuthError::NoClientSecret));
         assert!(
             AuthError::NoClientSecret
                 .to_string()
@@ -327,10 +349,49 @@ mod tests {
     }
 
     #[test]
+    fn with_nothing_set_anywhere_there_is_no_credential() {
+        assert_eq!(resolve(None, || None), None);
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_config_file() {
+        // The file is what a signed-in user has; the variable is how someone
+        // tries a different client without editing it.
+        assert_eq!(
+            resolve(Some("from-env".to_owned()), || Some("from-file".to_owned())),
+            Some("from-env".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_config_file_is_used_when_the_environment_is_unset() {
+        assert_eq!(
+            resolve(None, || Some("from-file".to_owned())),
+            Some("from-file".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_blank_value_in_the_config_file_counts_as_missing() {
+        // A half-filled google.json is what you get from stopping partway
+        // through the setup, and it must not read as configured.
+        assert_eq!(resolve(None, || Some("   ".to_owned())), None);
+    }
+
+    #[test]
+    fn the_config_file_value_is_trimmed() {
+        assert_eq!(
+            resolve(None, || Some(" pasted\n".to_owned())),
+            Some("pasted".to_owned())
+        );
+    }
+
+    #[test]
     fn a_blank_client_id_counts_as_missing() {
         unsafe { std::env::set_var("NEUTRON_GOOGLE_CLIENT_ID", "   ") };
-        assert_eq!(client_id(), Err(AuthError::NoClientId));
+        let value = env_value("NEUTRON_GOOGLE_CLIENT_ID");
         unsafe { std::env::remove_var("NEUTRON_GOOGLE_CLIENT_ID") };
+        assert_eq!(value, None);
     }
 
     #[test]

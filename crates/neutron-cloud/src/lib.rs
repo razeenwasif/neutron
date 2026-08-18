@@ -15,6 +15,7 @@
 //!
 //! Filled in at M2 (OneDrive) and M7 (Google Drive).
 
+pub mod config;
 pub mod credentials;
 pub mod drive;
 pub mod flow;

@@ -17,39 +17,64 @@
 //! So everything here happens on an apartment thread, which is free to block.
 //! The UI keeps painting at full rate behind the menu.
 //!
-//! # Why a hidden window rather than subclassing the main one
+//! # The shell builds the menu; Neutron draws it
 //!
-//! Owner-drawn menu items — the ones with icons, which is most third-party
-//! entries — require `WM_INITMENUPOPUP`, `WM_DRAWITEM` and `WM_MEASUREITEM` to
-//! be forwarded to `IContextMenu2::HandleMenuMsg`. Those messages go to the
-//! menu's owner window.
+//! [`open`] does *not* show a Win32 popup. It asks the shell to populate an
+//! `HMENU` exactly as Explorer would, reads that menu out into
+//! [`neutron_core::MenuItem`] values, and hands them to a caller-supplied
+//! closure which is expected to render them and return the chosen command id.
 //!
-//! The obvious approach is to subclass winit's `HWND` with `SetWindowSubclass`.
-//! It is also wrong here: that window belongs to the UI thread, and
-//! `TrackPopupMenuEx` must be called on the thread owning the window it is
-//! given. Using it would drag the modal loop back onto the UI thread and undo
-//! the point above.
+//! The reason is purely visual: a system-drawn menu is drawn in the *system's*
+//! colours, and a stark grey Win32 rectangle landing on top of a translucent
+//! glass panel undoes the whole design. Every command still comes from the
+//! shell and is still invoked through `IContextMenu`, so third-party entries
+//! work as before.
 //!
-//! Instead each menu creates its own hidden window *on the apartment thread*
-//! and owns it for the menu's lifetime. Forwarding happens in that window's own
-//! procedure, winit's window is never touched, and the modal loop stays where it
-//! belongs.
+//! What is lost is what only the system renderer can do: per-item icons
+//! supplied as `HBITMAP`, and fully owner-drawn items that carry no menu
+//! string at all. See [`read_menu`] for how the latter are handled.
+//!
+//! # Why the closure, rather than returning the items
+//!
+//! `IContextMenu` is apartment-affine and must stay alive between building the
+//! menu and invoking the choice. Returning the items and taking the id in a
+//! second call would mean parking a live COM pointer somewhere and hoping the
+//! follow-up landed on the same pool thread. Instead the apartment thread
+//! blocks inside the closure — the caller sends the items to the UI and waits
+//! for a reply — which keeps the interface on its own thread and lets RAII
+//! release everything in order.
+//!
+//! Blocking one apartment thread while a menu is open is exactly what the
+//! previous `TrackPopupMenuEx` implementation did, so this costs nothing new.
+//!
+//! # Why a hidden window
+//!
+//! Menu handlers expect an owner window: `WM_INITMENUPOPUP` is how a handler
+//! is told to populate a submenu lazily, and `InvokeCommand` wants a parent for
+//! any dialog the command shows. Subclassing winit's `HWND` would put that on
+//! the UI thread, which is the one place none of this may run. So each menu
+//! creates its own hidden window on the apartment thread and owns it for the
+//! menu's lifetime.
 
 use std::cell::RefCell;
 use std::path::Path;
+
+use windows::Win32::UI::WindowsAndMessaging::WM_INITMENUPOPUP;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFOEX, IContextMenu, IContextMenu2, IContextMenu3,
-    IShellFolder, SHBindToParent, SHParseDisplayName,
+    CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFOEX, GCS_VERBW, IContextMenu, IContextMenu2,
+    IContextMenu3, IShellFolder, SHBindToParent, SHParseDisplayName,
 };
+
+use neutron_core::menu::{MenuItem, parse_label, tidy};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GetMenuItemCount,
-    HMENU, RegisterClassW, SW_HIDE, SetForegroundWindow, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
-    WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    GetMenuItemInfoW, GetMenuStringW, HMENU, MENUITEMINFOW, MF_BYPOSITION, MFS_CHECKED,
+    MFS_DEFAULT, MFS_DISABLED, MFS_GRAYED, MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
+    MIIM_SUBMENU, RegisterClassW, SW_HIDE, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{Interface, PCWSTR, w};
 
@@ -71,14 +96,21 @@ thread_local! {
     static ACTIVE: RefCell<Option<IContextMenu>> = const { RefCell::new(None) };
 }
 
-/// Shows the shell context menu for `paths` at screen position `(x, y)`.
+/// Builds the shell context menu for `paths`, hands it to `choose` as plain
+/// data, and invokes whatever `choose` returns.
 ///
-/// **STA pool only**, and it blocks until the menu closes — which is the entire
-/// design; see the module docs.
+/// **STA pool only.** It blocks for as long as `choose` takes, which is the
+/// whole time the menu is on screen; see the module docs.
+///
+/// `choose` returns the id of the picked [`MenuItem`], or `None` if the user
+/// dismissed the menu.
 ///
 /// Every path must live in the same directory. That is what the caller has: a
 /// selection within one listing.
-pub fn show(paths: &[std::path::PathBuf], x: i32, y: i32) -> Result<(), String> {
+pub fn open<F>(paths: &[std::path::PathBuf], choose: F) -> Result<(), String>
+where
+    F: FnOnce(Vec<MenuItem>) -> Option<u32>,
+{
     if paths.is_empty() {
         return Ok(());
     }
@@ -122,17 +154,179 @@ pub fn show(paths: &[std::path::PathBuf], x: i32, y: i32) -> Result<(), String> 
         return Err(format!("could not build the menu: {}", hr.message()));
     }
 
-    // SAFETY: `popup` is live.
-    if unsafe { GetMenuItemCount(Some(popup.0)) } <= 0 {
+    // Published so `init_popup` can reach the handler while submenus are read.
+    ACTIVE.with(|a| *a.borrow_mut() = Some(menu.clone()));
+    let items = tidy(read_menu(&menu, popup.0, 0));
+    ACTIVE.with(|a| *a.borrow_mut() = None);
+
+    if items.is_empty() {
         return Err("the shell offered no commands for this item".to_owned());
     }
 
-    let chosen = window.track(&menu, &popup, x, y);
-
-    if let Some(id) = chosen {
+    if let Some(id) = choose(items) {
         invoke(&menu, id, window.0)?;
     }
     Ok(())
+}
+
+/// How deep a submenu chain is followed.
+///
+/// Bounded because the tree is walked eagerly: each level costs a
+/// `WM_INITMENUPOPUP` round trip into a third-party handler, and "Send to" or a
+/// cloud provider's nested menus can be slow. Nothing in a real shell menu is
+/// anywhere near this deep, so the limit only ever fires on a misbehaving
+/// handler that hands back a cycle.
+const MAX_DEPTH: u32 = 5;
+
+/// Reads an `HMENU` the shell has populated into plain data.
+///
+/// # Items without a string
+///
+/// A handler may add a fully owner-drawn item, which carries no menu text at
+/// all — the system would have asked it to paint the row itself. There is
+/// nothing to read, so the item's verb is used as the label. That is a
+/// programmatic name (`compress`, `pintohome`) rather than a display name, but
+/// it is recognisable, and dropping the row would silently remove a command the
+/// user has installed.
+fn read_menu(menu: &IContextMenu, hmenu: HMENU, depth: u32) -> Vec<MenuItem> {
+    // SAFETY: `hmenu` is a live menu.
+    let count = unsafe { GetMenuItemCount(Some(hmenu)) };
+    if count <= 0 {
+        return Vec::new();
+    }
+
+    let mut items = Vec::with_capacity(count as usize);
+    for index in 0..count as u32 {
+        let mut info = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU,
+            ..Default::default()
+        };
+        // SAFETY: `info` carries its own size and requests only fields that
+        // need no output buffer.
+        if unsafe { GetMenuItemInfoW(hmenu, index, true, &mut info) }.is_err() {
+            continue;
+        }
+
+        if info.fType.0 & MFT_SEPARATOR.0 != 0 {
+            items.push(MenuItem::separator());
+            continue;
+        }
+
+        let raw = menu_string(hmenu, index)
+            .or_else(|| verb_of(menu, info.wID))
+            .unwrap_or_default();
+        if raw.is_empty() {
+            continue;
+        }
+        let (label, accel) = parse_label(&raw);
+
+        // A submenu parent is not a command: its id is whatever the handler
+        // happened to leave there, and invoking it does nothing useful.
+        let has_sub = !info.hSubMenu.is_invalid();
+        let children = if has_sub && depth < MAX_DEPTH {
+            init_popup(info.hSubMenu, index);
+            read_menu(menu, info.hSubMenu, depth + 1)
+        } else {
+            Vec::new()
+        };
+
+        items.push(MenuItem {
+            id: if has_sub { 0 } else { info.wID },
+            label,
+            accel,
+            enabled: info.fState.0 & (MFS_DISABLED.0 | MFS_GRAYED.0) == 0,
+            default: info.fState.0 & MFS_DEFAULT.0 != 0,
+            checked: info.fState.0 & MFS_CHECKED.0 != 0,
+            separator: false,
+            children,
+        });
+    }
+    items
+}
+
+/// The menu text for one row, or `None` when the item has none.
+fn menu_string(hmenu: HMENU, index: u32) -> Option<String> {
+    // SAFETY: a null buffer asks only for the length, which is the documented
+    // way to size the real call.
+    let len = unsafe { GetMenuStringW(hmenu, index, None, MF_BYPOSITION) };
+    if len <= 0 {
+        return None;
+    }
+
+    // One extra for the NUL the call always writes.
+    let mut buf = vec![0u16; len as usize + 1];
+    // SAFETY: `buf` is at least as long as the length reported above.
+    let written = unsafe { GetMenuStringW(hmenu, index, Some(&mut buf), MF_BYPOSITION) };
+    if written <= 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..written as usize]))
+}
+
+/// The handler's own name for a command, used when there is no menu text.
+fn verb_of(menu: &IContextMenu, id: u32) -> Option<String> {
+    if id < CMD_FIRST {
+        return None;
+    }
+    // The shell identifies a command by its offset within the range we handed
+    // out, not by the raw menu id.
+    let offset = (id - CMD_FIRST) as usize;
+
+    let mut buf = [0u16; 260];
+    // GCS_VERBW writes UTF-16 through a byte-typed pointer — the parameter is
+    // PSTR for the ANSI form and is reused as-is for the wide one.
+    // SAFETY: the buffer is 260 wide characters and `cchmax` says so.
+    let ok = unsafe {
+        menu.GetCommandString(
+            offset,
+            GCS_VERBW,
+            None,
+            windows::core::PSTR(buf.as_mut_ptr() as *mut u8),
+            buf.len() as u32,
+        )
+    }
+    .is_ok();
+    if !ok {
+        return None;
+    }
+
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let verb = String::from_utf16_lossy(&buf[..end]);
+    (!verb.is_empty()).then_some(verb)
+}
+
+/// Tells the handler to fill in a submenu, as the system would before drawing
+/// it.
+///
+/// Menus like "Send to", "Open with" and most cloud-provider entries are empty
+/// until this arrives — the handler populates them on demand so that a menu
+/// that is never opened costs nothing. Without it those submenus read as empty.
+fn init_popup(hsub: HMENU, index: u32) {
+    let wparam = WPARAM(hsub.0 as usize);
+    // Low word is the item's position in its parent; the high word flags a
+    // window menu, which this is not.
+    let lparam = LPARAM(index as isize);
+
+    ACTIVE.with(|active| {
+        let borrowed = active.borrow();
+        let Some(menu) = borrowed.as_ref() else { return };
+
+        if let Ok(cm3) = menu.cast::<IContextMenu3>() {
+            let mut result = LRESULT(0);
+            // SAFETY: forwarding the documented message with the parameters the
+            // system would have sent.
+            if unsafe { cm3.HandleMenuMsg2(WM_INITMENUPOPUP, wparam, lparam, Some(&mut result)) }
+                .is_ok()
+            {
+                return;
+            }
+        }
+        if let Ok(cm2) = menu.cast::<IContextMenu2>() {
+            // SAFETY: as above.
+            let _ = unsafe { cm2.HandleMenuMsg(WM_INITMENUPOPUP, wparam, lparam) };
+        }
+    });
 }
 
 /// Runs the chosen command.
@@ -272,37 +466,6 @@ impl HiddenWindow {
         Ok(HiddenWindow(hwnd))
     }
 
-    /// Shows the menu and returns the chosen command id, or `None` if
-    /// dismissed.
-    fn track(&self, menu: &IContextMenu, popup: &Popup, x: i32, y: i32) -> Option<u32> {
-        // Published so the window procedure can forward owner-draw messages.
-        // Set for exactly the duration of the modal loop.
-        ACTIVE.with(|a| *a.borrow_mut() = Some(menu.clone()));
-
-        // Without this the menu does not dismiss when the user clicks
-        // elsewhere — the documented quirk of tracking a popup from a window
-        // that is not in the foreground.
-        // SAFETY: `self.0` is a live window owned by this thread.
-        unsafe { let _ = SetForegroundWindow(self.0); };
-
-        // SAFETY: live menu and window; TPM_RETURNCMD makes this return the
-        // command id rather than posting WM_COMMAND.
-        let chosen = unsafe {
-            TrackPopupMenuEx(
-                popup.0,
-                (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN).0,
-                x,
-                y,
-                self.0,
-                None,
-            )
-        };
-
-        ACTIVE.with(|a| *a.borrow_mut() = None);
-
-        // 0 means dismissed. See CMD_FIRST for why no command uses that id.
-        (chosen.0 != 0).then_some(chosen.0 as u32)
-    }
 }
 
 impl Drop for HiddenWindow {
@@ -333,47 +496,24 @@ fn register_class() {
     });
 }
 
-/// Forwards the messages owner-drawn menu items depend on.
+/// The owner window's procedure.
 ///
-/// Without this, third-party entries render as blank strips or with no icon,
-/// and cascading submenus from some handlers never populate at all.
+/// It forwards nothing. Owner-draw messages — `WM_DRAWITEM`, `WM_MEASUREITEM`,
+/// `WM_MENUCHAR` — exist so the *system* menu renderer can ask a handler to
+/// paint its own rows, and Neutron never asks the system to render a menu.
+/// `WM_INITMENUPOPUP` is the one message that still matters, and [`init_popup`]
+/// sends it to the handler directly while the menu is being read, rather than
+/// waiting for a message that will never arrive here.
 ///
-/// `IContextMenu3` is tried first because it handles `WM_MENUCHAR` (keyboard
-/// accelerators within the menu) which `IContextMenu2` does not.
+/// The window exists for the other half of its job: somewhere for
+/// `InvokeCommand` to parent the dialogs a command puts up.
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if matches!(msg, WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR) {
-        let handled = ACTIVE.with(|active| {
-            let borrowed = active.borrow();
-            let menu = borrowed.as_ref()?;
-
-            if let Ok(cm3) = menu.cast::<IContextMenu3>() {
-                let mut result = LRESULT(0);
-                // SAFETY: forwarding the message the shell asked to see, with
-                // the parameters it was given.
-                if unsafe { cm3.HandleMenuMsg2(msg, wparam, lparam, Some(&mut result)) }.is_ok() {
-                    return Some(result);
-                }
-            }
-            if let Ok(cm2) = menu.cast::<IContextMenu2>() {
-                // SAFETY: as above.
-                if unsafe { cm2.HandleMenuMsg(msg, wparam, lparam) }.is_ok() {
-                    return Some(LRESULT(0));
-                }
-            }
-            None
-        });
-
-        if let Some(result) = handled {
-            return result;
-        }
-    }
-
-    // SAFETY: standard fallback for messages this window does not handle.
+    // SAFETY: standard handling for a window with no messages of its own.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -392,8 +532,14 @@ mod tests {
     #[test]
     fn showing_a_menu_for_nothing_is_a_no_op() {
         // Right-clicking empty space below the rows produces an empty
-        // selection; a menu of zero items would be an empty grey box.
-        assert!(show(&[], 0, 0).is_ok());
+        // selection; a menu of zero items would be an empty box.
+        let mut asked = false;
+        let result = open(&[], |_| {
+            asked = true;
+            None
+        });
+        assert!(result.is_ok());
+        assert!(!asked, "no selection should not reach the shell at all");
     }
 
     #[test]
@@ -402,5 +548,12 @@ mod tests {
         // would be silently swallowed every time it was picked.
         assert!(CMD_FIRST > 0);
         assert!(CMD_LAST > CMD_FIRST);
+    }
+
+    #[test]
+    fn submenus_are_not_followed_forever() {
+        // A handler that hands back a menu containing itself would otherwise
+        // recurse until the stack ran out.
+        assert!(MAX_DEPTH > 0 && MAX_DEPTH < 16);
     }
 }

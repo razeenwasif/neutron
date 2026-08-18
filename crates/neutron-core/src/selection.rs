@@ -161,6 +161,39 @@ impl Selection {
         Some(target)
     }
 
+    /// Selects every entry between two *display* positions, inclusive.
+    ///
+    /// Backs rubber-band selection, where the band is a rectangle over display
+    /// order and the endpoints arrive in whatever order the drag happened to go.
+    ///
+    /// `additive` keeps whatever was already selected, which is what holding
+    /// Ctrl while dragging means; without it the band replaces the selection.
+    /// The cursor lands on the end the drag finished at, so a subsequent
+    /// Shift+click extends from where the pointer actually was.
+    pub fn select_span(&mut self, list: &EntryList, from: usize, to: usize, additive: bool) {
+        if !additive {
+            self.items.clear();
+        }
+
+        let order = list.order();
+        if order.is_empty() {
+            return;
+        }
+
+        let last = order.len() - 1;
+        let (low, high) = if from <= to { (from, to) } else { (to, from) };
+        let (low, high) = (low.min(last), high.min(last));
+
+        for position in low..=high {
+            self.items.insert(list.at(position) as u32);
+        }
+
+        // Anchor at the start of the band and cursor at its end, so the
+        // selection behaves as if the whole span had been shift-clicked.
+        self.anchor = Some(list.at(from.min(last)) as u32);
+        self.cursor = Some(list.at(to.min(last)) as u32);
+    }
+
     pub fn select_all(&mut self, list: &EntryList) {
         self.items = list.order().iter().copied().collect();
     }
@@ -173,6 +206,112 @@ impl Selection {
             .map(|&i| list.size(i as usize))
             .sum()
     }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+    use crate::entry::{Entry, EntryKind, SyncState};
+    use crate::sort::{SortSpec, sort};
+
+    fn list_of(names: &[&str]) -> EntryList {
+        names
+            .iter()
+            .map(|n| Entry {
+                name: (*n).to_owned(),
+                kind: EntryKind::File,
+                size: 0,
+                modified: 0,
+                created: 0,
+                attrs: 0,
+                sync: SyncState::None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_band_selects_everything_between_its_ends() {
+        let mut list = list_of(&["a", "b", "c", "d", "e"]);
+        sort(&mut list, SortSpec::default());
+        let mut s = Selection::new();
+
+        s.select_span(&list, 1, 3, false);
+        assert_eq!(s.len(), 3);
+        for pos in 1..=3 {
+            assert!(s.is_selected(list.at(pos)));
+        }
+        assert!(!s.is_selected(list.at(0)));
+        assert!(!s.is_selected(list.at(4)));
+    }
+
+    #[test]
+    fn a_band_dragged_upward_selects_the_same_run() {
+        // The endpoints arrive in whatever order the drag went, and a band
+        // dragged bottom-to-top must not select nothing.
+        let mut list = list_of(&["a", "b", "c", "d", "e"]);
+        sort(&mut list, SortSpec::default());
+
+        let mut down = Selection::new();
+        down.select_span(&list, 1, 3, false);
+        let mut up = Selection::new();
+        up.select_span(&list, 3, 1, false);
+
+        let mut a: Vec<usize> = down.iter().collect();
+        let mut b: Vec<usize> = up.iter().collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_band_replaces_unless_it_is_additive() {
+        let mut list = list_of(&["a", "b", "c", "d"]);
+        sort(&mut list, SortSpec::default());
+        let mut s = Selection::new();
+
+        s.select_span(&list, 0, 0, false);
+        s.select_span(&list, 2, 3, false);
+        assert_eq!(s.len(), 2, "a plain band should replace");
+
+        s.select_span(&list, 0, 0, true);
+        assert_eq!(s.len(), 3, "an additive band should keep the rest");
+    }
+
+    #[test]
+    fn a_band_past_the_end_clamps_rather_than_panicking() {
+        // The pointer routinely leaves the list while dragging, and the row
+        // under it is then past the last entry.
+        let mut list = list_of(&["a", "b"]);
+        sort(&mut list, SortSpec::default());
+        let mut s = Selection::new();
+
+        s.select_span(&list, 0, 999, false);
+        assert_eq!(s.len(), 2);
+        s.select_span(&list, 500, 900, false);
+        assert_eq!(s.len(), 1, "a band entirely past the end selects the last row");
+    }
+
+    #[test]
+    fn a_band_over_an_empty_list_does_nothing() {
+        let list = EntryList::new();
+        let mut s = Selection::new();
+        s.select_span(&list, 0, 5, false);
+        assert!(s.is_empty());
+        assert_eq!(s.cursor(), None);
+    }
+
+    #[test]
+    fn a_band_leaves_the_cursor_where_the_drag_ended() {
+        // So a following Shift+click extends from where the pointer actually
+        // was, rather than from the far end of the band.
+        let mut list = list_of(&["a", "b", "c", "d"]);
+        sort(&mut list, SortSpec::default());
+        let mut s = Selection::new();
+
+        s.select_span(&list, 3, 1, false);
+        assert_eq!(s.cursor(), Some(list.at(1)));
+    }
+
 }
 
 #[cfg(test)]

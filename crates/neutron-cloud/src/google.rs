@@ -88,13 +88,8 @@ impl GoogleDrive {
     pub fn state(&self) -> DriveState {
         // Both, because the secret is required at redemption and finding that
         // out only after consent is a poor trade for one extra check here.
-        if flow::client_id().is_err() || flow::client_secret().is_err() {
-            return DriveState::NotConfigured;
-        }
-        if credentials::load().is_none() {
-            return DriveState::SignedOut;
-        }
-        DriveState::SignedIn
+        let configured = flow::client_id().is_ok() && flow::client_secret().is_ok();
+        classify(configured, credentials::load().is_some())
     }
 
     /// Runs the interactive flow and stores the refresh token.
@@ -209,20 +204,38 @@ impl GoogleDrive {
     }
 }
 
+/// The reporting order: configuration first, credentials second.
+///
+/// Separated from [`GoogleDrive::state`] so it can be tested without a real
+/// credential store or config file behind it.
+fn classify(configured: bool, has_credentials: bool) -> DriveState {
+    if !configured {
+        DriveState::NotConfigured
+    } else if !has_credentials {
+        DriveState::SignedOut
+    } else {
+        DriveState::SignedIn
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn state_reports_missing_configuration_before_missing_credentials() {
+    fn missing_configuration_is_reported_before_missing_credentials() {
         // Two different problems with two different remedies: one needs a
         // client id, the other needs a sign-in. Reporting "signed out" when
         // there is no client id sends the user to a button that cannot work.
-        unsafe {
-            std::env::remove_var("NEUTRON_GOOGLE_CLIENT_ID");
-            std::env::remove_var("NEUTRON_GOOGLE_CLIENT_SECRET");
-        }
-        assert_eq!(GoogleDrive::new().state(), DriveState::NotConfigured);
+        //
+        // Asserted against the ordering rather than by calling `state()`,
+        // which reads the real credential store and the real config file: on a
+        // machine where Drive is set up it answers SignedIn, and on the
+        // developer's it answers whatever that machine happens to hold.
+        assert_eq!(classify(false, false), DriveState::NotConfigured);
+        assert_eq!(classify(false, true), DriveState::NotConfigured);
+        assert_eq!(classify(true, false), DriveState::SignedOut);
+        assert_eq!(classify(true, true), DriveState::SignedIn);
     }
 
     #[test]

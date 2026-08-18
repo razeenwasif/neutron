@@ -127,6 +127,13 @@ pub enum FileListAction {
     },
     /// Click on empty space — clears the selection.
     ClearSelection,
+    /// A rubber band covered these display positions, inclusive.
+    Marquee {
+        from: usize,
+        to: usize,
+        /// Ctrl was held: add to the selection rather than replacing it.
+        additive: bool,
+    },
 }
 
 /// Supplies real system icons for rows, when they have been resolved yet.
@@ -212,6 +219,9 @@ fn show_list(
         }
     }
 
+    let viewport = ui.available_rect_before_wrap();
+
+
     let output = scroll.show_rows(ui, ROW_HEIGHT, row_count, |ui, visible| {
         // `visible` is the only range that costs anything, regardless of how
         // large the directory is.
@@ -221,6 +231,7 @@ fn show_list(
                 action = Some(a);
             }
         }
+
 
         // Clicking below the last row clears the selection, as in Explorer.
         let leftover = ui.available_size();
@@ -241,7 +252,142 @@ fn show_list(
     });
 
     state.scroll_offset = output.state.offset.y;
+
+    // Rubber band, tracked after the rows so it paints over them.
+    let band = track_band(ui, viewport, output.state.offset.y);
+    if let Some(rect) = band.rect {
+        draw_band(ui, p, rect, viewport, output.state.offset.y);
+
+        // Rows are a uniform height, so the covered range is arithmetic rather
+        // than a hit test — which is what makes this cover rows scrolled far
+        // out of view, and what a per-row test could not.
+        if row_count > 0 {
+            let first = (rect.top() / ROW_HEIGHT).floor().max(0.0) as usize;
+            let last = (rect.bottom() / ROW_HEIGHT).floor().max(0.0) as usize;
+            action = Some(FileListAction::Marquee {
+                from: first.min(row_count - 1),
+                to: last.min(row_count - 1),
+                additive: band.additive,
+            });
+        }
+        // The band follows the pointer, so the frame has to keep coming even
+        // while the mouse is held still.
+        ui.ctx().request_repaint();
+    }
+
     action
+}
+
+/// Tracks a rubber-band drag and reports what it covers.
+///
+/// # Why this works in content coordinates
+///
+/// The list scrolls while the band is being dragged — dragging past the bottom
+/// edge auto-scrolls, which is the whole point of dragging past the bottom
+/// edge. A band anchored in *screen* space would stay put while the content
+/// moved underneath, so the selection would drift away from the rows the user
+/// was pointing at. Anchoring in content space means the origin stays glued to
+/// the row it started on.
+struct Band {
+    /// Rectangle in content coordinates, or `None` when no drag is in progress.
+    rect: Option<Rect>,
+    additive: bool,
+}
+
+/// Where this list's band drag started, in content coordinates.
+///
+/// Held in egui's own memory rather than in [`FileListState`], because the pane
+/// is drawn from a *clone* of that state — anything written during paint is
+/// discarded when the frame ends. A band origin stored there was reset to
+/// `None` on every frame, so the drag never survived past the press and no band
+/// ever appeared. Keyed by the pane's `Ui` id, so split panes each get their
+/// own.
+fn band_origin_id(ui: &Ui) -> egui::Id {
+    ui.id().with("marquee-origin")
+}
+
+/// Updates the band state from this frame's pointer, given the viewport rect
+/// and the current scroll offset.
+fn track_band(ui: &Ui, viewport: Rect, scroll_offset: f32) -> Band {
+    let (pointer, primary_down, primary_released, ctrl) = ui.input(|i| {
+        (
+            i.pointer.interact_pos(),
+            i.pointer.primary_down(),
+            i.pointer.primary_released(),
+            i.modifiers.ctrl || i.modifiers.command,
+        )
+    });
+
+    let to_content = |p: egui::Pos2| pos2(p.x - viewport.left(), p.y - viewport.top() + scroll_offset);
+
+    let id = band_origin_id(ui);
+    let stored: Option<egui::Pos2> = ui.ctx().data(|d| d.get_temp(id));
+
+    // A band starts anywhere in the list, including on top of a row.
+    //
+    // Explorer reserves a press on a row for dragging the file out, and an
+    // earlier version copied that — which made the band nearly unreachable,
+    // since rows occupy almost the whole list. Neutron has no outbound file
+    // drag yet, so that reservation bought nothing and cost the feature.
+    //
+    // Safe alongside click-selection because egui only reports `clicked()` for
+    // a press and release that did not travel, and the band needs a few pixels
+    // of travel before it starts. When outbound drag lands, this is where the
+    // two gestures will have to be told apart — most likely by whether the
+    // press landed on an already-selected row.
+    if primary_down && stored.is_none() {
+        if let Some(p) = pointer.filter(|p| viewport.contains(*p)) {
+            let origin = to_content(p);
+            ui.ctx().data_mut(|d| d.insert_temp(id, origin));
+        }
+    }
+
+    if primary_released {
+        ui.ctx().data_mut(|d| d.remove::<egui::Pos2>(id));
+        return Band { rect: None, additive: ctrl };
+    }
+
+    let Some(origin) = ui.ctx().data(|d| d.get_temp::<egui::Pos2>(id)) else {
+        return Band { rect: None, additive: ctrl };
+    };
+    let Some(current) = pointer.map(to_content) else {
+        return Band { rect: None, additive: ctrl };
+    };
+
+    // Below a few pixels this is a click with a shaky hand, and treating it as
+    // a band would clear the selection on every imprecise click.
+    let rect = Rect::from_two_pos(origin, current);
+    if rect.width() < 3.0 && rect.height() < 3.0 {
+        return Band { rect: None, additive: ctrl };
+    }
+
+    Band {
+        rect: Some(rect),
+        additive: ctrl,
+    }
+}
+
+/// Paints the band over the viewport, converting back to screen coordinates.
+fn draw_band(ui: &Ui, p: &Palette, band: Rect, viewport: Rect, scroll_offset: f32) {
+    let screen = Rect::from_min_max(
+        pos2(
+            band.left() + viewport.left(),
+            band.top() + viewport.top() - scroll_offset,
+        ),
+        pos2(
+            band.right() + viewport.left(),
+            band.bottom() + viewport.top() - scroll_offset,
+        ),
+    );
+
+    ui.painter()
+        .rect_filled(screen, RADIUS_SMALL_F, p.selection);
+    ui.painter().rect_stroke(
+        screen,
+        RADIUS_SMALL_F,
+        Stroke::new(1.0, p.accent),
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// Column labels: tiny tracked uppercase over a single hairline.
@@ -583,7 +729,11 @@ fn show_grid(
         }
     }
 
-    let output = scroll.show_rows(ui, TILE_H + TILE_GAP, rows, |ui, visible| {
+    let viewport = ui.available_rect_before_wrap();
+    let row_pitch = TILE_H + TILE_GAP;
+
+
+    let output = scroll.show_rows(ui, row_pitch, rows, |ui, visible| {
         let full = ui.available_width();
         for row in visible {
             let (band, response) =
@@ -632,6 +782,34 @@ fn show_grid(
     });
 
     state.scroll_offset = output.state.offset.y;
+
+    let band = track_band(ui, viewport, output.state.offset.y);
+    if let Some(rect) = band.rect {
+        draw_band(ui, p, rect, viewport, output.state.offset.y);
+
+        // A band over a grid covers a rectangle of tiles, so the covered range
+        // is not contiguous in display order — the tiles in the columns either
+        // side of the band, on the rows it spans, are *not* inside it. Reported
+        // as the enclosing span rather than the exact set, which is what
+        // Explorer does and what reads as predictable while dragging.
+        if count > 0 {
+            let first_row = (rect.top() / row_pitch).floor().max(0.0) as usize;
+            let last_row = (rect.bottom() / row_pitch).floor().max(0.0) as usize;
+            let column_of = |x: f32| {
+                ((x - LIST_PAD).max(0.0) / (TILE_W + TILE_GAP)).floor() as usize
+            };
+            let first = first_row * columns + column_of(rect.left()).min(columns - 1);
+            let last = last_row * columns + column_of(rect.right()).min(columns - 1);
+
+            action = Some(FileListAction::Marquee {
+                from: first.min(count - 1),
+                to: last.min(count - 1),
+                additive: band.additive,
+            });
+        }
+        ui.ctx().request_repaint();
+    }
+
     action
 }
 
