@@ -162,9 +162,9 @@ thousands of them that nobody asked for.
 | Metric | Target | Actual | Status |
 |---|---:|---:|---|
 | Enumerate 100k-file dir | <200 ms | ~92 ms | ✅ 2.2× under |
-| Frame time p99 scrolling | <8 ms | 0.40 ms | ✅ 20× under |
-| Cold start | <100 ms | ~1040 ms | ❌ **not achievable as architected** |
-| Idle memory | <60 MB | ~280 MB | ❌ **not achievable as architected** |
+| Frame time p99 scrolling | <8 ms | 0.23 ms | ✅ 35× under |
+| Cold start | <100 ms | 374 ms | ❌ **not achievable as architected** (369 ms of it is GPU device creation) |
+| Idle memory | <60 MB | 310 MB | ❌ **not achievable as architected** |
 | Idle CPU, focused | ~0% | 1.17% | ➖ 10 fps for a drifting ground |
 | Idle CPU, unfocused | ~0% | 0.39% | ✅ |
 | Binary size | ~15 MB | 11 MB | ✅ |
@@ -459,15 +459,26 @@ Both callers now share one non-allocating matcher in `neutron_core::text`.
 > Nothing in the application used `EntryList::default()`, so it had never
 > fired. `Default` is now written out, and there is a test for it.
 
-### Not yet re-measured
+### Frame time, re-measured
 
-The UI was rebuilt on 2026-08-17 — translucent cards over a static three-orb
-ground, per-pane headers, 36pt rows. Idle CPU was re-measured (above); enumerate,
-frame time, cold start and memory were not, since none of those paths changed.
-The background is a fixed ~500 triangles regardless of window size and the
-listing still paints only visible rows, so frame time should be unmoved — but
-that is reasoning, not a measurement, and it is worth confirming before the next
-milestone's numbers are quoted against it.
+Scrolling `C:\Windows\WinSxS` (27,436 entries) with 400 wheel notches, release:
+
+```
+frame time p50 0.11 ms   p99 0.23 ms
+```
+
+Against an 8 ms budget, so 35× under. This was the metric flagged as "reasoned
+about but not measured" after the UI rebuild; the reasoning held. Virtualized
+rows and a fixed-cost background mean frame time does not depend on directory
+size.
+
+### Still not measured
+
+The **real** index. Everything in this section used synthetic corpora, because
+building an index from the USN journal needs the elevated helper and therefore a
+UAC prompt. The 6–9 ms query figures recorded under M4 were taken on the real
+3.3M-record index and have not been re-taken since the scan was rewritten;
+expect roughly a third of them, and confirm before quoting.
 
 ---
 
