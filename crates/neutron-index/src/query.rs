@@ -25,6 +25,8 @@
 //! every candidate — which is the entire budget, spent on a case that almost
 //! never arises. A non-ASCII needle still matches non-ASCII names exactly.
 
+use neutron_core::text::contains_ignore_ascii_case;
+
 use crate::volume::VolumeIndex;
 
 /// A search hit, identifying the record it came from.
@@ -326,53 +328,6 @@ pub fn is_subsequence_ignore_ascii_case(haystack: &str, needle_lower: &str) -> b
         }
     }
     next.is_none()
-}
-
-/// Case-insensitive substring search, where `needle` is already lowercased.
-///
-/// Folds ASCII only — see the module note on why. Non-ASCII bytes compare
-/// exactly, so a Unicode needle still matches its own case.
-pub fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
-    }
-    let (hay, nee) = (haystack.as_bytes(), needle_lower.as_bytes());
-    if nee.len() > hay.len() {
-        return false;
-    }
-
-    let first = nee[0];
-    // Only the ASCII case needs both variants; a non-ASCII first byte is
-    // matched exactly.
-    let first_upper = first.to_ascii_uppercase();
-
-    // The last position a match could still start at. Searching past it wastes
-    // work and, worse, would report a candidate that cannot be compared.
-    let last_start = hay.len() - nee.len();
-
-    // `memchr2` rather than a byte loop. Almost every name in an index does not
-    // contain the first character at all, so this function is overwhelmingly a
-    // rejection test, and the rejection is the part worth vectorising: a scalar
-    // loop compares one byte per iteration where this compares a register full
-    // at a time.
-    let mut from = 0;
-    while from <= last_start {
-        let window = &hay[from..=last_start];
-        let Some(offset) = memchr::memchr2(first, first_upper, window) else {
-            return false;
-        };
-        let start = from + offset;
-
-        if hay[start..start + nee.len()]
-            .iter()
-            .zip(nee)
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-        {
-            return true;
-        }
-        from = start + 1;
-    }
-    false
 }
 
 #[cfg(test)]

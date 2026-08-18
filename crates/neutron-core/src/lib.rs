@@ -10,6 +10,7 @@ pub mod namespace;
 pub mod places;
 pub mod selection;
 pub mod sort;
+pub mod text;
 
 pub use entry::{Entry, EntryKind, EntryList};
 pub use history::History;

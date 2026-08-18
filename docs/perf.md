@@ -161,7 +161,7 @@ thousands of them that nobody asked for.
 
 | Metric | Target | Actual | Status |
 |---|---:|---:|---|
-| Enumerate 100k-file dir | <200 ms | 88 ms | ✅ 2.3× under |
+| Enumerate 100k-file dir | <200 ms | ~92 ms | ✅ 2.2× under |
 | Frame time p99 scrolling | <8 ms | 0.40 ms | ✅ 20× under |
 | Cold start | <100 ms | ~1040 ms | ❌ **not achievable as architected** |
 | Idle memory | <60 MB | ~280 MB | ❌ **not achievable as architected** |
@@ -416,6 +416,48 @@ than an oversight.
 > The real-index figures earlier in this file (6–9 ms) were measured on the
 > actual USN index, which needs an elevated helper. They have **not** been
 > re-measured since this change; expect roughly a third of them.
+
+### Sorting and filtering — an allocation inside two inner loops
+
+`C:\Windows\WinSxS`, 27,436 entries, release, `--bench` 6 iterations:
+
+| | before | after |
+|---|---:|---:|
+| Enumerate (warm median) | 26.6 ms | 24.7 ms |
+| **Sort (warm median)** | **15.8 ms** | **3.8 ms** |
+
+Per entry that is 0.589 µs → 0.169 µs, so a column-header click on a
+100k-entry folder goes from roughly 59 ms to 17 ms.
+
+The cause was `natural_cmp` copying each run of digits into a fresh `String`
+to compare it. That put a heap allocation in the sort's innermost loop, and
+`WinSxS` — where every name is a version number and a hash — hit it on nearly
+every comparison. It now compares the digit runs as slices of the original
+names, and walks bytes rather than `chars`, decoding UTF-8 only when a
+non-ASCII byte actually turns up.
+
+The filter field had the same shape of bug: `name.to_lowercase().contains(…)`
+allocates a lowercased copy of every name in the directory, on every keystroke.
+Measured with `cargo run -p neutron-core --release --example filter_bench`, over
+100,000 entries:
+
+| Needle | Matches | before | after |
+|---|---:|---:|---:|
+| `zzz` | 0 | 2.92 ms | **0.63 ms** |
+| `9999` | 19 | 3.04 ms | **0.88 ms** |
+| `component` | 100,000 | 6.45 ms | 6.26 ms |
+
+The last row is the useful one to keep in view: when everything matches, the
+cost is sorting the survivors, and a faster filter does not touch it.
+
+Both callers now share one non-allocating matcher in `neutron_core::text`.
+
+> Writing that benchmark found a real bug on the way: `EntryList` derived
+> `Default`, which left `name_offsets` empty. That vector holds one *more*
+> element than there are names — `[i]..[i + 1]` bounds name `i` — so the first
+> `name()` after the first `push` on a defaulted list read past the end.
+> Nothing in the application used `EntryList::default()`, so it had never
+> fired. `Default` is now written out, and there is a test for it.
 
 ### Not yet re-measured
 

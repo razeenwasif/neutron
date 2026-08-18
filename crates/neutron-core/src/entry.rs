@@ -88,7 +88,7 @@ pub struct Entry {
 /// Sorting permutes [`EntryList::order`] rather than the data arrays. Re-sorting
 /// a large directory therefore moves 4 bytes per entry instead of ~60, and any
 /// index a caller is holding into the data arrays stays valid across a re-sort.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct EntryList {
     /// All names concatenated, UTF-8. One allocation for the whole directory.
     name_arena: String,
@@ -133,15 +133,25 @@ struct Targets {
     is_path: Vec<bool>,
 }
 
+impl Default for EntryList {
+    /// Not derived. `name_offsets` holds one more entry than there are names —
+    /// `[i]..[i + 1]` bounds name `i` — so an empty list still needs its
+    /// leading zero. A derived `Default` gives an empty vector, and the first
+    /// `name()` after the first `push` reads one past the end of it.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EntryList {
     /// Rank value for an entry excluded by the current filter.
     pub const HIDDEN: u32 = u32::MAX;
 
     pub fn new() -> Self {
-        Self {
-            name_offsets: vec![0],
-            ..Default::default()
-        }
+        // Written out rather than `..Default::default()`: `Default` is now
+        // this function, and the two would call each other until the stack ran
+        // out — which is exactly what happened.
+        Self::with_capacity(0)
     }
 
 
@@ -529,6 +539,16 @@ mod tests {
         assert_eq!(list.rank(0), Some(0));
         // Filtered out — a selection cursor on it must not resolve to a row.
         assert_eq!(list.rank(1), None);
+    }
+
+    #[test]
+    fn a_default_list_is_a_usable_list() {
+        // `Default` used to be derived, which left `name_offsets` empty — and
+        // that vector holds one *more* entry than there are names, so the very
+        // first `name()` after the first `push` read past the end.
+        let mut list = EntryList::default();
+        list.push(&entry("first.txt", EntryKind::File, 1));
+        assert_eq!(list.name(0), "first.txt");
     }
 
     #[test]

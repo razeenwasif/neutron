@@ -69,47 +69,69 @@ impl Default for SortSpec {
 /// detection both need them; the common all-ASCII path is still fast because
 /// `char_indices` over ASCII is a byte walk.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let mut ai = a.chars().peekable();
-    let mut bi = b.chars().peekable();
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
 
     loop {
-        match (ai.peek().copied(), bi.peek().copied()) {
+        match (ab.get(i).copied(), bb.get(j).copied()) {
             (None, None) => return Ordering::Equal,
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
-            (Some(ac), Some(bc)) => {
-                if ac.is_ascii_digit() && bc.is_ascii_digit() {
-                    // Consume both digit runs and compare numerically. Compare
-                    // by significant-digit count first so arbitrarily long runs
-                    // work without overflowing an integer.
-                    let a_digits = take_digits(&mut ai);
-                    let b_digits = take_digits(&mut bi);
-                    let a_sig = a_digits.trim_start_matches('0');
-                    let b_sig = b_digits.trim_start_matches('0');
 
-                    match a_sig.len().cmp(&b_sig.len()).then_with(|| a_sig.cmp(b_sig)) {
-                        Ordering::Equal => {
-                            // Numerically equal. Fewer leading zeros first, so
-                            // `file01` and `file1` have a stable, total order
-                            // rather than comparing equal.
-                            match a_digits.len().cmp(&b_digits.len()) {
-                                Ordering::Equal => continue,
-                                other => return other,
-                            }
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                // Compare the digit runs numerically, as slices of the original
+                // names. An earlier version copied each run into a `String`,
+                // which put a heap allocation inside the sort's innermost loop
+                // — and directory names full of version numbers and hashes,
+                // which is exactly what a big folder looks like, hit it on
+                // nearly every comparison.
+                let a_run = digits_from(ab, &mut i);
+                let b_run = digits_from(bb, &mut j);
+
+                // By significant-digit count first, so arbitrarily long runs
+                // compare correctly without overflowing an integer.
+                let a_sig = strip_zeros(a_run);
+                let b_sig = strip_zeros(b_run);
+
+                match a_sig.len().cmp(&b_sig.len()).then_with(|| a_sig.cmp(b_sig)) {
+                    Ordering::Equal => {
+                        // Numerically equal. Fewer leading zeros first, so
+                        // `file01` and `file1` have a stable, total order
+                        // rather than comparing equal.
+                        match a_run.len().cmp(&b_run.len()) {
+                            Ordering::Equal => continue,
+                            other => return other,
                         }
-                        other => return other,
                     }
-                } else {
-                    ai.next();
-                    bi.next();
-                    // Fold case so `Apple` and `apple` neighbour each other.
-                    let (al, bl) = (lower(ac), lower(bc));
-                    if al != bl {
-                        return al.cmp(&bl);
-                    }
-                    // Same letter, different case: remember nothing and move on.
-                    // Ties are broken by the caller's stable fallback.
+                    other => return other,
                 }
+            }
+
+            (Some(x), Some(y)) if x.is_ascii() && y.is_ascii() => {
+                // The overwhelmingly common case, and the reason this walks
+                // bytes rather than chars: no UTF-8 decoding at all.
+                let (al, bl) = (x.to_ascii_lowercase(), y.to_ascii_lowercase());
+                if al != bl {
+                    return al.cmp(&bl);
+                }
+                // Same letter, different case: move on. Ties are broken by the
+                // caller's total-order fallback.
+                i += 1;
+                j += 1;
+            }
+
+            (Some(_), Some(_)) => {
+                // At least one side is non-ASCII. Decode a character from each
+                // and fold properly. `i` and `j` only ever advance by whole
+                // characters, so they are always on a boundary here.
+                let ac = a[i..].chars().next().unwrap_or('\u{fffd}');
+                let bc = b[j..].chars().next().unwrap_or('\u{fffd}');
+                let (al, bl) = (lower(ac), lower(bc));
+                if al != bl {
+                    return al.cmp(&bl);
+                }
+                i += ac.len_utf8();
+                j += bc.len_utf8();
             }
         }
     }
@@ -125,17 +147,22 @@ fn lower(c: char) -> char {
     }
 }
 
-fn take_digits(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
-    let mut s = String::new();
-    while let Some(&c) = it.peek() {
-        if c.is_ascii_digit() {
-            s.push(c);
-            it.next();
-        } else {
-            break;
-        }
+/// The run of digits starting at `*at`, advancing `*at` past it.
+fn digits_from<'a>(bytes: &'a [u8], at: &mut usize) -> &'a [u8] {
+    let start = *at;
+    while *at < bytes.len() && bytes[*at].is_ascii_digit() {
+        *at += 1;
     }
-    s
+    &bytes[start..*at]
+}
+
+/// `digits` without its leading zeros.
+fn strip_zeros(digits: &[u8]) -> &[u8] {
+    let first = digits
+        .iter()
+        .position(|&d| d != b'0')
+        .unwrap_or(digits.len());
+    &digits[first..]
 }
 
 /// Rebuilds the display order from scratch: filters, then sorts.
@@ -168,9 +195,10 @@ pub fn apply_filtered(list: &mut EntryList, spec: SortSpec, show_hidden: bool, n
             if !show_hidden && list.is_hidden(i) {
                 return false;
             }
-            // `to_lowercase` allocates, so the empty case skips it entirely:
-            // that is the path taken on every ordinary directory load.
-            needle.is_empty() || list.name(i).to_lowercase().contains(&needle)
+            // Not `name.to_lowercase().contains(..)`: that allocates a
+            // lowercased copy of every name in the directory, on every
+            // keystroke. The shared matcher folds case as it compares.
+            crate::text::contains_ignore_ascii_case(list.name(i), &needle)
         })
         .collect();
 
