@@ -57,6 +57,16 @@ enum Action {
     SetFilter(String),
     /// Put the caret in the focused pane's filter field.
     FocusFilter,
+    /// Start renaming the focused tab's cursor row.
+    BeginRename,
+    /// The rename box's contents changed.
+    RenameTyped(String),
+    /// Apply the typed name, or do nothing if it is unchanged or invalid.
+    RenameCommit,
+    /// Abandon the rename.
+    RenameCancel,
+    /// Make a folder in the focused tab, then rename it.
+    NewFolder,
     /// Put the selection on the clipboard. `cut` marks it for a move.
     Clip { cut: bool },
     /// Paste whatever is on the clipboard into the focused tab's folder.
@@ -157,6 +167,18 @@ pub struct NeutronApp {
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
 
+    /// The rename in progress, if any.
+    rename: Option<RenameEdit>,
+    /// Counts renames, only so each gets its own text-field id.
+    renames_started: u64,
+    /// A folder just created, waiting for its listing to arrive so the new row
+    /// can be found and put straight into a rename box.
+    pending_rename: Option<(TabId, String)>,
+    /// Folder names as they are created, from the apartment thread that made
+    /// them.
+    created_tx: crossbeam_channel::Sender<(TabId, String)>,
+    created_rx: crossbeam_channel::Receiver<(TabId, String)>,
+
     /// Names marked by the last `Ctrl+X`, and the folder they live in.
     ///
     /// Held so those rows can be drawn faded, which is the only sign a cut
@@ -232,6 +254,7 @@ impl NeutronApp {
         let (drive_tx, drive_rx) = crossbeam_channel::unbounded();
         let (menu_tx, menu_rx) = crossbeam_channel::unbounded();
         let (clip_fail_tx, clip_fail_rx) = crossbeam_channel::unbounded();
+        let (created_tx, created_rx) = crossbeam_channel::unbounded();
 
         // `Ctrl+V` never reaches the application through egui when the
         // clipboard holds files rather than text, which is the only case that
@@ -294,6 +317,11 @@ impl NeutronApp {
             drive_state,
             drive_tx,
             drive_rx,
+            rename: None,
+            renames_started: 0,
+            pending_rename: None,
+            created_tx,
+            created_rx,
             cut_dir: None,
             cut_names: std::collections::HashSet::new(),
             clip_fail_tx,
@@ -438,6 +466,18 @@ impl NeutronApp {
                     t.selection.select_span(&t.list, from, to, additive);
                 }
             }
+
+            Action::BeginRename => self.begin_rename(ctx),
+            Action::RenameTyped(text) => {
+                if let Some(r) = self.rename.as_mut() {
+                    r.text = text;
+                }
+            }
+            Action::RenameCommit => self.commit_rename(ctx),
+            Action::RenameCancel => {
+                self.close_rename(ctx);
+            }
+            Action::NewFolder => self.new_folder(),
 
             Action::Clip { cut } => self.clip_selection(cut),
             Action::Paste => self.paste(),
@@ -741,6 +781,156 @@ impl NeutronApp {
                 self.launch(path, neutron_shell::open::Verb::Open);
             }
         }
+    }
+
+    /// Opens the rename box on the focused tab's cursor row.
+    fn begin_rename(&mut self, ctx: &egui::Context) {
+        let Some(tab_id) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let Some(tab) = self.workspace.tabs.get(&tab_id) else {
+            return;
+        };
+        // A location with no path — This PC, a shell folder, Drive — has
+        // nothing this could rename.
+        if tab.location().as_path().is_none() {
+            return;
+        }
+        // The cursor rather than the selection: renaming is a single-file
+        // operation, and with several selected the cursor is the one the user
+        // last touched.
+        let Some(idx) = tab.selection.cursor().filter(|&i| i < tab.list.len()) else {
+            return;
+        };
+
+        let name = tab.list.name(idx).to_owned();
+        self.open_rename(ctx, tab_id, idx, name);
+    }
+
+    /// Puts a row into a rename box and focuses it.
+    fn open_rename(&mut self, ctx: &egui::Context, tab: TabId, idx: usize, name: String) {
+        self.renames_started += 1;
+        let generation = self.renames_started;
+        self.rename = Some(RenameEdit {
+            tab,
+            generation,
+            idx,
+            original: name.clone(),
+            text: name,
+        });
+
+        // Focused from here rather than from the widget: the box has not been
+        // drawn yet, and without focus the first keystroke would go to the key
+        // table instead — where it would be a navigation shortcut.
+        ctx.memory_mut(|m| m.request_focus(file_list::rename_field_id(generation)));
+    }
+
+    /// Ends the rename and gives the keyboard back.
+    ///
+    /// Without surrendering focus the field keeps it after the box is gone, and
+    /// `egui_wants_keyboard_input` stays true — which switches off every
+    /// shortcut in the application until something else is clicked.
+    fn close_rename(&mut self, ctx: &egui::Context) -> Option<RenameEdit> {
+        let edit = self.rename.take()?;
+        ctx.memory_mut(|m| m.surrender_focus(file_list::rename_field_id(edit.generation)));
+        Some(edit)
+    }
+
+    /// Applies the typed name.
+    fn commit_rename(&mut self, ctx: &egui::Context) {
+        let Some(edit) = self.close_rename(ctx) else {
+            return;
+        };
+
+        let text = edit.text.trim().to_owned();
+        // An unchanged name is not a failure; it is what pressing Enter without
+        // typing means, and it should not put a file operation on a worker.
+        if text == edit.original || text.is_empty() {
+            return;
+        }
+        if let Some(reason) = neutron_core::naming::rejection(&text) {
+            tracing::warn!("rename refused: {reason}");
+            return;
+        }
+
+        let Some(dir) = self
+            .workspace
+            .tabs
+            .get(&edit.tab)
+            .and_then(|t| t.location().as_path())
+            .map(|p| p.to_path_buf())
+        else {
+            return;
+        };
+        let from = dir.join(&edit.original);
+
+        let owner = self.hwnd.unwrap_or(0);
+        let wake = self.ctx.clone();
+        let done = self.refresh_tx.clone();
+        let tab = edit.tab;
+
+        tracing::info!(from = %from.display(), to = %text, "rename");
+        self.sta.submit(move || {
+            if let Err(e) = neutron_shell::fileops::rename(&from, &text, owner) {
+                tracing::warn!("rename failed: {e}");
+            }
+            let _ = done.send(tab);
+            wake.request_repaint();
+        });
+    }
+
+    /// Creates a folder in the focused tab and opens its rename box.
+    fn new_folder(&mut self) {
+        let Some(tab_id) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let Some(dir) = self
+            .workspace
+            .tabs
+            .get(&tab_id)
+            .and_then(|t| t.location().as_path())
+            .map(|p| p.to_path_buf())
+        else {
+            return;
+        };
+
+        let owner = self.hwnd.unwrap_or(0);
+        let wake = self.ctx.clone();
+        let done = self.refresh_tx.clone();
+        let created = self.created_tx.clone();
+
+        self.sta.submit(move || {
+            match neutron_shell::fileops::create_folder(&dir, owner) {
+                // The name is reported so the row can be found once the listing
+                // is re-read: a new folder appears with its name selected, and
+                // that cannot be done without knowing which row it is.
+                Ok(name) => {
+                    let _ = created.send((tab_id, name));
+                }
+                Err(e) => tracing::warn!("could not create folder: {e}"),
+            }
+            let _ = done.send(tab_id);
+            wake.request_repaint();
+        });
+    }
+
+    /// Puts a newly created folder into its rename box, once its row exists.
+    fn open_pending_rename(&mut self, ctx: &egui::Context) {
+        let Some((tab_id, name)) = self.pending_rename.clone() else {
+            return;
+        };
+        let Some(tab) = self.workspace.tabs.get(&tab_id) else {
+            self.pending_rename = None;
+            return;
+        };
+        // The listing may not have caught up yet. Left pending, it is retried
+        // next frame; the entry appears as soon as the reload lands.
+        let Some(idx) = (0..tab.list.len()).find(|&i| tab.list.name(i) == name) else {
+            return;
+        };
+
+        self.pending_rename = None;
+        self.open_rename(ctx, tab_id, idx, name);
     }
 
     /// The focused tab, the folder it shows, and the paths of its selection.
@@ -1165,6 +1355,10 @@ impl eframe::App for NeutronApp {
             self.clear_cut_marks();
         }
         self.clipboard_keys(&ctx, &mut actions);
+        while let Ok((tab, name)) = self.created_rx.try_recv() {
+            self.pending_rename = Some((tab, name));
+        }
+        self.open_pending_rename(&ctx);
         // Before drawing: installs icons that arrived since the last frame, so
         // rows painted below pick them up immediately rather than a frame late.
         self.icons.pump();
@@ -1202,6 +1396,24 @@ impl eframe::App for NeutronApp {
 
         self.startup.mark_frame(frame_started.elapsed());
     }
+}
+
+/// A rename in progress.
+///
+/// The typed text lives here rather than in the list widget because that widget
+/// is drawn from a clone of the view state — anything it wrote would be thrown
+/// away when the frame ended. It edits a copy and reports each keystroke back.
+struct RenameEdit {
+    tab: TabId,
+    /// Which rename this is. Gives the text field a fresh id each time, so it
+    /// cannot inherit the previous rename's caret position.
+    generation: u64,
+    /// Storage index, so a re-sort under the box does not move the rename to a
+    /// different file.
+    idx: usize,
+    /// What the file is called now, to tell an unchanged rename from a real one.
+    original: String,
+    text: String,
 }
 
 /// A shell menu waiting to be shown, from the apartment thread that built it.
@@ -1385,6 +1597,7 @@ impl NeutronApp {
                 // the Recycle Bin, and the shell still confirms it.
                 Action::Delete { permanent: shift },
             ));
+            bindings.push((egui::Key::F2, Action::BeginRename));
             bindings.push((egui::Key::F5, Action::Refresh));
             bindings.push((egui::Key::Escape, Action::ClearSelection));
             bindings.push((egui::Key::F6, Action::FocusNextPane));
@@ -1427,6 +1640,10 @@ impl NeutronApp {
                         Action::Split(if shift { Axis::Vertical } else { Axis::Horizontal }),
                     ),
                 ]);
+
+                if shift {
+                    bindings.push((egui::Key::N, Action::NewFolder));
+                }
 
                 if let Some(group) = self.workspace.focused_group().map(|g| g.id) {
                     bindings.push((egui::Key::T, Action::NewTab(group)));
@@ -1686,6 +1903,8 @@ impl NeutronApp {
             C::Copy => Some(Action::Clip { cut: false }),
             C::Cut => Some(Action::Clip { cut: true }),
             C::Paste => Some(Action::Paste),
+            C::Rename => Some(Action::BeginRename),
+            C::NewFolder => Some(Action::NewFolder),
             C::DeleteSelection => Some(Action::Delete { permanent: false }),
 
             C::ToggleHidden => Some(Action::ToggleHidden),
@@ -2248,7 +2467,18 @@ impl NeutronApp {
             ui,
             &mut view,
             &tab.list,
-            &file_list::Marks { selection: &tab.selection, cut },
+            &file_list::Marks {
+                selection: &tab.selection,
+                cut,
+                // Only in the pane that owns it. A split showing the same
+                // folder twice would otherwise draw two boxes, both bound to
+                // one text field id, and neither would behave.
+                rename: self
+                    .rename
+                    .as_ref()
+                    .filter(|r| Some(r.tab) == group.active_tab())
+                    .map(|r| (r.idx, r.text.as_str(), r.generation)),
+            },
             p,
             Some(&source as &dyn file_list::IconSource),
         );
@@ -2282,6 +2512,9 @@ impl NeutronApp {
                 FileListAction::ContextMenu { idx, pos } => {
                     actions.push(Action::ContextMenu { idx, pos })
                 }
+                FileListAction::RenameTyped(text) => actions.push(Action::RenameTyped(text)),
+                FileListAction::RenameCommit => actions.push(Action::RenameCommit),
+                FileListAction::RenameCancel => actions.push(Action::RenameCancel),
             }
         }
     }

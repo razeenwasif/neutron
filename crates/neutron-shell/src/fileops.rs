@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::UI::Shell::{
     FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOF_WANTNUKEWARNING, FOFX_ADDUNDORECORD,
     FOFX_RECYCLEONDELETE, FileOperation, IFileOperation, IShellItem,
@@ -211,6 +212,92 @@ pub fn transfer(
         tracing::warn!("file operation failed: {}", e.message());
         e.message()
     })
+}
+
+/// Renames one item in place.
+///
+/// **STA pool only.** Through `IFileOperation` rather than `std::fs::rename`
+/// for the same reasons as everything else here: it goes in the undo stack, it
+/// fires the change notifications an open Explorer window is listening for, and
+/// it produces the shell's own prompts for a name that is taken or a file that
+/// is in use.
+pub fn rename(path: &Path, new_name: &str, owner: isize) -> Result<(), String> {
+    if let Some(reason) = neutron_core::naming::rejection(new_name) {
+        return Err(reason.to_owned());
+    }
+
+    // SAFETY: the pool thread has already called CoInitializeEx with
+    // COINIT_APARTMENTTHREADED; see `sta`.
+    let op: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) }
+        .map_err(|e| format!("could not start the rename: {}", e.message()))?;
+
+    let item = shell_item(path)?;
+    let wide = wide(new_name);
+
+    // SAFETY: `op` is live; `wide` is NUL-terminated and outlives the calls.
+    unsafe {
+        op.SetOperationFlags(FOF_ALLOWUNDO | FOFX_ADDUNDORECORD)
+            .map_err(|e| e.message())?;
+        op.SetOwnerWindow(HWND(owner as *mut _))
+            .map_err(|e| e.message())?;
+        op.RenameItem(&item, PCWSTR(wide.as_ptr()), None)
+            .map_err(|e| e.message())?;
+        op.PerformOperations().map_err(|e| {
+            tracing::warn!(path = %path.display(), "rename failed: {}", e.message());
+            e.message()
+        })
+    }
+}
+
+/// Creates a folder in `parent` and returns the name it was given.
+///
+/// **STA pool only.** The name is chosen here rather than by the shell —
+/// `New folder`, then `New folder (2)` and so on — because the caller needs to
+/// know it: a new folder appears with its name selected for typing, and that
+/// cannot be done without knowing which row it is.
+///
+/// Reading the directory to find a free name races with anything else creating
+/// files there. The shell settles it: `NewItem` on a name that appeared in the
+/// meantime fails, and the folder is simply not created.
+pub fn create_folder(parent: &Path, owner: isize) -> Result<String, String> {
+    let name = neutron_core::naming::next_available("New folder", |candidate| {
+        parent.join(candidate).exists()
+    });
+
+    // SAFETY: the pool thread has already called CoInitializeEx with
+    // COINIT_APARTMENTTHREADED; see `sta`.
+    let op: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) }
+        .map_err(|e| format!("could not start the folder creation: {}", e.message()))?;
+
+    let target = shell_item(parent)?;
+    let wide_name = wide(&name);
+
+    // SAFETY: `op` and `target` are live; `wide_name` outlives the call.
+    unsafe {
+        op.SetOperationFlags(FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOF_NOCONFIRMMKDIR)
+            .map_err(|e| e.message())?;
+        op.SetOwnerWindow(HWND(owner as *mut _))
+            .map_err(|e| e.message())?;
+        op.NewItem(
+            &target,
+            FILE_ATTRIBUTE_DIRECTORY.0,
+            PCWSTR(wide_name.as_ptr()),
+            PCWSTR::null(),
+            None,
+        )
+        .map_err(|e| e.message())?;
+        op.PerformOperations().map_err(|e| {
+            tracing::warn!(parent = %parent.display(), "could not create folder: {}", e.message());
+            e.message()
+        })?;
+    }
+
+    Ok(name)
+}
+
+/// A NUL-terminated UTF-16 copy of `s`.
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Wraps a path as an `IShellItem`.

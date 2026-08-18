@@ -1,6 +1,6 @@
 //! Non-Windows placeholder. See `lib.rs` for why the stubs exist.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposal {
@@ -29,4 +29,12 @@ pub fn transfer(
     _owner: isize,
 ) -> Result<(), String> {
     Err("file operations are Windows-only".to_owned())
+}
+
+pub fn rename(_path: &Path, _new_name: &str, _owner: isize) -> Result<(), String> {
+    Err("renaming is Windows-only".to_owned())
+}
+
+pub fn create_folder(_parent: &Path, _owner: isize) -> Result<String, String> {
+    Err("creating folders is Windows-only".to_owned())
 }

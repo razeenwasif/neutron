@@ -5,6 +5,7 @@ pub mod entry;
 pub mod history;
 pub mod layout;
 pub mod menu;
+pub mod naming;
 pub mod namespace;
 pub mod places;
 pub mod selection;

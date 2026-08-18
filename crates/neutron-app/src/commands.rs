@@ -27,6 +27,8 @@ pub enum CommandId {
 
     SelectAll,
     ClearSelection,
+    Rename,
+    NewFolder,
     Copy,
     Cut,
     Paste,
@@ -83,6 +85,8 @@ pub const ALL: &[CommandDef] = &[
     CommandDef { id: CommandId::Copy, title: "Copy to clipboard", hint: "Ctrl+C" },
     CommandDef { id: CommandId::Cut, title: "Cut to clipboard", hint: "Ctrl+X" },
     CommandDef { id: CommandId::Paste, title: "Paste here", hint: "Ctrl+V" },
+    CommandDef { id: CommandId::Rename, title: "Rename this file", hint: "F2" },
+    CommandDef { id: CommandId::NewFolder, title: "New folder", hint: "Ctrl+Shift+N" },
     CommandDef {
         id: CommandId::DeleteSelection,
         title: "Delete to Recycle Bin",

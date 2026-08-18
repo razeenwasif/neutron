@@ -112,7 +112,10 @@ impl Default for FileListState {
 }
 
 /// Something the user did that the app must act on.
-#[derive(Debug, Clone, Copy, PartialEq)]
+// Not `Copy`: a rename carries the typed name. Everything else in here is a
+// couple of integers, and one owned `String` per frame is not worth a second
+// action type to avoid.
+#[derive(Debug, Clone, PartialEq)]
 pub enum FileListAction {
     /// Double-click or Enter — open the entry.
     Activate(usize),
@@ -127,6 +130,12 @@ pub enum FileListAction {
         idx: Option<usize>,
         pos: egui::Pos2,
     },
+    /// The rename box's contents changed.
+    RenameTyped(String),
+    /// Enter, or the box losing focus: keep the typed name.
+    RenameCommit,
+    /// Escape: put the old name back.
+    RenameCancel,
     /// Click on empty space — clears the selection.
     ClearSelection,
     /// A rubber band covered these display positions, inclusive.
@@ -172,11 +181,25 @@ pub struct Marks<'a> {
     /// `None` when nothing is cut, or when the cut happened in a different
     /// directory than the one being drawn.
     pub cut: Option<&'a HashSet<String>>,
+    /// The row being renamed, the text currently in its box, and which rename
+    /// this is.
+    ///
+    /// The text is borrowed rather than owned because the box's contents belong
+    /// to the application: this widget is drawn from a clone of the view state,
+    /// so anything it wrote would be discarded when the frame ended. It copies
+    /// the string for the frame, reports edits back as actions, and the app
+    /// keeps the authoritative one — the same arrangement the filter field uses.
+    pub rename: Option<(usize, &'a str, u64)>,
 }
 
 impl Marks<'_> {
     fn is_cut(&self, name: &str) -> bool {
         self.cut.is_some_and(|names| names.contains(name))
+    }
+
+    fn rename_text(&self, idx: usize) -> Option<(&'_ str, u64)> {
+        self.rename
+            .and_then(|(row, text, generation)| (row == idx).then_some((text, generation)))
     }
 }
 
@@ -547,6 +570,117 @@ fn header(
 
 const RADIUS_SMALL_F: f32 = 8.0;
 
+/// The id of the rename box for the `generation`-th rename.
+///
+/// Not derived from the row: the application has to focus the box the moment a
+/// rename starts, which is before this widget has been drawn.
+///
+/// Not fixed either, which was the first attempt and was wrong. `TextEdit`
+/// state is stored per id and outlives the widget, so every rename inherited
+/// the caret position the *previous* one finished at — renaming `cutme.txt`
+/// right after typing a seven-character name put the caret at offset seven and
+/// produced `cutme.tnotesxt`. A fresh id per rename has no state to inherit.
+pub fn rename_field_id(generation: u64) -> egui::Id {
+    egui::Id::new("neutron-rename-field").with(generation)
+}
+
+/// The in-place rename editor, drawn over the name column.
+///
+/// Reports every keystroke rather than only the final answer: the string it
+/// edits lives in the application, so the box holds a copy for one frame and
+/// hands back what was typed.
+fn rename_box(
+    ui: &mut Ui,
+    p: &Palette,
+    rect: Rect,
+    current: &str,
+    generation: u64,
+) -> Option<FileListAction> {
+    let mut text = current.to_owned();
+    let id = rename_field_id(generation);
+
+    let field = rect.shrink2(vec2(0.0, 3.0));
+    ui.painter().rect(
+        field,
+        RADIUS_SMALL_F,
+        p.inset,
+        Stroke::new(1.0, if neutron_core::naming::is_valid(text.trim()) { p.accent } else { p.danger }),
+        egui::StrokeKind::Inside,
+    );
+
+    // Select the part of the name that is actually being changed, before the
+    // field is built rather than after. Renaming almost always means the stem,
+    // and having to unselect ".txt" every time is the kind of friction that
+    // makes an application feel unfinished.
+    //
+    // Done first because `TextEdit` establishes its own caret the moment it is
+    // shown, and overwriting that afterwards only takes effect on the *next*
+    // frame — by which time the first keystroke has already gone to the wrong
+    // place. Typing `notes` over `cutme.txt` produced `cutme.txtnotes`.
+    //
+    // "First frame" is recorded against the field's own id, which is unique per
+    // rename, so this fires exactly once and needs no cleanup.
+    let armed = id.with("armed");
+    let first_frame = ui.ctx().data_mut(|d| {
+        let seen: bool = d.get_temp(armed).unwrap_or(false);
+        d.insert_temp(armed, true);
+        !seen
+    });
+    if first_frame {
+        let stem = neutron_core::naming::stem_len(&text);
+        let mut state = egui::text_edit::TextEditState::default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(stem),
+        )));
+        egui::TextEdit::store_state(ui.ctx(), id, state);
+    }
+
+    let inner = field.shrink2(vec2(6.0, 0.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+    child.set_clip_rect(inner);
+
+    let output = egui::TextEdit::singleline(&mut text)
+        .id(id)
+        .background_color(Color32::TRANSPARENT)
+        .desired_width(inner.width())
+        .font(TextStyle::Body.resolve(ui.style()))
+        .text_color(p.text)
+        .vertical_align(egui::Align::Center)
+        .show(&mut child);
+
+    let valid = neutron_core::naming::is_valid(text.trim());
+
+    // Checked before Enter, so Escape wins when a key table somewhere else has
+    // also claimed it.
+    if child.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return Some(FileListAction::RenameCancel);
+    }
+    if child.input(|i| i.key_pressed(egui::Key::Enter)) {
+        // Enter on a name Windows will not accept leaves the box open with its
+        // border still red, rather than closing and quietly discarding what was
+        // typed. The red border is the explanation; taking the text away as
+        // well would leave nothing to correct.
+        if valid {
+            return Some(FileListAction::RenameCommit);
+        }
+    }
+    // Clicking away commits, as Explorer does: a rename abandoned by clicking
+    // elsewhere is nearly always finished rather than unwanted, and Escape is
+    // right there for the other case. An invalid name is the exception — there
+    // is nothing to commit, and leaving the box open once focus has gone
+    // somewhere else would be a trap.
+    if output.response.lost_focus() {
+        return Some(if valid {
+            FileListAction::RenameCommit
+        } else {
+            FileListAction::RenameCancel
+        });
+    }
+
+    (text != current).then_some(FileListAction::RenameTyped(text))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_row(
     ui: &mut Ui,
@@ -652,17 +786,26 @@ fn draw_row(
 
     // --- name ---
     let name_rect = Rect::from_min_size(pos2(x, outer.top()), vec2(name_width, ROW_HEIGHT));
-    draw_cell_text(
-        ui,
-        name_rect,
-        list.name(idx),
-        &body,
-        name_colour,
-        Align2::LEFT_CENTER,
-    );
+
+    let mut rename_action = None;
+    if let Some((text, generation)) = marks.rename_text(idx) {
+        rename_action = rename_box(ui, p, name_rect, text, generation);
+        // Everything right of the name still draws: the size and date are
+        // context for what is being renamed, and blanking them would make the
+        // row jump.
+    } else {
+        draw_cell_text(
+            ui,
+            name_rect,
+            list.name(idx),
+            &body,
+            name_colour,
+            Align2::LEFT_CENTER,
+        );
+    }
 
     // Cloud-only badge, right-aligned within the name column.
-    if list.sync(idx) == SyncState::CloudOnly {
+    if list.sync(idx) == SyncState::CloudOnly && marks.rename_text(idx).is_none() {
         ui.painter().text(
             pos2(name_rect.right() - 2.0, outer.center().y),
             Align2::RIGHT_CENTER,
@@ -710,6 +853,18 @@ fn draw_row(
     );
 
     // --- interaction ---
+    //
+    // The rename box wins outright. While it is open the row is not a target
+    // for selection or activation: a click inside the box would otherwise both
+    // move the caret and re-select the row, and a double-click to place the
+    // caret would open the file.
+    if let Some(a) = rename_action {
+        return Some(a);
+    }
+    if marks.rename_text(idx).is_some() {
+        return None;
+    }
+
     if response.double_clicked() {
         return Some(FileListAction::Activate(idx));
     }
