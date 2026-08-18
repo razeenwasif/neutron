@@ -144,6 +144,7 @@ pub enum AuthError {
     StateMismatch,
     Malformed(String),
     NoClientId,
+    NoClientSecret,
     Http(String),
 }
 
@@ -160,6 +161,10 @@ impl fmt::Display for AuthError {
             AuthError::NoClientId => write!(
                 f,
                 "no Google OAuth client id configured — set NEUTRON_GOOGLE_CLIENT_ID"
+            ),
+            AuthError::NoClientSecret => write!(
+                f,
+                "no Google OAuth client secret configured — set NEUTRON_GOOGLE_CLIENT_SECRET"
             ),
             AuthError::Http(e) => write!(f, "{e}"),
         }
@@ -264,21 +269,57 @@ fn percent_decode(value: &str) -> String {
 /// Served from memory with an explicit `Connection: close`, so the browser does
 /// not hold the socket open waiting for more — the listener accepts exactly one
 /// request and a keep-alive connection would make it hang.
-pub fn success_page() -> String {
-    let body = "<!doctype html><meta charset=\"utf-8\">\
+///
+/// # It must tell the truth
+///
+/// An earlier version served the success page unconditionally, before the
+/// result was even examined. A flow that failed the state check, or came back
+/// with no code, still told the user "Google Drive connected" — so the browser
+/// said it worked while the application knew it had not, and the only visible
+/// symptom was a sidebar row that quietly refused to do anything.
+pub fn result_page(outcome: Result<(), &AuthError>) -> String {
+    let (heading, detail) = match outcome {
+        Ok(()) => (
+            "Google Drive connected",
+            "You can close this tab and return to Neutron.".to_owned(),
+        ),
+        Err(e) => ("Could not connect", e.to_string()),
+    };
+
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\">\
         <title>Neutron</title>\
         <body style=\"font-family:Segoe UI,system-ui,sans-serif;background:#0c0714;\
         color:#fbf7ff;display:grid;place-items:center;height:100vh;margin:0\">\
-        <div style=\"text-align:center\">\
-        <h1 style=\"font-weight:600\">Google Drive connected</h1>\
-        <p style=\"color:#b8adcc\">You can close this tab and return to Neutron.</p>\
-        </div>";
+        <div style=\"text-align:center;max-width:32rem;padding:0 1.5rem\">\
+        <h1 style=\"font-weight:600\">{heading}</h1>\
+        <p style=\"color:#b8adcc;line-height:1.6\">{}</p>\
+        </div>",
+        escape_html(&detail)
+    );
 
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// Escapes text interpolated into the result page.
+///
+/// The detail comes from Google's error body, which is remote text reaching a
+/// page rendered in the user's browser. Small surface, but it is the only
+/// untrusted string on it.
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Kept for the success case, in terms of [`result_page`].
+pub fn success_page() -> String {
+    result_page(Ok(()))
 }
 
 #[cfg(test)]
@@ -398,6 +439,26 @@ mod tests {
         // A trailing, incomplete escape is data rather than a panic.
         assert_eq!(percent_decode("a%"), "a%");
         assert_eq!(percent_decode("a%2"), "a%2");
+    }
+
+    #[test]
+    fn a_failed_flow_does_not_claim_success() {
+        // The bug this guards: the browser said "connected" while the app knew
+        // the exchange had failed, leaving a dead sidebar row as the only
+        // symptom.
+        let page = result_page(Err(&AuthError::StateMismatch));
+        assert!(page.contains("Could not connect"), "{page}");
+        assert!(!page.contains("Google Drive connected"));
+        assert!(page.contains("rejected"), "the reason should be shown");
+    }
+
+    #[test]
+    fn the_result_page_escapes_the_reason() {
+        // The detail originates in Google's error body — remote text rendered
+        // in the user's browser.
+        let page = result_page(Err(&AuthError::Provider("<script>x</script>".to_owned())));
+        assert!(!page.contains("<script>"), "unescaped markup reached the page");
+        assert!(page.contains("&lt;script&gt;"));
     }
 
     #[test]

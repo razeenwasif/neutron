@@ -1239,7 +1239,10 @@ impl NeutronApp {
             let state = match drive.sign_in() {
                 Ok(()) => neutron_cloud::google::DriveState::SignedIn,
                 Err(e) => {
-                    tracing::warn!("Google Drive sign-in failed: {e}");
+                    // At error level: this is the only record of why a sign-in
+                    // the user actively started did not work, and it must show
+                    // under the default log filter.
+                    tracing::error!("Google Drive sign-in failed: {e}");
                     neutron_cloud::google::DriveState::Error(e.to_string())
                 }
             };
@@ -1739,13 +1742,21 @@ impl NeutronApp {
                         neutron_ui::icons::Glyph::Cloud,
                         "Set NEUTRON_GOOGLE_CLIENT_ID to enable Drive",
                     ),
-                    DriveState::Error(why) => sidebar::placeholder_row(
-                        ui,
-                        p,
-                        "Google Drive",
-                        neutron_ui::icons::Glyph::Cloud,
-                        why,
-                    ),
+                    // Retryable, not a dead row. A failed sign-in is usually
+                    // something the user can act on — a declined consent, a
+                    // dropped connection — and making them restart the
+                    // application to try again is a poor answer to it.
+                    DriveState::Error(why) => {
+                        if sidebar::action_row_with_hint(
+                            ui,
+                            p,
+                            "Retry Google Drive",
+                            neutron_ui::icons::Glyph::Cloud,
+                            why,
+                        ) {
+                            actions.push(Action::ConnectDrive);
+                        }
+                    }
                 }
 
                 // Only shown when WSL is actually installed. An empty "Linux"

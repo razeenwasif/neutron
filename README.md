@@ -208,21 +208,32 @@ Drive has no local presence unless Drive for Desktop is installed, so Neutron
 talks to the API directly. `Connect Google Drive` in the sidebar opens a browser
 once; after that the session is restored silently.
 
-**Set up a client id.** Neutron does not ship one — an installed-app client id
-is public rather than secret, but shipping one would tie every build to a single
-Google Cloud project's quota and audit trail. Create an OAuth client of type
-*Desktop app* in a Google Cloud project with the Drive API enabled, then:
+**Set up client credentials.** Create an OAuth client of type *Desktop app* in a
+Google Cloud project with the Drive API enabled, then supply both values it
+gives you:
 
 ```bash
-WSLENV=NEUTRON_GOOGLE_CLIENT_ID NEUTRON_GOOGLE_CLIENT_ID=<id>.apps.googleusercontent.com
+export WSLENV=NEUTRON_GOOGLE_CLIENT_ID:NEUTRON_GOOGLE_CLIENT_SECRET
+export NEUTRON_GOOGLE_CLIENT_ID=<id>.apps.googleusercontent.com
+export NEUTRON_GOOGLE_CLIENT_SECRET=<secret>
 ```
 
-Without it the sidebar row stays greyed with that instruction; the rest of
+Both are needed. Google's token endpoint rejects an installed-app exchange
+without the secret *even under PKCE* — `invalid_request: client_secret is
+missing`, and only after the user has already consented.
+
+Neither is compiled in. Neither is a secret in the cryptographic sense — Google
+documents that an installed app's secret "is obviously not treated as a secret",
+since it ships in every copy of the binary — but hard-coding them would tie every
+build to one project's quota and audit trail.
+
+Without them the sidebar row stays greyed with that instruction; the rest of
 Neutron is unaffected.
 
 **Security.** The flow is PKCE with a loopback redirect. A desktop app cannot
-keep a secret — anything compiled in is readable by whoever has the binary — so
-PKCE generates a fresh verifier per attempt and an intercepted authorisation
+keep a secret — anything compiled in is readable by whoever has the binary, which
+is exactly why Google's own client secret for installed apps protects nothing —
+so PKCE generates a fresh verifier per attempt and an intercepted authorisation
 code is useless without it. The redirect binds `127.0.0.1:0` rather than a
 custom URI scheme, which any other program on the machine could register and
 intercept. The `state` parameter is checked before the code is even read.

@@ -86,7 +86,9 @@ impl GoogleDrive {
 
     /// What the sidebar should show, without performing any network I/O.
     pub fn state(&self) -> DriveState {
-        if flow::client_id().is_err() {
+        // Both, because the secret is required at redemption and finding that
+        // out only after consent is a poor trade for one extra check here.
+        if flow::client_id().is_err() || flow::client_secret().is_err() {
             return DriveState::NotConfigured;
         }
         if credentials::load().is_none() {
@@ -216,7 +218,10 @@ mod tests {
         // Two different problems with two different remedies: one needs a
         // client id, the other needs a sign-in. Reporting "signed out" when
         // there is no client id sends the user to a button that cannot work.
-        unsafe { std::env::remove_var("NEUTRON_GOOGLE_CLIENT_ID") };
+        unsafe {
+            std::env::remove_var("NEUTRON_GOOGLE_CLIENT_ID");
+            std::env::remove_var("NEUTRON_GOOGLE_CLIENT_SECRET");
+        }
         assert_eq!(GoogleDrive::new().state(), DriveState::NotConfigured);
     }
 

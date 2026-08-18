@@ -379,6 +379,17 @@ mod tests {
 /// Visually distinct from a destination: the accent glyph says this is a
 /// control, not a place you can already go.
 pub fn action_row(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph) -> bool {
+    action_row_with_hint(ui, p, label, glyph, "")
+}
+
+/// As [`action_row`], with hover text explaining why it is being offered.
+pub fn action_row_with_hint(
+    ui: &mut Ui,
+    p: &Palette,
+    label: &str,
+    glyph: Glyph,
+    hint: &str,
+) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), NAV_HEIGHT), Sense::click());
 
@@ -401,5 +412,9 @@ pub fn action_row(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph) -> bool {
         if response.hovered() { p.text } else { p.text_muted },
     );
 
-    response.clicked()
+    let clicked = response.clicked();
+    if !hint.is_empty() {
+        response.on_hover_text(hint);
+    }
+    clicked
 }

@@ -19,21 +19,45 @@ use crate::oauth::{self, AuthError, Pkce};
 /// eventually releases the worker rather than pinning it for the session.
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Where the client id comes from.
+/// Where the client credentials come from.
 ///
-/// # Why this is not compiled in
+/// # Why these are not compiled in
 ///
-/// An OAuth client id for an installed app is not a secret in the cryptographic
-/// sense — Google publishes it to anyone who runs the binary, and PKCE is what
-/// actually secures the exchange. It is still not committed, for two duller
-/// reasons: it ties a public repository to one person's Google Cloud project
-/// and its quota, and anyone building Neutron themselves should be using their
-/// own rather than inheriting someone else's rate limit and audit trail.
+/// Neither value is a secret in the cryptographic sense. Google's own
+/// documentation is explicit that for installed applications the client secret
+/// "is obviously not treated as a secret" — it ships inside every copy of the
+/// binary and anyone can read it out. PKCE is what actually secures the
+/// exchange; the secret is a Google protocol requirement, not a protection.
+///
+/// They are still not committed, for two duller reasons: they tie a public
+/// repository to one person's Google Cloud project and its quota, and anyone
+/// building Neutron themselves should use their own rather than inherit someone
+/// else's rate limit and audit trail.
 pub fn client_id() -> Result<String, AuthError> {
-    std::env::var("NEUTRON_GOOGLE_CLIENT_ID")
+    env_value("NEUTRON_GOOGLE_CLIENT_ID").ok_or(AuthError::NoClientId)
+}
+
+/// The client secret Google issues alongside a Desktop-app client.
+///
+/// Required at the token endpoint. Omitting it — which the first version of
+/// this did, on the assumption that PKCE made it unnecessary — gets the whole
+/// exchange rejected with `invalid_request: client_secret is missing`, *after*
+/// the user has already consented in the browser.
+pub fn client_secret() -> Result<String, AuthError> {
+    env_value("NEUTRON_GOOGLE_CLIENT_SECRET").ok_or(AuthError::NoClientSecret)
+}
+
+/// Reads an environment variable, trimmed, treating blank as absent.
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or(AuthError::NoClientId)
+        // Trimmed, not merely checked for being non-blank. These are pasted by
+        // hand, and a trailing newline survives the environment intact — it
+        // then percent-encodes to `%0A` inside the authorization URL and Google
+        // answers `Error 400: invalid_request` with nothing pointing at
+        // whitespace.
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 /// Tokens as Google returns them.
@@ -54,6 +78,10 @@ pub struct Tokens {
 /// **Worker thread only** — binds a socket and waits on a human.
 pub fn authorize() -> Result<Tokens, AuthError> {
     let client_id = client_id()?;
+    // Checked up front, not at redemption. Discovering it is missing after the
+    // user has worked through a consent screen wastes the one step that costs
+    // them attention.
+    client_secret()?;
     let pkce = Pkce::generate()?;
     let state = oauth::random_state()?;
 
@@ -69,6 +97,10 @@ pub fn authorize() -> Result<Tokens, AuthError> {
     let redirect = format!("http://127.0.0.1:{port}");
 
     let url = oauth::authorize_url(&client_id, &redirect, &state, &pkce);
+    // Logged so a rejected authorisation can be diagnosed from the URL that
+    // was actually sent. Safe: it carries the *challenge*, never the verifier,
+    // and the client id is public by design.
+    tracing::debug!(%url, "opening the consent screen");
     open_browser(&url)?;
 
     let code = wait_for_redirect(&listener, &state)?;
@@ -112,9 +144,12 @@ fn wait_for_redirect(listener: &TcpListener, expected_state: &str) -> Result<Str
 
         let result = oauth::parse_redirect(&line, expected_state);
 
-        // The page is written before returning either way, so the user sees an
-        // outcome in the tab they are looking at rather than a dead socket.
-        let _ = stream.write_all(oauth::success_page().as_bytes());
+        // The page reports what actually happened. This is the only chance to
+        // tell the user anything in the tab they are looking at, and claiming
+        // success here while returning an error is how a failed sign-in came to
+        // look like a working one.
+        let page = oauth::result_page(result.as_ref().map(|_| ()));
+        let _ = stream.write_all(page.as_bytes());
         let _ = stream.flush();
 
         return result.map(|r| r.code);
@@ -131,8 +166,10 @@ pub fn exchange_code(
     code: &str,
     pkce: &Pkce,
 ) -> Result<Tokens, AuthError> {
+    let secret = client_secret()?;
     post_token(&[
         ("client_id", client_id),
+        ("client_secret", &secret),
         ("code", code),
         ("code_verifier", &pkce.verifier),
         ("grant_type", "authorization_code"),
@@ -146,8 +183,10 @@ pub fn exchange_code(
 /// path involves no browser and no consent screen, so a returning user never
 /// sees one.
 pub fn refresh(client_id: &str, refresh_token: &str) -> Result<Tokens, AuthError> {
+    let secret = client_secret()?;
     post_token(&[
         ("client_id", client_id),
+        ("client_secret", &secret),
         ("refresh_token", refresh_token),
         ("grant_type", "refresh_token"),
     ])
@@ -201,17 +240,56 @@ pub fn describe_token_error(body: &str, status: u16) -> String {
     }
 }
 
+/// Opens the user's default browser at `url`.
+///
+/// # Never through `cmd /C start`
+///
+/// That was the first implementation and it is silently, catastrophically
+/// wrong: `cmd.exe` treats `&` as a command separator, and an OAuth
+/// authorization URL is *made* of `&`. The browser received everything up to
+/// the first one — `...?client_id=X` alone, with no redirect_uri, response_type
+/// or scope — and cmd tried to execute `redirect_uri=...` as a program. Google
+/// answered `Error 400: invalid_request`, which points at the request rather
+/// than at how it was opened, and the URL in the log looked perfect because it
+/// *was* perfect right up until a shell chewed it.
+///
+/// Quoting the argument would fix the splitting, but `ShellExecuteW` is what
+/// `start` calls anyway — this skips the shell, and with it a spawned console
+/// window and a complaint about the UNC working directory.
 #[cfg(windows)]
 fn open_browser(url: &str) -> Result<(), AuthError> {
-    // Through the shell, so it opens whatever the user has set as default
-    // rather than assuming a browser is on PATH.
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| AuthError::Http(format!("could not open a browser: {e}")))
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{PCWSTR, w};
+
+    let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the verb is a
+    // static literal and no owner window is needed for a browser launch.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    // Returns a fake HINSTANCE; anything <= 32 is an error code rather than a
+    // handle. The one API in Win32 that reports failure this way.
+    if result.0 as usize <= 32 {
+        return Err(AuthError::Http(format!(
+            "could not open a browser (ShellExecute returned {})",
+            result.0 as usize
+        )));
+    }
+    Ok(())
 }
 
+/// Safe as written — the URL is one argv element and no shell is involved, so
+/// nothing interprets the `&` separators.
 #[cfg(not(windows))]
 fn open_browser(url: &str) -> Result<(), AuthError> {
     std::process::Command::new("xdg-open")
@@ -235,9 +313,38 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_client_secret_is_named_too() {
+        // Google requires it for installed apps despite PKCE. Assuming
+        // otherwise cost a full round of consent before the token endpoint
+        // said so.
+        unsafe { std::env::remove_var("NEUTRON_GOOGLE_CLIENT_SECRET") };
+        assert_eq!(client_secret(), Err(AuthError::NoClientSecret));
+        assert!(
+            AuthError::NoClientSecret
+                .to_string()
+                .contains("NEUTRON_GOOGLE_CLIENT_SECRET")
+        );
+    }
+
+    #[test]
     fn a_blank_client_id_counts_as_missing() {
         unsafe { std::env::set_var("NEUTRON_GOOGLE_CLIENT_ID", "   ") };
         assert_eq!(client_id(), Err(AuthError::NoClientId));
+        unsafe { std::env::remove_var("NEUTRON_GOOGLE_CLIENT_ID") };
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_stripped_from_the_client_id() {
+        // A pasted id very often carries a trailing newline. Left on, it
+        // encodes to `%0A` in the authorization URL and Google rejects the
+        // whole request with an error that says nothing about whitespace.
+        unsafe {
+            std::env::set_var("NEUTRON_GOOGLE_CLIENT_ID", "  123-abc.apps.googleusercontent.com\n")
+        };
+        assert_eq!(
+            client_id().as_deref(),
+            Ok("123-abc.apps.googleusercontent.com")
+        );
         unsafe { std::env::remove_var("NEUTRON_GOOGLE_CLIENT_ID") };
     }
 
@@ -276,6 +383,17 @@ mod tests {
                 .expect("parses");
         assert!(t.refresh_token.is_none());
         assert_eq!(t.access_token, "a");
+    }
+
+    #[test]
+    fn the_authorization_url_contains_the_separators_that_broke_it() {
+        // Guards the shape of the problem rather than the fix: the URL is built
+        // from `&`-joined parameters, so any future change to how the browser
+        // is launched has to survive them. Routing this through `cmd /C start`
+        // delivered only the first parameter.
+        let pkce = crate::oauth::Pkce::from_verifier("v".repeat(43));
+        let url = crate::oauth::authorize_url("id", "http://127.0.0.1:1", "st", &pkce);
+        assert!(url.matches('&').count() >= 6, "{url}");
     }
 
     #[test]
