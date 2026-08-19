@@ -50,41 +50,6 @@ pub struct RawRecord {
     pub is_dir: bool,
 }
 
-/// Which byte of `needle` to hunt for: the one expected to occur least often.
-///
-/// The table below is rough on purpose. It only has to order bytes correctly
-/// enough to prefer `x` over `s`; being wrong about whether `k` beats `v` costs
-/// nothing measurable, and a table fitted to one machine's filenames would be
-/// worse, not better, on someone else's disk.
-///
-/// Ties go to the later byte, which also skips further on a miss.
-fn rarest_byte(needle: &[u8]) -> usize {
-    // Roughly how often each ASCII byte turns up in file names: letters by
-    // English frequency, digits and the common separators marked as very
-    // common, everything else left rare.
-    const COMMON: &[u8] = b"etaoinsrlcdumhpgbfywkv0123456789.-_ ";
-
-    let rank = |b: u8| -> usize {
-        let folded = b.to_ascii_lowercase();
-        match COMMON.iter().position(|&c| c == folded) {
-            // Earlier in the list means more common, so a higher score.
-            Some(i) => COMMON.len() - i,
-            None => 0,
-        }
-    };
-
-    let mut best = 0;
-    let mut best_rank = usize::MAX;
-    for (i, &b) in needle.iter().enumerate() {
-        let r = rank(b);
-        if r <= best_rank {
-            best_rank = r;
-            best = i;
-        }
-    }
-    best
-}
-
 /// A finished, queryable index of one volume.
 pub struct VolumeIndex {
     volume: VolumeId,
@@ -102,6 +67,14 @@ pub struct VolumeIndex {
     frn: Vec<Frn>,
     /// Parent's record index, or [`NO_PARENT`].
     parent: Vec<u32>,
+
+    /// How often each byte value occurs across every name, with ASCII case
+    /// folded together.
+    ///
+    /// One kilobyte per volume, and it is what lets a query be hunted by its
+    /// rarest character *on this disk* rather than on a guess about filenames
+    /// in general. See [`Self::rarest_byte`].
+    byte_counts: Box<[u32; 256]>,
 
     /// Journal position this index is current as of. Deltas replay from here.
     pub next_usn: i64,
@@ -139,6 +112,7 @@ impl VolumeIndex {
             name_meta: Vec::with_capacity(count),
             frn: Vec::with_capacity(count),
             parent: Vec::with_capacity(count),
+            byte_counts: Box::new([0; 256]),
             next_usn,
         };
 
@@ -172,6 +146,11 @@ impl VolumeIndex {
         self.name_start.push(self.names.len() as u32);
         self.name_meta
             .push(truncated.len() as u16 | if is_dir { DIR_BIT } else { 0 });
+        for &b in truncated.as_bytes() {
+            // Folded, because a search for `x` looks for both cases and their
+            // frequencies have to be counted together.
+            self.byte_counts[b.to_ascii_lowercase() as usize] += 1;
+        }
         self.names.push_str(truncated);
     }
 
@@ -204,6 +183,30 @@ impl VolumeIndex {
 
     pub fn is_dir(&self, i: usize) -> bool {
         self.name_meta[i] & DIR_BIT != 0
+    }
+
+    /// Which byte of `needle` to hunt for: the one that occurs least often in
+    /// this volume's names.
+    ///
+    /// Measured rather than guessed. The first version used a fixed table of
+    /// English letter frequencies, which is right about `x` beating `s` and
+    /// wrong about plenty else — on the real index it picked the `f` of
+    /// `config` and made that the slowest query of the set. A disk full of
+    /// `.dll`s and `Microsoft.*` has its own distribution, and it is already
+    /// sitting there to be counted.
+    ///
+    /// Ties go to the later byte, which also skips further on a miss.
+    fn rarest_byte(&self, needle: &[u8]) -> usize {
+        let mut best = 0;
+        let mut best_count = u32::MAX;
+        for (i, &b) in needle.iter().enumerate() {
+            let count = self.byte_counts[b.to_ascii_lowercase() as usize];
+            if count <= best_count {
+                best_count = count;
+                best = i;
+            }
+        }
+        best
     }
 
     /// Calls `on_match` for every record in `records` whose name contains
@@ -247,7 +250,7 @@ impl VolumeIndex {
         // costs a comparison and a cursor advance. Its `x` occurs a hundredth
         // as often and rejects just as conclusively. Measured on 3.3M names,
         // this is the difference between 3.5 ms and half a millisecond.
-        let pivot = rarest_byte(needle);
+        let pivot = self.rarest_byte(needle);
         let wanted = needle[pivot];
         // Only the ASCII case needs both variants; a non-ASCII byte is matched
         // exactly.
@@ -539,32 +542,59 @@ mod scan_tests {
     }
 
     #[test]
-    fn the_pivot_is_the_rarest_byte_not_the_first() {
-        // "setup.exe" is hunted by its x, not its very common s. Which of two
-        // similarly rare bytes wins is not worth asserting — the table is only
-        // meant to be roughly right — but preferring a rare one over the first
-        // one is the entire point.
-        assert_eq!(rarest_byte(b"setup.exe"), 7);
-        assert_ne!(rarest_byte(b"config"), 0);
-        assert_ne!(rarest_byte(b"neutron"), 0);
+    fn the_pivot_is_the_rarest_byte_in_this_volume() {
+        // A corpus containing every byte of the needle, `s` everywhere and `x`
+        // almost nowhere. The pivot should be the `x`, whatever a
+        // general-purpose letter-frequency table would have said.
+        let mut names: Vec<&str> = vec!["setups.setup"; 200];
+        names.push("x");
+        let idx = index(&names);
+
+        assert_eq!(idx.rarest_byte(b"setup.exe"), 7);
+        assert_eq!(&b"setup.exe"[7..8], b"x");
+    }
+
+    #[test]
+    fn the_pivot_follows_the_corpus_not_a_fixed_table() {
+        // The same needle, two disks. Where `f` is rare the `f` is chosen;
+        // where `g` is rare the `g` is. A fixed table cannot do this, and on
+        // the real index it picked wrong and made `config` the slowest query
+        // of the set.
+        let mut heavy_in_g: Vec<&str> = vec!["cgggg"; 200];
+        heavy_in_g.push("cf");
+        assert_eq!(index(&heavy_in_g).rarest_byte(b"cfg"), 1);
+
+        let mut heavy_in_f: Vec<&str> = vec!["cffff"; 200];
+        heavy_in_f.push("cg");
+        assert_eq!(index(&heavy_in_f).rarest_byte(b"cfg"), 2);
     }
 
     #[test]
     fn the_pivot_of_a_single_byte_needle_is_that_byte() {
-        assert_eq!(rarest_byte(b"e"), 0);
+        assert_eq!(index(&["anything"]).rarest_byte(b"e"), 0);
     }
 
     #[test]
-    fn every_byte_equally_rare_picks_the_last() {
+    fn bytes_absent_from_the_corpus_tie_and_the_later_one_wins() {
         // Later is better: a miss then skips further along the arena.
-        assert_eq!(rarest_byte(b"qzj"), 2);
+        assert_eq!(index(&["alpha"]).rarest_byte(b"qzj"), 2);
     }
 
     #[test]
     fn the_pivot_never_points_outside_the_needle() {
+        let idx = index(&["alpha", "beta9"]);
         for needle in ["a", "ab", "\u{e9}\u{e9}", "....", "9"] {
-            assert!(rarest_byte(needle.as_bytes()) < needle.len());
+            assert!(idx.rarest_byte(needle.as_bytes()) < needle.len());
         }
+    }
+
+    #[test]
+    fn counting_folds_case() {
+        // A search for `x` looks for both cases, so their frequencies have to
+        // be counted together or the pivot is chosen against half the picture.
+        let idx = index(&["XXXX", "abcd"]);
+        assert_eq!(idx.byte_counts[b'x' as usize], 4);
+        assert_eq!(idx.byte_counts[b'X' as usize], 0);
     }
 }
 

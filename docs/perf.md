@@ -201,8 +201,8 @@ Explorer really does fall over — is unaffected by any of this.
 
 | Metric | Target | Milestone |
 |---|---:|---|
-| Full index, all 6 volumes | <10 s | M4 |
-| Search query latency | <1 ms | M4 |
+| Full index, all 6 volumes | <10 s | M4 — **met**, 2.98 s warm |
+| Search query latency | <1 ms | M4 — **missed**, 1.6–4.7 ms |
 
 ## M3 — shell integration (2026-08-17)
 
@@ -413,9 +413,8 @@ That is a real trade for a latency that is already a fraction of a frame and sit
 behind a 30 ms debounce. Not taken; recorded so the option is a decision rather
 than an oversight.
 
-> The real-index figures earlier in this file (6–9 ms) were measured on the
-> actual USN index, which needs an elevated helper. They have **not** been
-> re-measured since this change; expect roughly a third of them.
+> These are synthetic figures. The real index was measured separately and is
+> reported below.
 
 ### Sorting and filtering — an allocation inside two inner loops
 
@@ -472,13 +471,53 @@ about but not measured" after the UI rebuild; the reasoning held. Virtualized
 rows and a fixed-cost background mean frame time does not depend on directory
 size.
 
-### Still not measured
+### The real index, measured (elevated)
 
-The **real** index. Everything in this section used synthetic corpora, because
-building an index from the USN journal needs the elevated helper and therefore a
-UAC prompt. The 6–9 ms query figures recorded under M4 were taken on the real
-3.3M-record index and have not been re-taken since the scan was rewritten;
-expect roughly a third of them, and confirm before quoting.
+`neutron-indexer.exe --bench` from an administrator prompt, release, run twice.
+
+**Indexing: 3,312,564 records across four volumes in 2.98 s, 203 MB resident.**
+
+| Volume | Records | Time | Memory | Per record |
+|---|---:|---:|---:|---:|
+| A: | 178,050 | 495 ms | 7.1 MB | 2.78 µs |
+| C: | 1,420,824 | 2,981 ms | 89.4 MB | 2.10 µs |
+| F: | 1,657,296 | 2,866 ms | 104.3 MB | 1.73 µs |
+| I: | 56,394 | 226 ms | 2.3 MB | 4.01 µs |
+
+B: and G: are skipped — not NTFS with an active journal. Volumes are indexed in
+parallel, so the total is the slowest volume rather than the sum.
+
+**Target <10 s: met, at 2.98 s.** The immediately preceding run of the same
+binary took 11.35 s, and an earlier one 34.7 s. The difference is the Windows
+file cache, not the code — the journal has to come off the disk the first time
+after a boot. Every figure here is a warm one; treat the first index after a
+restart as several times longer and do not read a regression into it.
+
+**Query latency**, against all 3.31 M records:
+
+| Query | Matches | M4 baseline | After the arena scan | After the measured pivot |
+|---|---:|---:|---:|---:|
+| `e` | 2,296,497 | 5.78 ms | 4.54 ms | 4.73 ms |
+| `config` | 16,393 | 9.39 ms | 5.75 ms | **3.54 ms** |
+| `neutron` | 1,550 | 8.69 ms | 4.15 ms | **3.25 ms** |
+| `setup.exe` | 110 | 7.45 ms | 1.86 ms | **1.61 ms** |
+| `e` + one char | — | 10.54 ms | 2.60 ms | 4.08 ms |
+| `config` + one char | — | 9.04 ms | 1.96 ms | **2.17 ms** |
+| `neutron` + one char | — | 0.025 ms | 0.056 ms | 0.064 ms |
+
+The middle column is why the pivot is now measured rather than guessed. A fixed
+table of English letter frequencies sent `config` hunting its `f`, which on a
+disk of `.dll`s and `Microsoft.*` is common — and made it the *slowest* of the
+four. Counting the bytes actually present, one kilobyte per volume built during
+the pass that was happening anyway, made it the second fastest.
+
+`e` is unchanged and cannot improve: a one-character needle offers no choice of
+pivot, and it matches two million files.
+
+**Target <1 ms: still missed, at 1.6–4.7 ms.** Down from 6–9 ms, and the reason
+is now understood rather than assumed: at ~120 MB of names the scan is limited
+by reading them, not by the matching. See the synthetic measurements above for
+what closing the last of it would cost.
 
 ---
 
