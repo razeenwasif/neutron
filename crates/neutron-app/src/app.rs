@@ -2194,6 +2194,24 @@ impl NeutronApp {
         // Handled here, not in the main key table: that table is skipped while
         // a text field has focus, which is the whole time the overlay is open.
         child.input(|i| {
+            // The shortcuts that opened the overlay, so they still work once it
+            // is open — pressing Ctrl+Shift+F again closes it, and the other
+            // two switch mode. Without these they did nothing at all and the
+            // keystroke's letter was typed into the needle instead, which is
+            // how `neutron` became `neutronneutron-index` while testing.
+            let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            if ctrl {
+                if i.modifiers.shift && i.key_pressed(egui::Key::F) {
+                    actions.push(Action::ToggleFinder(crate::finder::Mode::Everything));
+                }
+                if i.modifiers.shift && i.key_pressed(egui::Key::P) {
+                    actions.push(Action::ToggleFinder(crate::finder::Mode::Commands));
+                }
+                if !i.modifiers.shift && i.key_pressed(egui::Key::P) {
+                    actions.push(Action::ToggleFinder(crate::finder::Mode::Files));
+                }
+            }
+
             if i.key_pressed(egui::Key::Escape) {
                 actions.push(Action::CloseFinder);
             }

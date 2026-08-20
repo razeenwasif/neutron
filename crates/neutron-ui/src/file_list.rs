@@ -275,7 +275,26 @@ fn show_list(
     let viewport = ui.available_rect_before_wrap();
 
 
+    // Computed before the scroll area and applied inside it, which is the only
+    // place `scroll_with_delta` reaches the right container.
+    let auto_scroll = band_scroll_delta(ui, viewport, ui.input(|i| i.stable_dt));
+
     let output = scroll.show_rows(ui, ROW_HEIGHT, row_count, |ui, visible| {
+        if auto_scroll != 0.0 {
+            // Without an animation, because this *is* the animation: a delta is
+            // issued every frame for as long as the pointer is held past the
+            // edge. Letting egui smooth each one on top would make the speed a
+            // function of its easing curve rather than of how far past the edge
+            // the pointer is.
+            ui.scroll_with_delta_animation(
+                vec2(0.0, auto_scroll),
+                egui::style::ScrollAnimation::none(),
+            );
+            // The pointer is not moving, so nothing else would ask for the next
+            // frame — and without one the list scrolls a single step and stops.
+            ui.ctx().request_repaint();
+        }
+
         // `visible` is the only range that costs anything, regardless of how
         // large the directory is.
         for row in visible {
@@ -413,6 +432,65 @@ fn scrollbar_strip(scroll: egui::style::ScrollStyle, overflowing: bool) -> f32 {
         return 0.0;
     }
     scroll.bar_width + scroll.bar_outer_margin
+}
+
+/// How far the list scrolls per second when a band is dragged past its edge.
+///
+/// A band that stops at the edge of the pane can only ever select a screenful,
+/// which is the wrong answer to "select everything from here down" in a folder
+/// with more rows than fit. Explorer scrolls; so does this.
+const BAND_SCROLL_PER_SECOND: f32 = 900.0;
+
+/// The band-drag margin at the top and bottom of the list inside which
+/// scrolling starts.
+///
+/// Scrolling only when the pointer leaves the pane entirely would mean dragging
+/// off the window to reach the next row, so it starts a little before the edge
+/// and accelerates as the pointer goes further past it.
+const BAND_SCROLL_MARGIN: f32 = 24.0;
+
+/// How far to scroll this frame because a band is being dragged past the edge.
+///
+/// Zero when no band is in progress, when the pointer is comfortably inside the
+/// list, or when the drag is an outbound file drag rather than a band.
+///
+/// Read from the drag state stored last frame, because this has to be applied
+/// *inside* the scroll area and the band is not tracked until after it. One
+/// frame of lag during a continuous gesture is not visible.
+fn band_scroll_delta(ui: &Ui, viewport: Rect, seconds: f32) -> f32 {
+    let dragging_band = ui
+        .ctx()
+        .data(|d| d.get_temp::<Drag>(band_origin_id(ui)))
+        .is_some_and(|drag| !drag.out);
+    if !dragging_band {
+        return 0.0;
+    }
+
+    let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) else {
+        return 0.0;
+    };
+
+    // Positive past the bottom, negative past the top; zero in between.
+    let past = if pointer.y > viewport.bottom() - BAND_SCROLL_MARGIN {
+        pointer.y - (viewport.bottom() - BAND_SCROLL_MARGIN)
+    } else if pointer.y < viewport.top() + BAND_SCROLL_MARGIN {
+        pointer.y - (viewport.top() + BAND_SCROLL_MARGIN)
+    } else {
+        return 0.0;
+    };
+
+    // Proportional to how far past the edge the pointer is, capped so a pointer
+    // flung to the far side of the screen does not jump the whole list. Framed
+    // per second rather than per frame so the speed does not depend on how busy
+    // the machine is.
+    //
+    // The floor matters more than the ceiling. A pointer resting just inside
+    // the margin is the common case — that is where it lands when you drag to
+    // the bottom of the window — and an intensity that tends to zero there
+    // makes the list creep. Measured at a tenth of this floor it managed two
+    // rows in a second and a half.
+    let intensity = (past.abs() / (BAND_SCROLL_MARGIN * 2.0)).clamp(0.35, 1.0);
+    -past.signum() * intensity * BAND_SCROLL_PER_SECOND * seconds
 }
 
 /// `viewport` with the scroll bar's strip taken off its right edge.
@@ -1058,7 +1136,17 @@ fn show_grid(
     let row_pitch = TILE_H + TILE_GAP;
 
 
+    let auto_scroll = band_scroll_delta(ui, viewport, ui.input(|i| i.stable_dt));
+
     let output = scroll.show_rows(ui, row_pitch, rows, |ui, visible| {
+        if auto_scroll != 0.0 {
+            ui.scroll_with_delta_animation(
+                vec2(0.0, auto_scroll),
+                egui::style::ScrollAnimation::none(),
+            );
+            ui.ctx().request_repaint();
+        }
+
         let full = ui.available_width();
         for row in visible {
             let (band, response) =
