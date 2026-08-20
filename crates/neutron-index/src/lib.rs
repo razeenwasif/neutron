@@ -36,6 +36,7 @@ pub type Frn = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VolumeId(pub char);
 
+pub mod cache;
 pub mod protocol;
 pub mod query;
 pub mod volume;

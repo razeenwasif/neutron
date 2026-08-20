@@ -519,6 +519,70 @@ is now understood rather than assumed: at ~120 MB of names the scan is limited
 by reading them, not by the matching. See the synthetic measurements above for
 what closing the last of it would cost.
 
+## The UAC prompt (2026-08-20)
+
+Not a speed problem, but the last item on the performance list: search cost a
+UAC prompt after every reboot, because the helper had to read the volumes before
+it could answer anything, and reading a volume needs administrator rights.
+
+**Now it costs one prompt, once.** The elevated helper writes its index to
+`%LOCALAPPDATA%\Neutron` when it finishes building. Every later session starts
+an *unelevated* helper, which loads that cache and serves it.
+
+| | Time | Prompt |
+|---|---:|---|
+| Build from the journals (elevated) | 2.98 s | yes |
+| Load from cache (unelevated) | **67 ms** | **no** |
+
+67 ms for 3,313,625 records across four volumes. The cache is 164 MB on disk —
+5.4 MB for A:, 66 MB for C:, 90 MB for F:, 2.3 MB for I: — which is the name
+arena and the four index arrays written out as-is.
+
+### The index is stale, and says so
+
+A cached index is missing everything created since it was written. A search tool
+that quietly omits results is worse than one that admits it might, so the finder
+says which it is and how old it is — "index is from earlier today", "6 days old"
+— next to the result count, and names the command that fixes it. "Rebuild the
+search index" is the one action that spends a prompt, and it is spent on
+something the user asked for.
+
+### Why not a scheduled task
+
+The usual way to remove the prompt entirely is to register a scheduled task at
+highest privileges once, and start it unelevated thereafter. It was rejected,
+and the reason is worth writing down so it is not "fixed" later.
+
+A task that runs a binary elevated, startable by any unelevated process, is
+exactly as trustworthy as the binary's location. Neutron currently runs from
+`%LOCALAPPDATA%`-adjacent paths that the user — and therefore anything running
+as the user — can write to. Registering such a task would convert "an attacker
+who can write to your profile" into "an attacker with administrator rights on
+your machine", which is a privilege boundary this application has no business
+dissolving to save a click.
+
+If Neutron ever installs to a location only administrators can write to, the
+scheduled task becomes reasonable and worth revisiting. Until then the cache
+gets the same result for the common case without the hole.
+
+### Two things this turned up
+
+The helper is elevated, and an unelevated process cannot `taskkill` it. Stopping
+it has to go through its own protocol, which the pipe's DACL already permits.
+That works — but "Rebuild the search index" stops the running helper and starts
+an elevated one, and the old process does not release the pipe name the instant
+it agrees to exit. The replacement was arriving during that window and dying on
+`All pipe instances are busy`. It now retries for fifteen seconds, because the
+only honest error message would have been "try again in a moment".
+
+And the cache is read from a directory the user can write to, so
+`VolumeIndex::from_parts` treats every file as hostile: the arrays index into
+each other, and an offset pointing past the end would panic on the first search.
+Lengths, character boundaries, parent references and both sort orders are all
+re-established on load, and anything that fails is discarded rather than
+repaired. There are tests for truncation at seven different lengths, a wrong
+magic, a wrong volume, trailing bytes and a length field of `u64::MAX`.
+
 ---
 
 ## Reproducing

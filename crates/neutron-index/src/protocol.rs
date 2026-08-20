@@ -87,6 +87,21 @@ pub struct IndexStatus {
     /// Volumes that could not be indexed, with the reason — a FAT32 stick, a
     /// volume with no journal. Shown once rather than retried.
     pub skipped: Vec<String>,
+    /// Whether this index was read from the volumes just now, or loaded from
+    /// the last run's cache.
+    ///
+    /// A cached index is missing everything created since it was written, and
+    /// a search tool that quietly omits results is worse than one that says it
+    /// might. The UI shows the difference and offers to refresh.
+    #[serde(default)]
+    pub fresh: bool,
+    /// How many seconds ago a cached index was written, when it was cached.
+    ///
+    /// "From the last index" is not actionable; "from an index six days old"
+    /// is. It is the difference between a note the user reads past and one
+    /// they do something about.
+    #[serde(default)]
+    pub cached_age_secs: Option<u64>,
 }
 
 impl IndexStatus {

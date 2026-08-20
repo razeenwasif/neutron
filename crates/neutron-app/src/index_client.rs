@@ -39,11 +39,36 @@ use neutron_index::protocol::{
 /// not the rows.
 const RESULT_LIMIT: usize = 500;
 
+/// How long to give an unelevated helper to load its cache before deciding it
+/// has nothing and asking for elevation.
+///
+/// Loading three million records off an SSD is well under a second; this is
+/// generous enough to cover a cold file cache without making the fall back to
+/// a prompt feel like a hang.
+const CACHE_LOAD_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// How long to keep polling for the pipe after launching the helper.
 ///
 /// Generous because it covers the UAC prompt *and* a full index of every
 /// volume, and the helper only starts serving once indexing is done.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How old a cached index is, in words.
+///
+/// Rounded hard and deliberately vague past a day. The user is deciding whether
+/// to spend a UAC prompt, and "6 days old" answers that as well as a timestamp
+/// would while taking a quarter of the space.
+pub fn describe_age(seconds: Option<u64>) -> String {
+    let Some(secs) = seconds else {
+        return "from an earlier session".to_owned();
+    };
+    match secs {
+        s if s < 90 * 60 => "from earlier today".to_owned(),
+        s if s < 36 * 3600 => format!("{} hours old", s / 3600),
+        s if s < 14 * 86_400 => format!("{} days old", s / 86_400),
+        s => format!("{} weeks old", s / (7 * 86_400)),
+    }
+}
 
 /// What the search subsystem is currently doing, for the UI to render.
 #[derive(Debug, Clone, PartialEq)]
@@ -102,7 +127,7 @@ enum QueryError {
 }
 
 enum Command {
-    Connect { launch: bool },
+    Connect { launch: Launch },
     /// Substring across everything.
     Search(Query),
     /// Fuzzy beneath one folder.
@@ -110,6 +135,20 @@ enum Command {
     /// Ask the helper to exit, then forget the connection.
     StopServer,
     Shutdown,
+}
+
+/// How far a connect attempt may go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    /// Connect if a helper is already there; otherwise give up quietly. Used at
+    /// startup, where a prompt nobody asked for would be an ambush.
+    Never,
+    /// Start a helper if needed, unelevated first so a cached index costs no
+    /// prompt at all.
+    IfNeeded,
+    /// Go straight to the elevated helper. This is the user explicitly asking
+    /// for a fresh index, which is the one case where the prompt is the point.
+    Elevated,
 }
 
 enum Event {
@@ -159,13 +198,24 @@ impl IndexClient {
     /// Called once at startup: if a helper from an earlier session is still
     /// alive, search is available immediately and the user is never asked.
     pub fn try_attach(&self) {
-        let _ = self.commands.send(Command::Connect { launch: false });
+        let _ = self.commands.send(Command::Connect { launch: Launch::Never });
     }
 
-    /// Starts the helper, raising the UAC prompt.
+    /// Starts the helper, preferring a cached index over a UAC prompt.
     pub fn start_helper(&mut self) {
         self.state = IndexState::Starting;
-        let _ = self.commands.send(Command::Connect { launch: true });
+        let _ = self.commands.send(Command::Connect { launch: Launch::IfNeeded });
+    }
+
+    /// Rebuilds the index from the volumes, which needs administrator rights.
+    ///
+    /// Stops whatever is serving first: a helper running on last session's
+    /// cache holds the pipe name, and the fresh one cannot claim it until that
+    /// one is gone.
+    pub fn refresh_index(&mut self) {
+        self.state = IndexState::Starting;
+        let _ = self.commands.send(Command::StopServer);
+        let _ = self.commands.send(Command::Connect { launch: Launch::Elevated });
     }
 
     /// Substring search across every volume.
@@ -271,7 +321,7 @@ fn worker(commands: Receiver<Command>, events: Sender<Event>, ctx: egui::Context
                         // Silent when merely probing at startup: reporting "no
                         // helper" before the user has asked for search would be
                         // an error message about something nobody attempted.
-                        if launch {
+                        if launch != Launch::Never {
                             send(&events, &ctx, Event::State(IndexState::Unavailable(e)));
                         }
                     }
@@ -362,7 +412,7 @@ fn send(events: &Sender<Event>, ctx: &egui::Context, event: Event) {
 }
 
 #[cfg(windows)]
-fn connect(launch: bool) -> Result<Connection, String> {
+fn connect(launch: Launch) -> Result<Connection, String> {
     match Connection::open() {
         Ok(conn) => return Ok(conn),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -380,34 +430,65 @@ fn connect(launch: bool) -> Result<Connection, String> {
         Err(_) => {}
     }
 
-    if !launch {
+    if launch == Launch::Never {
         return Err("no indexer running".to_owned());
     }
 
-    launch_helper()?;
+    // Unelevated first, and this is the whole point of the cache.
+    //
+    // A helper with no rights can still load the index the last elevated run
+    // wrote and answer from it. That takes no prompt and about a second, so the
+    // common case — every launch after the first — asks the user for nothing.
+    // Only when there is no cache to serve does the elevated attempt happen,
+    // and then the prompt is buying something the user can see the need for.
+    if launch == Launch::IfNeeded && launch_helper(Elevation::AsInvoker).is_ok() {
+        if let Some(conn) = await_pipe(CACHE_LOAD_TIMEOUT) {
+            return Ok(conn);
+        }
+        tracing::info!("the unelevated helper had nothing to serve; asking for elevation");
+    }
+
+    launch_helper(Elevation::Prompt)?;
 
     // The helper indexes before it starts serving, so this covers the UAC
     // prompt and the whole first build.
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    await_pipe(CONNECT_TIMEOUT)
+        .ok_or_else(|| "the indexer did not start — the prompt may have been declined".to_owned())
+}
+
+/// Polls for the pipe until `timeout`.
+#[cfg(windows)]
+fn await_pipe(timeout: Duration) -> Option<Connection> {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Ok(conn) = Connection::open() {
-            return Ok(conn);
+            return Some(conn);
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(100));
     }
-    Err("the indexer did not start — the prompt may have been declined".to_owned())
+    None
 }
 
 #[cfg(not(windows))]
-fn connect(_launch: bool) -> Result<Connection, String> {
+fn connect(_launch: Launch) -> Result<Connection, String> {
     Err("search is Windows-only".to_owned())
 }
 
-/// Launches the helper with the `runas` verb, raising the UAC prompt.
+/// Whether to ask for administrator rights when starting the helper.
 #[cfg(windows)]
-fn launch_helper() -> Result<(), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Elevation {
+    /// No prompt. The helper can serve a cached index but cannot build one.
+    AsInvoker,
+    /// Raises the UAC prompt, which is what lets it read the volumes.
+    Prompt,
+}
+
+/// Launches the helper.
+#[cfg(windows)]
+fn launch_helper(elevation: Elevation) -> Result<(), String> {
     let exe = helper_path()?;
-    tracing::info!(path = %exe.display(), "launching the indexer (elevated)");
+    tracing::info!(path = %exe.display(), elevated = elevation == Elevation::Prompt, "launching the indexer");
 
     // Reuses the shell-execute path built at M3, including the deliberate
     // choice to keep the consent dialog visible — suppressing UI on `runas`
@@ -415,7 +496,10 @@ fn launch_helper() -> Result<(), String> {
     neutron_shell::open::shell_execute_with_args(
         &exe,
         &["--serve".to_owned(), DEFAULT_PIPE.to_owned()],
-        neutron_shell::open::Verb::RunAs,
+        match elevation {
+            Elevation::AsInvoker => neutron_shell::open::Verb::Open,
+            Elevation::Prompt => neutron_shell::open::Verb::RunAs,
+        },
         0,
     )
 }
@@ -558,6 +642,40 @@ impl Connection {
     }
     fn find(&mut self, _query: &Query) -> Result<SearchResults, QueryError> {
         Err(QueryError::Transport("search is Windows-only".to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod age_tests {
+    use super::describe_age;
+
+    #[test]
+    fn an_unknown_age_says_so_rather_than_guessing() {
+        assert_eq!(describe_age(None), "from an earlier session");
+    }
+
+    #[test]
+    fn a_fresh_cache_reads_as_today() {
+        assert_eq!(describe_age(Some(60)), "from earlier today");
+        assert_eq!(describe_age(Some(80 * 60)), "from earlier today");
+    }
+
+    #[test]
+    fn hours_are_reported_up_to_a_day_and_a_half() {
+        assert_eq!(describe_age(Some(5 * 3600)), "5 hours old");
+        assert_eq!(describe_age(Some(30 * 3600)), "30 hours old");
+    }
+
+    #[test]
+    fn days_take_over_from_hours() {
+        assert_eq!(describe_age(Some(3 * 86_400)), "3 days old");
+    }
+
+    #[test]
+    fn a_long_neglected_index_is_reported_in_weeks() {
+        // The case the note exists for: search has been quietly missing
+        // everything created in the last month.
+        assert_eq!(describe_age(Some(30 * 86_400)), "4 weeks old");
     }
 }
 

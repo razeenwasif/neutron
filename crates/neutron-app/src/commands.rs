@@ -40,6 +40,7 @@ pub enum CommandId {
 
     FindInFolder,
     SearchEverything,
+    RefreshIndex,
     StopIndexer,
 
     GoHome,
@@ -106,6 +107,14 @@ pub const ALL: &[CommandDef] = &[
         id: CommandId::SearchEverything,
         title: "Search every volume",
         hint: "Ctrl+Shift+F",
+    },
+    // Searching normally reuses the index the last elevated run wrote, which
+    // costs no prompt. This is how a user asks for one that includes what has
+    // changed since.
+    CommandDef {
+        id: CommandId::RefreshIndex,
+        title: "Rebuild the search index",
+        hint: "",
     },
     // The only way to stop the elevated helper from inside the application.
     // Without it the process outlives every window and has to be killed from

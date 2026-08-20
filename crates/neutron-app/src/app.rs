@@ -69,6 +69,9 @@ enum Action {
     RenameCancel,
     /// Make a folder in the focused tab, then rename it.
     NewFolder,
+    /// Rebuild the search index from the volumes, which needs administrator
+    /// rights.
+    RefreshIndex,
     /// Put the selection on the clipboard. `cut` marks it for a move.
     Clip { cut: bool },
     /// Paste whatever is on the clipboard into the focused tab's folder.
@@ -481,6 +484,7 @@ impl NeutronApp {
                 self.close_rename(ctx);
             }
             Action::NewFolder => self.new_folder(),
+            Action::RefreshIndex => self.index.refresh_index(),
 
             Action::Clip { cut } => self.clip_selection(cut),
             Action::Paste => self.paste(),
@@ -1881,7 +1885,7 @@ impl NeutronApp {
                     }
                     IndexState::Idle => self.finder.set_rows(
                         Vec::new(),
-                        "Press Enter to start the indexer (requires administrator)".into(),
+                        "Press Enter to start searching".into(),
                     ),
                 }
             }
@@ -1911,8 +1915,20 @@ impl NeutronApp {
                     })
                     .collect();
 
+                // A cached index is missing everything created since it was
+                // written, and a search tool that quietly omits results is
+                // worse than one that admits it might. Named where the count
+                // is, because that is the number being qualified.
+                let cached = match self.index.state() {
+                    IndexState::Ready(status) if !status.fresh => format!(
+                        "  ·  index is {} — \"Rebuild the search index\" to update it",
+                        crate::index_client::describe_age(status.cached_age_secs),
+                    ),
+                    _ => String::new(),
+                };
+
                 let status = format!(
-                    "{}{} results in {:.2} ms",
+                    "{}{} results in {:.2} ms{cached}",
                     results.total,
                     if results.truncated { "+" } else { "" },
                     results.elapsed_micros as f64 / 1000.0,
@@ -2006,6 +2022,7 @@ impl NeutronApp {
 
             C::FindInFolder => Some(Action::ToggleFinder(crate::finder::Mode::Files)),
             C::SearchEverything => Some(Action::ToggleFinder(crate::finder::Mode::Everything)),
+            C::RefreshIndex => Some(Action::RefreshIndex),
             C::StopIndexer => {
                 self.index.stop_server();
                 None

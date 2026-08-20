@@ -50,6 +50,16 @@ pub struct RawRecord {
     pub is_dir: bool,
 }
 
+/// Borrowed views of an index's arrays, for writing it out.
+pub struct IndexParts<'a> {
+    pub names: &'a str,
+    pub name_start: &'a [u32],
+    pub name_meta: &'a [u16],
+    pub frn: &'a [Frn],
+    pub parent: &'a [u32],
+    pub byte_counts: &'a [u32],
+}
+
 /// A finished, queryable index of one volume.
 pub struct VolumeIndex {
     volume: VolumeId,
@@ -183,6 +193,100 @@ impl VolumeIndex {
 
     pub fn is_dir(&self, i: usize) -> bool {
         self.name_meta[i] & DIR_BIT != 0
+    }
+
+    /// The raw arrays, for [`crate::cache::save`].
+    pub fn parts(&self) -> IndexParts<'_> {
+        IndexParts {
+            names: &self.names,
+            name_start: &self.name_start,
+            name_meta: &self.name_meta,
+            frn: &self.frn,
+            parent: &self.parent,
+            byte_counts: &self.byte_counts[..],
+        }
+    }
+
+    /// Rebuilds an index from arrays read off disk, or `None` if they do not
+    /// describe a coherent one.
+    ///
+    /// # Everything here is checked
+    ///
+    /// These arrays index into each other — `name_start[i]` is an offset into
+    /// `names`, `parent[i]` is a record number — and every one of those
+    /// references is used later without a bounds check, because in the built
+    /// index they cannot be wrong. Coming off disk they can: a file truncated
+    /// by a power cut, or edited by anything with write access to the user's
+    /// own profile.
+    ///
+    /// So the invariants the builder maintains are re-established here, once,
+    /// rather than defended at every use. Anything that fails is rejected
+    /// whole: the cost is rebuilding from the journal, which is what would
+    /// have happened without a cache at all.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        volume: VolumeId,
+        names: String,
+        name_start: Vec<u32>,
+        name_meta: Vec<u16>,
+        frn: Vec<Frn>,
+        parent: Vec<u32>,
+        byte_counts: Vec<u32>,
+        next_usn: i64,
+    ) -> Option<Self> {
+        let count = frn.len();
+        if name_start.len() != count || name_meta.len() != count || parent.len() != count {
+            tracing::warn!(?volume, "cached index arrays disagree on length");
+            return None;
+        }
+
+        let counts: [u32; 256] = byte_counts.try_into().ok()?;
+
+        for i in 0..count {
+            let start = name_start[i] as usize;
+            let len = (name_meta[i] & LEN_MASK) as usize;
+            let end = start.checked_add(len)?;
+
+            // Within the arena, and on character boundaries — `name` slices the
+            // string directly, and a split multi-byte character would panic.
+            if end > names.len() || !names.is_char_boundary(start) || !names.is_char_boundary(end) {
+                tracing::warn!(?volume, "cached index has a name outside its arena");
+                return None;
+            }
+
+            // A parent is a record number or the "no parent" sentinel. Anything
+            // else would send path reconstruction off the end of the array.
+            if parent[i] != NO_PARENT && parent[i] as usize >= count {
+                tracing::warn!(?volume, "cached index has a parent that is not a record");
+                return None;
+            }
+        }
+
+        // The scan walks the record cursor forward on the assumption that names
+        // are laid out in record order. Out of order, a match would be
+        // attributed to the wrong file.
+        if !name_start.is_sorted() {
+            tracing::warn!(?volume, "cached index names are not in record order");
+            return None;
+        }
+
+        // `find` is a binary search, which silently returns nonsense on an
+        // unsorted array rather than failing.
+        if !frn.is_sorted() {
+            tracing::warn!(?volume, "cached index FRNs are not sorted");
+            return None;
+        }
+
+        Some(Self {
+            volume,
+            names,
+            name_start,
+            name_meta,
+            frn,
+            parent,
+            byte_counts: Box::new(counts),
+            next_usn,
+        })
     }
 
     /// Which byte of `needle` to hunt for: the one that occurs least often in

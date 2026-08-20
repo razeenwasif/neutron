@@ -24,7 +24,7 @@
 //! inherently sequential — useless.
 
 use std::io::{BufRead, BufReader, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use neutron_index::protocol::{IndexStatus, Request, Response, SearchHit, sanitize_needle};
 use neutron_index::{Searcher, VolumeIndex, usn};
@@ -49,16 +49,34 @@ pub fn run(pipe_name: &str) -> anyhow::Result<()> {
     // Indexing happens before the first connection is accepted. The client
     // tolerates the pipe not existing yet and retries; the alternative — accept
     // early and answer "not ready" — is the same wait with more moving parts.
-    let indexes = build_indexes();
+    let (indexes, fresh) = build_indexes();
+
+    // An unelevated helper with nothing to serve must not claim the pipe.
+    //
+    // Otherwise it sits there answering every search with no results, and the
+    // elevated helper the client goes on to launch cannot create a pipe that
+    // already exists. Exiting hands the name straight back.
+    //
+    // Only when it is *unelevated* and empty: a machine with no indexable
+    // volumes should still serve, so the client can say so rather than report
+    // that no indexer is running.
+    if !fresh && indexes.is_empty() {
+        tracing::info!("no cached index and no rights to build one; exiting");
+        return Ok(());
+    }
 
     let path = format!(r"\\.\pipe\{pipe_name}");
     tracing::info!(pipe = %path, "serving");
 
     let mut searcher = Searcher::new();
-    let status = status_of(&indexes);
+    let cached_age_secs = (!fresh)
+        .then(|| usn::cache_dir().and_then(|dir| neutron_index::cache::age(&dir)))
+        .flatten()
+        .map(|age| age.as_secs());
+    let status = status_of(&indexes, fresh, cached_age_secs);
 
     loop {
-        let pipe = match Pipe::create(&path) {
+        let pipe = match create_pipe(&path) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("could not create the pipe: {e}");
@@ -88,7 +106,56 @@ enum Exit {
     Shutdown,
 }
 
-fn build_indexes() -> Vec<VolumeIndex> {
+/// How long to wait for a previous helper to release the pipe name.
+///
+/// "Rebuild the search index" stops the running helper and starts an elevated
+/// one, and the old process does not vanish the instant it agrees to: it has to
+/// unwind and close its handle. The replacement arrives during that window and
+/// finds the name still taken.
+///
+/// Retried rather than reported, because the only honest message would be "try
+/// again in a moment" — and this loop *is* trying again in a moment. The window
+/// is a few hundred milliseconds; the budget is generous because the cost of
+/// giving up too early is a UAC prompt the user has already answered being
+/// wasted.
+const PIPE_CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn create_pipe(path: &str) -> anyhow::Result<Pipe> {
+    let deadline = Instant::now() + PIPE_CLAIM_TIMEOUT;
+    loop {
+        match Pipe::create(path) {
+            Ok(pipe) => return Ok(pipe),
+            Err(e) if Instant::now() < deadline => {
+                tracing::debug!("pipe not free yet ({e}); retrying");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn build_indexes() -> (Vec<VolumeIndex>, bool) {
+    // Elevated: read the journals and write a cache for next time.
+    // Unelevated: serve last time's cache, if there is one.
+    //
+    // This is what makes the UAC prompt a once-ever event rather than a
+    // once-per-boot one. Without a cache the helper has nothing to answer with
+    // until it has read a volume, so it must be elevated before it is useful,
+    // so the prompt comes back after every restart.
+    if usn::can_read_volumes() {
+        let indexes = index_from_journals();
+        save_cache(&indexes);
+        (indexes, true)
+    } else {
+        let indexes = load_cache();
+        if indexes.is_empty() {
+            tracing::warn!("not elevated and no usable cache; nothing to serve");
+        }
+        (indexes, false)
+    }
+}
+
+fn index_from_journals() -> Vec<VolumeIndex> {
     use rayon::prelude::*;
 
     let volumes = usn::indexable_volumes();
@@ -122,13 +189,58 @@ fn build_indexes() -> Vec<VolumeIndex> {
     indexes
 }
 
-fn status_of(indexes: &[VolumeIndex]) -> IndexStatus {
+/// Writes each index out, so an unelevated helper can serve it later.
+///
+/// Failures are logged and otherwise ignored. A cache that could not be written
+/// costs a UAC prompt next time; refusing to serve over it would cost the
+/// session.
+fn save_cache(indexes: &[VolumeIndex]) {
+    let Some(dir) = usn::cache_dir() else {
+        return;
+    };
+    let started = Instant::now();
+    for index in indexes {
+        if let Err(e) = neutron_index::cache::save(&dir, index) {
+            tracing::warn!(volume = ?index.volume(), "could not cache the index: {e}");
+        }
+    }
+    tracing::info!(elapsed_ms = started.elapsed().as_millis(), "index cached");
+}
+
+/// Loads whatever caches are readable.
+///
+/// Volumes are asked for by letter rather than by listing the directory, so a
+/// stray file cannot introduce a volume that is not on the machine.
+fn load_cache() -> Vec<VolumeIndex> {
+    let Some(dir) = usn::cache_dir() else {
+        return Vec::new();
+    };
+    let started = Instant::now();
+
+    let mut indexes: Vec<VolumeIndex> = usn::indexable_volumes()
+        .into_iter()
+        .filter_map(|volume| neutron_index::cache::load(&dir, volume))
+        .collect();
+    indexes.sort_by_key(|i| i.volume().0);
+
+    tracing::info!(
+        volumes = indexes.len(),
+        records = indexes.iter().map(|i| i.len()).sum::<usize>(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "index loaded from cache"
+    );
+    indexes
+}
+
+fn status_of(indexes: &[VolumeIndex], fresh: bool, cached_age_secs: Option<u64>) -> IndexStatus {
     IndexStatus {
         volumes_done: indexes.len(),
         volumes_total: indexes.len(),
         records: indexes.iter().map(|i| i.len()).sum(),
         memory_bytes: indexes.iter().map(|i| i.memory_bytes()).sum(),
         skipped: Vec::new(),
+        fresh,
+        cached_age_secs,
     }
 }
 
