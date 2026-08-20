@@ -36,6 +36,7 @@ pub enum CommandId {
 
     ToggleHidden,
     ToggleView,
+    TogglePreview,
     ToggleTheme,
 
     FindInFolder,
@@ -99,6 +100,11 @@ pub const ALL: &[CommandDef] = &[
         id: CommandId::ToggleView,
         title: "Switch list / grid view",
         hint: "Ctrl+Shift+L",
+    },
+    CommandDef {
+        id: CommandId::TogglePreview,
+        title: "Show the preview pane",
+        hint: "Alt+P",
     },
     CommandDef { id: CommandId::ToggleTheme, title: "Switch light / dark", hint: "Ctrl+D" },
 

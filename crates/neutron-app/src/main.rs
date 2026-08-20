@@ -26,6 +26,7 @@ mod header;
 mod icon_service;
 mod index_client;
 mod loader;
+mod preview;
 mod panes;
 mod sidebar;
 mod startup;

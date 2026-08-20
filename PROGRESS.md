@@ -82,9 +82,26 @@
   target might ask for is answered. Runs on the STA pool with the input queues
   joined, so the window keeps painting for the whole drag.
 
-#### 7. Known Cost
+#### 7. Preview Pane
+- `Alt+P` (or the command palette) opens a right-hand pane showing what the
+  cursor row actually contains: images, text, and a card of facts for anything
+  else. Its visibility is remembered across sessions.
+- Reading and decoding happen on a worker; the pane only ever receives finished
+  bytes. Requests are debounced at 120ms and carry a generation, so holding Down
+  through a folder of photographs reads almost nothing and never shows a late
+  answer for a file the cursor has left.
+- Images are downscaled to 1024px on the worker, so a 4000×3000 photograph
+  never becomes a 48MB texture. The pane reports the file's real dimensions.
+- Text is capped at 256KB, monospaced and unwrapped — a config file is read for
+  its structure, and soft-wrapping destroys exactly that.
+- Not done: `IPreviewHandler`, which is how Explorer shows PDFs and Office
+  documents. Those render into an `HWND` the host supplies, which would mean
+  parenting a child window over the wgpu surface and keeping it aligned through
+  every scroll and split.
+
+#### 8. Known Cost
 - The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
 
-#### 8. Test Suite
+#### 9. Test Suite
 - Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`, `neutron-index`) passing on Linux.
-- Full suite on the Windows target: 337 tests, clippy clean.
+- Full suite on the Windows target: 386 tests, clippy clean.

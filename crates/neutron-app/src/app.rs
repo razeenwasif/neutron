@@ -72,6 +72,8 @@ enum Action {
     /// Rebuild the search index from the volumes, which needs administrator
     /// rights.
     RefreshIndex,
+    /// Show or hide the preview pane.
+    TogglePreview,
     /// Put the selection on the clipboard. `cut` marks it for a move.
     Clip { cut: bool },
     /// Paste whatever is on the clipboard into the focused tab's folder.
@@ -171,6 +173,10 @@ pub struct NeutronApp {
     /// apartment thread, because only the shell knows and asking blocks.
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
+
+    /// The preview pane, and the worker that fills it.
+    preview: crate::preview::PreviewState,
+    previews: crate::preview::PreviewLoader,
 
     /// The rename in progress, if any.
     rename: Option<RenameEdit>,
@@ -322,6 +328,11 @@ impl NeutronApp {
             drive_state,
             drive_tx,
             drive_rx,
+            preview: crate::preview::PreviewState {
+                open: saved_preview_open(cc),
+                ..Default::default()
+            },
+            previews: crate::preview::PreviewLoader::spawn(cc.egui_ctx.clone()),
             rename: None,
             renames_started: 0,
             pending_rename: None,
@@ -485,6 +496,20 @@ impl NeutronApp {
             }
             Action::NewFolder => self.new_folder(),
             Action::RefreshIndex => self.index.refresh_index(),
+            Action::TogglePreview => {
+                self.preview.open = !self.preview.open;
+                if !self.preview.open {
+                    // Dropped rather than kept for next time: the texture is
+                    // the largest thing the pane owns, and a hidden pane
+                    // holding a few megabytes of an image nobody is looking at
+                    // is the kind of thing that is never noticed and never
+                    // freed.
+                    self.previews.clear();
+                    self.preview.showing = None;
+                    self.preview.content = crate::preview::Preview::Nothing;
+                    self.preview.texture = None;
+                }
+            }
 
             Action::Clip { cut } => self.clip_selection(cut),
             Action::Paste => self.paste(),
@@ -1383,7 +1408,9 @@ impl NeutronApp {
 
 impl eframe::App for NeutronApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if let Ok(json) = serde_json::to_string(&self.workspace.persist()) {
+        let mut snapshot = self.workspace.persist();
+        snapshot.preview = self.preview.open;
+        if let Ok(json) = serde_json::to_string(&snapshot) {
             storage.set_string(STORAGE_KEY, json);
         }
     }
@@ -1421,6 +1448,7 @@ impl eframe::App for NeutronApp {
         self.open_pending_rename(&ctx);
         // Before drawing: installs icons that arrived since the last frame, so
         // rows painted below pick them up immediately rather than a frame late.
+        self.pump_preview(&ctx);
         self.icons.pump();
         self.icon_texture = self.icons.texture(&ctx);
         self.index.pump();
@@ -1436,6 +1464,7 @@ impl eframe::App for NeutronApp {
 
         self.status_bar(ui, &p);
         self.sidebar(ui, &p, &mut actions);
+        self.preview_pane(ui, &p);
         self.panes(ui, &p, &mut actions);
 
         // Drawn last so it covers everything, and after input routing so the
@@ -1456,6 +1485,18 @@ impl eframe::App for NeutronApp {
 
         self.startup.mark_frame(frame_started.elapsed());
     }
+}
+
+/// Whether the preview pane was showing when the last session was saved.
+///
+/// Read separately from the workspace restore because the pane belongs to the
+/// window rather than to the pane tree, and because a `--start-path` launch
+/// skips the workspace restore entirely but should still remember it.
+fn saved_preview_open(cc: &eframe::CreationContext<'_>) -> bool {
+    cc.storage
+        .and_then(|s| s.get_string(STORAGE_KEY))
+        .and_then(|json| serde_json::from_str::<crate::workspace::PersistedWorkspace>(&json).ok())
+        .is_some_and(|saved| saved.preview)
 }
 
 /// A rename in progress.
@@ -1694,6 +1735,12 @@ impl NeutronApp {
                 // the Recycle Bin, and the shell still confirms it.
                 Action::Delete { permanent: shift },
             ));
+            // Alt+P, which is Explorer's binding for the same pane. Not
+            // Ctrl+P: that is the file finder, and it is used far more often.
+            if i.modifiers.alt && !ctrl && i.key_pressed(egui::Key::P) {
+                actions.push(Action::TogglePreview);
+            }
+
             bindings.push((egui::Key::F2, Action::BeginRename));
             bindings.push((egui::Key::F5, Action::Refresh));
             bindings.push((egui::Key::Escape, Action::ClearSelection));
@@ -2018,6 +2065,7 @@ impl NeutronApp {
 
             C::ToggleHidden => Some(Action::ToggleHidden),
             C::ToggleView => Some(Action::ToggleView),
+            C::TogglePreview => Some(Action::TogglePreview),
             C::ToggleTheme => Some(Action::ToggleTheme),
 
             C::FindInFolder => Some(Action::ToggleFinder(crate::finder::Mode::Files)),
@@ -2196,6 +2244,110 @@ impl NeutronApp {
                         }
                     });
                 });
+            });
+    }
+
+    /// Keeps the preview in step with the selection, and uploads a decoded
+    /// image once it arrives.
+    ///
+    /// Called before drawing, so the pane paints this frame's answer rather
+    /// than last frame's.
+    fn pump_preview(&mut self, ctx: &egui::Context) {
+        if !self.preview.open {
+            return;
+        }
+
+        // What the pane should be showing: the cursor row of the focused tab.
+        // The cursor rather than the selection, because with several files
+        // selected there is no single thing to preview, and the cursor is the
+        // one the user last touched.
+        let wanted = self.workspace.active_tab().and_then(|tab| {
+            let dir = tab.location().as_path()?;
+            let idx = tab.selection.cursor().filter(|&i| i < tab.list.len())?;
+            Some((dir.join(tab.list.name(idx)), tab.list.kind(idx).is_container()))
+        });
+
+        match &wanted {
+            Some((path, is_dir)) => self.previews.request(path, *is_dir, self.preview.showing.as_ref()),
+            None => {
+                if self.preview.showing.is_some() {
+                    self.previews.clear();
+                    self.preview.showing = None;
+                    self.preview.content = crate::preview::Preview::Nothing;
+                    self.preview.texture = None;
+                }
+            }
+        }
+
+        self.previews.tick();
+
+        if let Some((path, content)) = self.previews.poll() {
+            self.preview.texture = match &content {
+                crate::preview::Preview::Image {
+                    rgba,
+                    width,
+                    height,
+                    ..
+                } => {
+                    // Uploaded here because only the UI thread may touch the
+                    // graphics context. The worker hands over plain bytes,
+                    // already downscaled, so this copies a few megabytes at
+                    // most and does it once per file rather than per frame.
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [*width, *height],
+                        rgba,
+                    );
+                    Some(ctx.load_texture("neutron-preview", image, egui::TextureOptions::LINEAR))
+                }
+                _ => None,
+            };
+            self.preview.showing = Some(path);
+            self.preview.content = content;
+        } else if self.previews.busy() && self.preview.showing != wanted.as_ref().map(|(p, _)| p.clone()) {
+            // Something is on its way for a different file. Say so rather than
+            // leaving the previous file's contents under the new name.
+            self.preview.content = crate::preview::Preview::Loading;
+            self.preview.texture = None;
+        }
+    }
+
+    fn preview_pane(&self, ui: &mut egui::Ui, p: &Palette) {
+        if !self.preview.open {
+            return;
+        }
+
+        let subject = self.workspace.active_tab().and_then(|tab| {
+            let idx = tab.selection.cursor().filter(|&i| i < tab.list.len())?;
+            Some(crate::preview::Subject {
+                name: tab.list.name(idx),
+                kind: neutron_ui::file_list::kind_label(tab.list.kind(idx), tab.list.name(idx)),
+                size: Some(tab.list.size(idx)),
+                modified: tab.list.modified(idx),
+                is_dir: tab.list.kind(idx).is_container(),
+            })
+        });
+
+        egui::Panel::right("preview")
+            .default_size(320.0)
+            .size_range(egui::Rangef::new(220.0, 640.0))
+            .frame(
+                theme::card(p)
+                    .outer_margin(egui::Margin {
+                        left: 0,
+                        right: GUTTER as i8,
+                        top: GUTTER as i8,
+                        bottom: GUTTER as i8,
+                    })
+                    .inner_margin(egui::Margin::symmetric(12, 12)),
+            )
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                theme::glass_highlight(
+                    ui.painter(),
+                    ui.max_rect().expand2(egui::vec2(12.0, 12.0)),
+                    egui::CornerRadius::same(theme::RADIUS_CARD),
+                );
+                crate::preview::show(ui, p, &self.preview, subject);
             });
     }
 

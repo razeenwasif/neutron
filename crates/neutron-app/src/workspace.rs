@@ -313,6 +313,12 @@ pub struct PersistedWorkspace {
     /// Flattened split structure, replayed in order on restore.
     pub splits: Vec<PersistedSplit>,
     pub focused: usize,
+    /// Whether the preview pane was showing.
+    ///
+    /// `default` so a session saved before the pane existed still restores —
+    /// the field is simply absent and reads as closed.
+    #[serde(default)]
+    pub preview: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -395,6 +401,11 @@ impl Workspace {
             panes,
             splits,
             focused: order.iter().position(|g| *g == self.focused).unwrap_or(0),
+            // Filled in by the caller. The preview pane is a property of the
+            // window rather than of the pane tree, and the workspace does not
+            // know it exists — but it rides in the same snapshot, because a
+            // second saved file for one boolean would be worse.
+            preview: false,
         }
     }
 
@@ -674,8 +685,21 @@ mod tests {
             panes: Vec::new(),
             splits: Vec::new(),
             focused: 0,
+            preview: false,
         };
         assert!(Workspace::restore(&empty).is_none());
+    }
+
+    #[test]
+    fn a_session_saved_before_the_preview_pane_existed_still_restores() {
+        // The field is `serde(default)` precisely so an older session file,
+        // which has no `preview` key at all, does not fail to parse and throw
+        // the whole layout away.
+        let json = r#"{"panes":[{"tabs":["/only"],"active":0}],"splits":[],"focused":0}"#;
+        let saved: PersistedWorkspace =
+            serde_json::from_str(json).expect("an older snapshot must still parse");
+        assert!(!saved.preview);
+        assert!(Workspace::restore(&saved).is_some());
     }
 
     #[test]
@@ -688,6 +712,7 @@ mod tests {
             splits: Vec::new(),
             // Points at a pane that does not exist.
             focused: 7,
+            preview: false,
         };
         let restored = Workspace::restore(&saved).expect("should still restore");
         assert!(restored.layout.contains(restored.focused));

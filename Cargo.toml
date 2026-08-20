@@ -91,6 +91,13 @@ windows-core = "0.62"
 # SIMD substring scanning for the index. Already in the tree via other crates.
 memchr = "2"
 
+# Image decoding for the preview pane. Default features pull in every format
+# the crate knows; these are the ones that actually turn up in a folder, and
+# the rest are megabytes of decoder for files nobody previews.
+image = { version = "0.25", default-features = false, features = [
+    "png", "jpeg", "gif", "bmp", "webp", "ico", "tiff",
+] }
+
 # Release builds: optimize hard. This is a file manager whose entire pitch is
 # speed, so the extra link time is worth it.
 [profile.release]

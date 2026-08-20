@@ -1308,7 +1308,7 @@ fn draw_cell_text(ui: &Ui, cell: Rect, text: &str, font: &FontId, color: Color32
     ui.painter().galley(pos, galley, color);
 }
 
-fn kind_label(kind: EntryKind, name: &str) -> String {
+pub fn kind_label(kind: EntryKind, name: &str) -> String {
     match kind {
         EntryKind::Directory => "Folder".to_owned(),
         EntryKind::Drive => "Drive".to_owned(),
