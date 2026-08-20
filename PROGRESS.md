@@ -99,9 +99,26 @@
   parenting a child window over the wgpu surface and keeping it aligned through
   every scroll and split.
 
-#### 8. Known Cost
+#### 8. Live Listings
+- Every folder a tab is showing is watched with `ReadDirectoryChangesW`, so a
+  download finishing or a build writing its output appears without an F5. This
+  was planned at M1 and only landed now.
+- The watcher reports *that* the folder changed and nothing else. Applying
+  individual events would mean reproducing the sort position, the filter, the
+  hidden-file rule and the rename pairing for each one, and being wrong leaves a
+  listing that disagrees with the disk invisibly. Re-reading is 25ms for 27,000
+  entries and is right by construction.
+- The first change is reported at once, then the watcher waits 250ms before
+  looking again. Measured: creating 500 files in 0.76s cost a handful of
+  re-reads and held CPU at 1.7% against a 1.2% idle baseline.
+- Refreshing is now distinct from navigating. A refresh keeps the filter and
+  re-selects by *name*, because re-reading rebuilds every index into the entry
+  list. Files that were deleted stay gone, which is what should happen to the
+  one just removed.
+
+#### 9. Known Cost
 - The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
 
-#### 9. Test Suite
+#### 10. Test Suite
 - Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`, `neutron-index`) passing on Linux.
-- Full suite on the Windows target: 386 tests, clippy clean.
+- Full suite on the Windows target: 389 tests, clippy clean.

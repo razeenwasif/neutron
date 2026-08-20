@@ -45,6 +45,8 @@ pub mod fileops;
 #[cfg_attr(not(windows), path = "clipboard_stub.rs")]
 pub mod clipboard;
 
+pub mod watch;
+
 #[cfg_attr(windows, path = "dragout.rs")]
 #[cfg_attr(not(windows), path = "dragout_stub.rs")]
 pub mod dragout;

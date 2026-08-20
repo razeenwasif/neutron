@@ -37,6 +37,25 @@ pub struct Tab {
     /// Generation of the load this tab is waiting for. Results with any other
     /// generation belong to a navigation the user has already left.
     pub pending: Option<u64>,
+    /// Names to select again once the pending load lands.
+    ///
+    /// A refresh re-reads the directory, which rebuilds the entry list and
+    /// invalidates every index into it — including the selection, which is
+    /// stored as indices so it can survive a re-sort. Names are the only
+    /// identity that outlives the rebuild.
+    ///
+    /// `None` for a navigation, where the previous selection means nothing in
+    /// the new folder.
+    pub reselect: Option<Reselect>,
+}
+
+/// What was selected before a refresh, by name.
+#[derive(Debug, Clone, Default)]
+pub struct Reselect {
+    pub names: Vec<String>,
+    /// The cursor row, kept separately because it drives the preview pane and
+    /// is not necessarily part of the selection.
+    pub cursor: Option<String>,
 }
 
 impl Tab {
@@ -49,7 +68,45 @@ impl Tab {
             view,
             status: Status::Loading,
             pending: None,
+            reselect: None,
         }
+    }
+
+    /// Records what is selected now, so a refresh can restore it.
+    pub fn remember_selection(&self) -> Reselect {
+        Reselect {
+            names: self
+                .selection
+                .iter()
+                .filter(|&i| i < self.list.len())
+                .map(|i| self.list.name(i).to_owned())
+                .collect(),
+            cursor: self
+                .selection
+                .cursor()
+                .filter(|&i| i < self.list.len())
+                .map(|i| self.list.name(i).to_owned()),
+        }
+    }
+
+    /// Selects those names again, ignoring any that are gone.
+    ///
+    /// Deleted files simply do not come back, which is the desired behaviour
+    /// after the operation that most often triggers a refresh.
+    pub fn restore_selection(&mut self, wanted: &Reselect) {
+        use std::collections::HashSet;
+
+        let names: HashSet<&str> = wanted.names.iter().map(String::as_str).collect();
+        let indices: Vec<usize> = (0..self.list.len())
+            .filter(|&i| names.contains(self.list.name(i)))
+            .collect();
+
+        let cursor = wanted
+            .cursor
+            .as_deref()
+            .and_then(|name| (0..self.list.len()).find(|&i| self.list.name(i) == name));
+
+        self.selection.set(&indices, cursor);
     }
 
     pub fn location(&self) -> &NodeId {

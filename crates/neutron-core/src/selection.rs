@@ -56,6 +56,18 @@ impl Selection {
         self.items.iter().map(|&i| i as usize)
     }
 
+    /// Replaces the selection wholesale.
+    ///
+    /// For restoring a selection after the entry list has been rebuilt, where
+    /// the indices are all new and there is no gesture to model — the anchor
+    /// goes to the cursor, so a subsequent Shift+click ranges from where the
+    /// user visibly is.
+    pub fn set(&mut self, indices: &[usize], cursor: Option<usize>) {
+        self.items = indices.iter().map(|&i| i as u32).collect();
+        self.cursor = cursor.map(|c| c as u32);
+        self.anchor = self.cursor;
+    }
+
     pub fn clear(&mut self) {
         self.items.clear();
         self.cursor = None;
@@ -478,4 +490,42 @@ mod tests {
 
         assert_eq!(s.total_size(&l), 100);
     }
+    #[test]
+    fn setting_a_selection_replaces_whatever_was_there() {
+        let list = list();
+        let mut sel = Selection::new();
+        sel.apply(&list, 0, SelectMode::Replace);
+
+        sel.set(&[2, 3], Some(2));
+        assert!(!sel.is_selected(0));
+        assert!(sel.is_selected(2) && sel.is_selected(3));
+        assert_eq!(sel.cursor(), Some(2));
+    }
+
+    #[test]
+    fn setting_an_empty_selection_clears_it() {
+        // What a refresh does when every selected file was deleted.
+        let list = list();
+        let mut sel = Selection::new();
+        sel.apply(&list, 0, SelectMode::Replace);
+
+        sel.set(&[], None);
+        assert!(sel.is_empty());
+        assert_eq!(sel.cursor(), None);
+    }
+
+    #[test]
+    fn a_set_selection_anchors_a_following_range_at_the_cursor() {
+        // Otherwise the anchor is left pointing at whatever index happened to
+        // be there before the list was rebuilt, and the next Shift+click
+        // selects a range the user did not start.
+        let list = list();
+        let mut sel = Selection::new();
+        sel.set(&[1], Some(1));
+        sel.apply(&list, 3, SelectMode::Range);
+
+        assert!(sel.is_selected(1) && sel.is_selected(2) && sel.is_selected(3));
+        assert!(!sel.is_selected(0));
+    }
+
 }

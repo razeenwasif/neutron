@@ -12,7 +12,7 @@
 //! readable and makes the set of things the UI can do an explicit enum rather
 //! than scattered field writes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use neutron_core::places::Place;
@@ -174,6 +174,17 @@ pub struct NeutronApp {
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
 
+    /// Directory watchers, one per distinct folder on screen.
+    ///
+    /// Keyed by path rather than by tab: a split showing the same folder twice
+    /// needs one watcher, not two, and a tab that navigates away should not
+    /// stop a watch another pane still wants.
+    watchers: std::collections::HashMap<PathBuf, neutron_shell::watch::Watcher>,
+    /// Set by a watcher thread when its folder changes. Drained on the UI
+    /// thread, which is the only place a re-list may be started from.
+    changed_tx: crossbeam_channel::Sender<PathBuf>,
+    changed_rx: crossbeam_channel::Receiver<PathBuf>,
+
     /// The preview pane, and the worker that fills it.
     preview: crate::preview::PreviewState,
     previews: crate::preview::PreviewLoader,
@@ -266,6 +277,7 @@ impl NeutronApp {
         let (menu_tx, menu_rx) = crossbeam_channel::unbounded();
         let (clip_fail_tx, clip_fail_rx) = crossbeam_channel::unbounded();
         let (created_tx, created_rx) = crossbeam_channel::unbounded();
+        let (changed_tx, changed_rx) = crossbeam_channel::unbounded();
 
         // `Ctrl+V` never reaches the application through egui when the
         // clipboard holds files rather than text, which is the only case that
@@ -328,6 +340,9 @@ impl NeutronApp {
             drive_state,
             drive_tx,
             drive_rx,
+            watchers: std::collections::HashMap::new(),
+            changed_tx,
+            changed_rx,
             preview: crate::preview::PreviewState {
                 open: saved_preview_open(cc),
                 ..Default::default()
@@ -393,11 +408,46 @@ impl NeutronApp {
             return;
         };
         t.selection.clear();
+        t.reselect = None;
         t.status = Status::Loading;
         // The filter describes the folder being left, not the one being
         // entered. Carrying it across a navigation shows an arbitrarily empty
         // pane with no visible cause, which reads as a broken listing.
         t.view.filter.clear();
+        let (sort, show_hidden) = (t.view.sort, t.view.show_hidden);
+
+        let generation = self.loader.load(tab, location, sort, show_hidden);
+        if let Some(t) = self.workspace.tabs.get_mut(&tab) {
+            t.pending = Some(generation);
+        }
+    }
+
+    /// Re-reads the folder a tab is already showing, keeping what the user set
+    /// up in it.
+    ///
+    /// Distinct from [`Self::reload`], which exists for *going somewhere else*
+    /// and so throws the selection and the filter away. Refreshing is not going
+    /// anywhere: it happens after a delete, on F5, and — once the watcher is
+    /// wired up — whenever anything on disk changes. Clearing the selection
+    /// every time would mean the listing rearranging itself under the user
+    /// while they work.
+    ///
+    /// The selection is remembered by *name*, because re-reading rebuilds the
+    /// entry list and every index into it. Names that are gone stay gone, which
+    /// is what should happen to the file that was just deleted.
+    ///
+    /// The status is deliberately left alone: switching it to `Loading` would
+    /// replace the count in the status bar with a spinner on every change,
+    /// which is a lot of movement to announce that nothing the user did has
+    /// finished yet.
+    fn refresh_in_place(&mut self, tab: TabId) {
+        let Some(t) = self.workspace.tabs.get_mut(&tab) else {
+            return;
+        };
+        let remembered = t.remember_selection();
+        t.reselect = Some(remembered);
+
+        let location = t.location().clone();
         let (sort, show_hidden) = (t.view.sort, t.view.show_hidden);
 
         let generation = self.loader.load(tab, location, sort, show_hidden);
@@ -464,9 +514,7 @@ impl NeutronApp {
             }
             Action::Refresh => {
                 if let Some(tab) = active {
-                    if let Some(loc) = self.workspace.tabs.get(&tab).map(|t| t.location().clone()) {
-                        self.reload(tab, loc);
-                    }
+                    self.refresh_in_place(tab);
                 }
             }
 
@@ -1448,6 +1496,8 @@ impl eframe::App for NeutronApp {
         self.open_pending_rename(&ctx);
         // Before drawing: installs icons that arrived since the last frame, so
         // rows painted below pick them up immediately rather than a frame late.
+        self.sync_watchers(&ctx);
+        self.drain_changes();
         self.pump_preview(&ctx);
         self.icons.pump();
         self.icon_texture = self.icons.texture(&ctx);
@@ -1582,12 +1632,10 @@ impl NeutronApp {
 
     /// Re-lists tabs whose contents a finished shell operation may have changed.
     fn drain_refreshes(&mut self) {
-        // Collected first because `reload` borrows `self` mutably.
+        // Collected first because refreshing borrows `self` mutably.
         let tabs: Vec<TabId> = self.refresh_rx.try_iter().collect();
         for tab in tabs {
-            if let Some(loc) = self.workspace.tabs.get(&tab).map(|t| t.location().clone()) {
-                self.reload(tab, loc);
-            }
+            self.refresh_in_place(tab);
         }
     }
 
@@ -1610,11 +1658,15 @@ impl NeutronApp {
                         elapsed: loaded.enumerate_time + loaded.sort_time,
                     };
                     tab.list = loaded.list;
-                    tab.selection.clear();
+                    match tab.reselect.take() {
+                        Some(wanted) => tab.restore_selection(&wanted),
+                        None => tab.selection.clear(),
+                    }
                 }
                 LoadResult::Failed { id, error } => {
                     tab.status = Status::Error(format!("{id}: {error}"));
                     tab.list = EntryList::new();
+                    tab.reselect = None;
                     tab.selection.clear();
                 }
             }
@@ -2245,6 +2297,79 @@ impl NeutronApp {
                     });
                 });
             });
+    }
+
+    /// Starts and stops watchers so they match the folders tabs are showing.
+    ///
+    /// Run every frame and diffed rather than driven by navigation events,
+    /// because there are a dozen ways a pane's folder can change — navigate,
+    /// back, a tab closing, a split — and one of them will always be missed.
+    /// The set of visible folders is the truth; this makes the watchers agree
+    /// with it.
+    fn sync_watchers(&mut self, ctx: &egui::Context) {
+        use std::collections::HashSet;
+
+        // Every tab's folder, not only the visible ones. A background tab
+        // that is kept current is right the moment it is switched to; watching
+        // only the active tab would leave it showing whatever was true when it
+        // was last on screen. The cost is a blocked thread per open tab, and
+        // tabs are counted in ones.
+        let wanted: HashSet<PathBuf> = self
+            .workspace
+            .tabs
+            .values()
+            .filter_map(|t| t.location().as_path().map(Path::to_path_buf))
+            .collect();
+
+        // Dropping a watcher cancels its blocking read and joins nothing — the
+        // thread notices and exits on its own.
+        self.watchers.retain(|path, _| wanted.contains(path));
+
+        for path in wanted {
+            if self.watchers.contains_key(&path) {
+                continue;
+            }
+            let tx = self.changed_tx.clone();
+            let wake = ctx.clone();
+            let reported = path.clone();
+
+            // A folder that cannot be watched is not an error: the pane just
+            // keeps updating only when asked, exactly as it did before.
+            if let Some(watcher) = neutron_shell::watch::watch(&path, move || {
+                let _ = tx.send(reported.clone());
+                wake.request_repaint();
+            }) {
+                tracing::debug!(path = %path.display(), "watching");
+                self.watchers.insert(path, watcher);
+            }
+        }
+    }
+
+    /// Re-lists any tab showing a folder that changed on disk.
+    fn drain_changes(&mut self) {
+        let changed: std::collections::HashSet<PathBuf> = self.changed_rx.try_iter().collect();
+        if changed.is_empty() {
+            return;
+        }
+
+        // Every tab on that folder, not only the visible one: a background tab
+        // that is re-listed now is correct the moment it is switched to,
+        // instead of showing a stale listing until something else happens.
+        let stale: Vec<TabId> = self
+            .workspace
+            .tabs
+            .values()
+            .filter(|t| {
+                t.location()
+                    .as_path()
+                    .is_some_and(|p| changed.contains(p))
+            })
+            .map(|t| t.id)
+            .collect();
+
+        for tab in stale {
+            self.refresh_in_place(tab);
+        }
     }
 
     /// Keeps the preview in step with the selection, and uploads a decoded
