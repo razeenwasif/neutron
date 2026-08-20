@@ -19,6 +19,7 @@
 //! function reintroduces the stall.
 
 mod app;
+mod archive_ops;
 mod bench;
 mod commands;
 mod finder;

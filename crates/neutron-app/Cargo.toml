@@ -16,6 +16,7 @@ neutron-shell.workspace = true
 neutron-fuzzy.workspace = true
 neutron-index.workspace = true
 neutron-cloud.workspace = true
+neutron-archive.workspace = true
 
 egui.workspace = true
 eframe.workspace = true

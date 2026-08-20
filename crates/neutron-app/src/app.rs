@@ -74,6 +74,12 @@ enum Action {
     RefreshIndex,
     /// Show or hide the preview pane.
     TogglePreview,
+    /// Unpack the selected archive into a folder beside it.
+    ExtractSelection,
+    /// Zip the selection into a new archive beside it.
+    CompressSelection,
+    /// Stop the archive job that is running.
+    CancelArchiveJob,
     /// Put the selection on the clipboard. `cut` marks it for a move.
     Clip { cut: bool },
     /// Paste whatever is on the clipboard into the focused tab's folder.
@@ -173,6 +179,11 @@ pub struct NeutronApp {
     /// apartment thread, because only the shell knows and asking blocks.
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
+
+    /// The archive job that is running, if any, and what it last reported.
+    archive_job: Option<crate::archive_ops::ArchiveJob>,
+    /// What the last finished job did, shown until the next one starts.
+    archive_note: Option<String>,
 
     /// Directory watchers, one per distinct folder on screen.
     ///
@@ -340,6 +351,8 @@ impl NeutronApp {
             drive_state,
             drive_tx,
             drive_rx,
+            archive_job: None,
+            archive_note: None,
             watchers: std::collections::HashMap::new(),
             changed_tx,
             changed_rx,
@@ -544,6 +557,13 @@ impl NeutronApp {
             }
             Action::NewFolder => self.new_folder(),
             Action::RefreshIndex => self.index.refresh_index(),
+            Action::ExtractSelection => self.extract_selection(),
+            Action::CompressSelection => self.compress_selection(),
+            Action::CancelArchiveJob => {
+                if let Some(job) = self.archive_job.as_ref() {
+                    job.cancel();
+                }
+            }
             Action::TogglePreview => {
                 self.preview.open = !self.preview.open;
                 if !self.preview.open {
@@ -1496,6 +1516,7 @@ impl eframe::App for NeutronApp {
         self.open_pending_rename(&ctx);
         // Before drawing: installs icons that arrived since the last frame, so
         // rows painted below pick them up immediately rather than a frame late.
+        self.pump_archive_job();
         self.sync_watchers(&ctx);
         self.drain_changes();
         self.pump_preview(&ctx);
@@ -1512,7 +1533,7 @@ impl eframe::App for NeutronApp {
 
         self.keyboard(&ctx, &mut actions);
 
-        self.status_bar(ui, &p);
+        self.status_bar(ui, &p, &mut actions);
         self.sidebar(ui, &p, &mut actions);
         self.preview_pane(ui, &p);
         self.panes(ui, &p, &mut actions);
@@ -2113,6 +2134,8 @@ impl NeutronApp {
             C::Paste => Some(Action::Paste),
             C::Rename => Some(Action::BeginRename),
             C::NewFolder => Some(Action::NewFolder),
+            C::Extract => Some(Action::ExtractSelection),
+            C::Compress => Some(Action::CompressSelection),
             C::DeleteSelection => Some(Action::Delete { permanent: false }),
 
             C::ToggleHidden => Some(Action::ToggleHidden),
@@ -2236,7 +2259,7 @@ impl NeutronApp {
         });
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui, p: &Palette) {
+    fn status_bar(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
         let tab = self.workspace.active_tab();
 
         egui::Panel::bottom("status_bar")
@@ -2312,9 +2335,152 @@ impl NeutronApp {
                                     ));
                             }
                         }
+
+                        self.archive_status(ui, p, actions);
                     });
                 });
             });
+    }
+
+    /// The running archive job, or what the last one did.
+    ///
+    /// Lives in the status bar rather than in a dialog. Extracting is not modal
+    /// — there is no reason the user cannot carry on browsing while it runs —
+    /// and a window that steals focus to say "43%" is the thing every other
+    /// archiver gets wrong.
+    fn archive_status(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
+        if let Some(job) = self.archive_job.as_ref() {
+            if ui
+                .add(egui::Button::new(egui::RichText::new("Stop").size(11.0)).small())
+                .on_hover_text("Stop this archive job. What has been written already stays.")
+                .clicked()
+            {
+                actions.push(Action::CancelArchiveJob);
+            }
+
+            let progress = job.state.progress;
+            let text = if progress.total > 0 {
+                format!(
+                    "{} — {:.0}%",
+                    job.state.label,
+                    (progress.done as f64 / progress.total as f64) * 100.0
+                )
+            } else {
+                // A tar is a stream and a zip being written has no known total,
+                // so there is no percentage to give. The byte count still moves,
+                // which is what says it has not hung.
+                format!(
+                    "{} — {}",
+                    job.state.label,
+                    neutron_ui::format::size(Some(progress.done))
+                )
+            };
+            ui.colored_label(p.accent, text);
+            return;
+        }
+
+        if let Some(note) = self.archive_note.as_ref() {
+            ui.colored_label(p.text_muted, note);
+        }
+    }
+
+    /// Unpacks the selected archive into a folder beside it.
+    fn extract_selection(&mut self) {
+        let Some((_, dir, paths)) = self.selection_paths() else {
+            return;
+        };
+        // One at a time, and the first selected archive is the one meant. A
+        // selection of several archives is far more likely to be a stray
+        // Ctrl+A than a request to unpack all of them at once.
+        let Some(archive) = paths
+            .iter()
+            .find(|p| neutron_archive::format_of(p).is_some())
+            .cloned()
+        else {
+            self.archive_note = Some("That is not an archive Neutron can open".to_owned());
+            return;
+        };
+        let Some(format) = neutron_archive::format_of(&archive) else {
+            return;
+        };
+
+        let Some(destination) = neutron_archive::destination_for(&archive, |p| p.exists()) else {
+            return;
+        };
+        let _ = dir;
+
+        self.start_archive_job(crate::archive_ops::extract(
+            archive,
+            destination,
+            format,
+            self.ctx.clone(),
+        ));
+    }
+
+    /// Zips the selection into a new archive beside it.
+    fn compress_selection(&mut self) {
+        let Some((_, dir, paths)) = self.selection_paths() else {
+            return;
+        };
+
+        let name = neutron_archive::create::suggested_name(&paths, &dir);
+        // Numbered rather than overwriting: zipping the same folder twice
+        // should not silently replace the first archive.
+        let output = neutron_core::naming::next_available(
+            name.trim_end_matches(".zip"),
+            |candidate| dir.join(format!("{candidate}.zip")).exists(),
+        );
+        let output = dir.join(format!("{output}.zip"));
+
+        self.start_archive_job(crate::archive_ops::compress(
+            paths,
+            dir,
+            output,
+            self.ctx.clone(),
+        ));
+    }
+
+    fn start_archive_job(&mut self, job: crate::archive_ops::ArchiveJob) {
+        if self.archive_job.is_some() {
+            // Refused rather than queued: archive work is disk-bound, so two at
+            // once makes both slower, and the status bar has room for one line.
+            self.archive_note =
+                Some("Already busy with an archive — wait for it to finish".to_owned());
+            return;
+        }
+        self.archive_note = None;
+        self.archive_job = Some(job);
+    }
+
+    /// Applies whatever the archive worker has reported.
+    fn pump_archive_job(&mut self) {
+        let Some(job) = self.archive_job.as_mut() else {
+            return;
+        };
+        let Some(finished) = job.poll() else {
+            return;
+        };
+
+        self.archive_job = None;
+        self.archive_note = Some(match finished {
+            crate::archive_ops::Finished::Done { label, summary } => {
+                if !summary.refused.is_empty() {
+                    // Logged in full, summarised on screen: the status bar has
+                    // one line and a hostile archive can refuse hundreds.
+                    for refusal in &summary.refused {
+                        tracing::warn!("archive: {refusal}");
+                    }
+                }
+                format!("{label} — {}", crate::archive_ops::describe(&summary))
+            }
+            crate::archive_ops::Finished::Failed { label, error } => {
+                tracing::warn!("{label} failed: {error}");
+                format!("{label} failed: {error}")
+            }
+        });
+
+        // The folder the result landed in is watched, so the new archive or
+        // folder appears on its own. Nothing to refresh here.
     }
 
     /// Starts and stops watchers so they match the folders tabs are showing.

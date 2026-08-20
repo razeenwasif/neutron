@@ -1,0 +1,22 @@
+[package]
+name = "neutron-archive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true
+
+# Only `deflate`: it is what Windows writes and what essentially every zip in
+# the wild uses. The rarer methods are declined by name rather than supported
+# badly, and pull in three more compressors for archives nobody has.
+zip = { version = "6", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
+
+[dev-dependencies]
+# The hostile-archive tests build their entries by hand, without the sanitising
+# a well-behaved writer would apply.
+zip = { version = "6", default-features = false, features = ["deflate"] }

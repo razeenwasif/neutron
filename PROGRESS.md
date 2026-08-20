@@ -116,9 +116,28 @@
   list. Files that were deleted stay gone, which is what should happen to the
   one just removed.
 
-#### 9. Known Cost
+#### 9. Archives
+- **Extract** zip, tar and tar.gz; **compress** to zip. Both run on a worker
+  with progress and a Stop in the status bar — extracting is not modal, and
+  there is no reason browsing should stop while it runs.
+- `7z` and `rar` are deliberately absent. Both need a real implementation or a
+  bundled binary, and the installed tools already appear in the context menu,
+  which beats a second-rate decoder.
+- **Entry names are treated as hostile.** An entry called `..\..\Windows\
+  System32\drivers\etc\hosts` is a valid zip entry, and an extractor that
+  joins names onto a destination writes exactly there. Names are taken apart and
+  rebuilt from components known to be ordinary; anything else is refused and
+  reported. Tested end to end with real traversal, absolute, UNC and
+  drive-relative archives.
+- Modification times survive the round trip in both directions, which needed a
+  small UTC calendar conversion — a zip stores MS-DOS date fields, and the
+  format's zero value is 1980.
+- Cancelling keeps what was already written. Deleting a half-extracted folder is
+  a destructive act nobody asked for.
+
+#### 10. Known Cost
 - The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
 
-#### 10. Test Suite
+#### 11. Test Suite
 - Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`, `neutron-index`) passing on Linux.
-- Full suite on the Windows target: 389 tests, clippy clean.
+- Full suite on the Windows target: 426 tests, clippy clean.
