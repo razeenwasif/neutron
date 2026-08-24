@@ -1,0 +1,15 @@
+{
+  "protocol": 1,
+  "id": "hashes",
+  "name": "Hashes",
+  "description": "Writes SHA-256 checksums for the selected files",
+  "run": "run.cmd",
+  "commands": [
+    {
+      "id": "sha256",
+      "title": "Write SHA-256 checksums",
+      "needs": "selection",
+      "menu": true
+    }
+  ]
+}

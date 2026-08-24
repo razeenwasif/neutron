@@ -135,9 +135,51 @@
 - Cancelling keeps what was already written. Deleting a half-extracted folder is
   a destructive act nobody asked for.
 
-#### 10. Known Cost
+#### 10. Plugins
+- A plugin is a folder under `%APPDATA%\Neutron\plugins` holding a
+  `plugin.json` and a program. Its commands appear in the command palette and,
+  if the manifest asks, in the right-click menu. Choosing one runs the program
+  with the folder and selection as one line of JSON on standard input, and acts
+  on the lines it prints back — `status`, `refresh`, `navigate`, `open`,
+  `error`. Authoring guide in `docs/plugins.md`; a working example in
+  `examples/plugins/hashes`.
+- **Separate processes, not a dynamic library.** Release builds are
+  `panic = "abort"`, so an in-process plugin that panics kills the file manager;
+  a child process that dies is an exit status. It also cannot hang the window —
+  the host waits on a channel with a deadline, and there is a Stop. And since
+  Rust has no stable ABI, the alternative would have been a C boundary that
+  restricts plugins to whoever is willing to link one; newline-delimited JSON
+  means a plugin can be a shell script.
+- **Not a sandbox, and the docs say so.** A plugin runs with the user's rights.
+  What the design *does* guarantee: listing a plugin never runs it (discovery
+  reads manifests and stops); nothing appears in the palette that is not written
+  in a file the user can read; and a plugin's output is treated as untrusted —
+  flattened to one line, stripped of control and bidi characters, length-capped,
+  and paths checked before anything is done with them.
+- Three threads per invocation, one per pipe. Each can block: `stdin` if the
+  plugin never reads a request larger than the pipe buffer, `stdout` while it
+  thinks, and `stderr` — undrained — blocks *the plugin*, which looks from the
+  host side exactly like a hang.
+- Every rejected plugin folder keeps its reason and shows it. A plugin system
+  that silently skips what it cannot parse is unusable to write for: the symptom
+  is an entry that never appears, with nothing anywhere to explain it.
+- Menu ids for plugin rows start at `0x1000_0000`, clear of the shell's
+  `1..=0x7FFF`, checked at compile time. A chosen plugin id is never forwarded
+  to `IContextMenu::InvokeCommand`, which would otherwise invoke an unrelated
+  verb.
+- Fallout worth noting: the selection is a `HashSet`, so `selection_paths` was
+  returning files in a different order every run. It now sorts into the order
+  the rows appear in, which also fixes the order files go into a zip and onto
+  the clipboard.
+
+#### 11. Known Cost
 - The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
 
-#### 11. Test Suite
-- Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`, `neutron-index`) passing on Linux.
-- Full suite on the Windows target: 426 tests, clippy clean.
+#### 12. Test Suite
+- Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`,
+  `neutron-index`, `neutron-archive`, `neutron-plugin`) passing on Linux.
+- `neutron-plugin` is tested against **real child processes** — plugins that
+  hang, crash, print nonsense, never read their input, print forever, or emit
+  one endless line. Those are the cases a mock cannot check, because the failure
+  being guarded against is the pipe and the process.
+- Full suite on the Windows target: 474 tests, clippy clean.

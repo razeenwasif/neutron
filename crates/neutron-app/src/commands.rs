@@ -50,6 +50,9 @@ pub enum CommandId {
     GoDesktop,
     GoDownloads,
     GoDocuments,
+
+    ReloadPlugins,
+    OpenPluginsFolder,
 }
 
 pub struct CommandDef {
@@ -134,7 +137,68 @@ pub const ALL: &[CommandDef] = &[
         title: "Stop the search indexer",
         hint: "",
     },
+
+    // Plugin housekeeping. Both exist for the same reason: a plugin that does
+    // not appear gives the user nothing to look at, and these are the two
+    // things they would want to do about it.
+    CommandDef {
+        id: CommandId::OpenPluginsFolder,
+        title: "Open the plugins folder",
+        hint: "",
+    },
+    CommandDef {
+        id: CommandId::ReloadPlugins,
+        title: "Reload plugins",
+        hint: "",
+    },
 ];
+
+/// Something the palette can run: one of Neutron's own commands, or one a
+/// plugin declared.
+///
+/// Rows are chosen by position in the matched list and resolved through this,
+/// rather than by matching the title back against a table. Titles are no longer
+/// unique once plugins can contribute them — two plugins may reasonably both
+/// offer "Copy hash" — and a lookup by title would run whichever came first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invoke {
+    Builtin(CommandId),
+    Plugin(crate::plugins::Ref),
+}
+
+/// One palette row, from either source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub invoke: Invoke,
+    pub title: String,
+    /// The shortcut for a built-in; the plugin's name for a plugin command, so
+    /// it is always visible whose command it is.
+    pub hint: String,
+}
+
+/// The palette's full list: everything built in, then everything installed.
+///
+/// Built-ins first because they are what a user expects to find, and their
+/// order is deliberate. Plugin entries keep the order [`crate::plugins`]
+/// produced, which is by plugin id and then by manifest.
+pub fn catalogue(plugins: &[(crate::plugins::Ref, String, String)]) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = ALL
+        .iter()
+        .map(|c| Entry {
+            invoke: Invoke::Builtin(c.id),
+            title: c.title.to_owned(),
+            hint: c.hint.to_owned(),
+        })
+        .collect();
+
+    entries.extend(plugins.iter().map(|(reference, title, plugin_name)| Entry {
+        invoke: Invoke::Plugin(reference.clone()),
+        title: title.clone(),
+        hint: plugin_name.clone(),
+    }));
+
+    entries
+}
 
 #[cfg(test)]
 mod tests {
@@ -167,6 +231,44 @@ mod tests {
                 assert_ne!(a.title, b.title, "duplicate title: {}", a.title);
             }
         }
+    }
+
+    #[test]
+    fn the_catalogue_starts_with_the_builtins_and_appends_plugins() {
+        let plugins = vec![(
+            crate::plugins::Ref { plugin: "hash".into(), command: "sha256".into() },
+            "Copy SHA-256".to_owned(),
+            "Checksums".to_owned(),
+        )];
+        let entries = catalogue(&plugins);
+
+        assert_eq!(entries.len(), ALL.len() + 1);
+        assert_eq!(entries[0].invoke, Invoke::Builtin(ALL[0].id));
+        let last = entries.last().unwrap();
+        assert_eq!(last.title, "Copy SHA-256");
+        // The plugin's name occupies the hint column, where a built-in shows
+        // its shortcut — so a plugin row always says where it came from.
+        assert_eq!(last.hint, "Checksums");
+    }
+
+    #[test]
+    fn two_plugins_may_offer_the_same_title_without_becoming_one_entry() {
+        // The reason rows resolve by position rather than by title.
+        let plugins = vec![
+            (
+                crate::plugins::Ref { plugin: "a".into(), command: "go".into() },
+                "Copy hash".to_owned(),
+                "A".to_owned(),
+            ),
+            (
+                crate::plugins::Ref { plugin: "b".into(), command: "go".into() },
+                "Copy hash".to_owned(),
+                "B".to_owned(),
+            ),
+        ];
+        let entries = catalogue(&plugins);
+        assert_eq!(entries.len(), ALL.len() + 2);
+        assert_ne!(entries[ALL.len()].invoke, entries[ALL.len() + 1].invoke);
     }
 
     #[test]

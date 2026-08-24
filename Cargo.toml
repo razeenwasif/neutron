@@ -9,6 +9,7 @@ members = [
     "crates/neutron-shell",
     "crates/neutron-cloud",
     "crates/neutron-archive",
+    "crates/neutron-plugin",
     "crates/neutron-indexer",
     "xtask",
 ]
@@ -26,6 +27,7 @@ default-members = [
     "crates/neutron-shell",
     "crates/neutron-cloud",
     "crates/neutron-archive",
+    "crates/neutron-plugin",
     "crates/neutron-indexer",
 ]
 
@@ -44,6 +46,7 @@ neutron-fuzzy = { path = "crates/neutron-fuzzy" }
 neutron-index = { path = "crates/neutron-index" }
 neutron-shell = { path = "crates/neutron-shell" }
 neutron-archive = { path = "crates/neutron-archive" }
+neutron-plugin = { path = "crates/neutron-plugin" }
 neutron-cloud = { path = "crates/neutron-cloud" }
 
 # --- ui ---

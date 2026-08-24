@@ -29,6 +29,7 @@ mod index_client;
 mod loader;
 mod preview;
 mod panes;
+mod plugins;
 mod sidebar;
 mod startup;
 mod workspace;

@@ -80,6 +80,10 @@ enum Action {
     CompressSelection,
     /// Stop the archive job that is running.
     CancelArchiveJob,
+    /// Stop the plugin command that is running.
+    CancelPluginCommand,
+    /// Re-read the plugins folder.
+    ReloadPlugins,
     /// Put the selection on the clipboard. `cut` marks it for a move.
     Clip { cut: bool },
     /// Paste whatever is on the clipboard into the focused tab's folder.
@@ -180,6 +184,15 @@ pub struct NeutronApp {
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
 
+    /// Installed plugins, and the command running from one if any.
+    plugins: crate::plugins::PluginRuntime,
+    /// The palette's list: built-in commands plus whatever the plugins declared.
+    ///
+    /// Built once rather than per keystroke, and rebuilt when the plugin set is
+    /// re-read. The built-in half is `&'static` data being copied into owned
+    /// strings, which is the price of the two sources sharing one list.
+    palette: Vec<commands::Entry>,
+
     /// The archive job that is running, if any, and what it last reported.
     archive_job: Option<crate::archive_ops::ArchiveJob>,
     /// What the last finished job did, shown until the next one starts.
@@ -278,6 +291,11 @@ impl NeutronApp {
         // the window never appeared at all.
         let places_rx = spawn_places_discovery(cc.egui_ctx.clone());
 
+        // Reads manifests and nothing else — no plugin runs until a command
+        // is chosen — so this is a directory listing on the startup path.
+        let plugins = crate::plugins::PluginRuntime::load();
+        let palette = commands::catalogue(&plugins.palette_entries());
+
         let mut workspace = Self::initial_workspace(cc, start_path);
         let mut loader = Loader::spawn(cc.egui_ctx.clone());
         let sta = neutron_shell::sta::StaPool::spawn();
@@ -351,6 +369,8 @@ impl NeutronApp {
             drive_state,
             drive_tx,
             drive_rx,
+            plugins,
+            palette,
             archive_job: None,
             archive_note: None,
             watchers: std::collections::HashMap::new(),
@@ -563,6 +583,12 @@ impl NeutronApp {
                 if let Some(job) = self.archive_job.as_ref() {
                     job.cancel();
                 }
+            }
+            Action::CancelPluginCommand => self.plugins.cancel(),
+            Action::ReloadPlugins => {
+                self.plugins.reload();
+                self.palette = commands::catalogue(&self.plugins.palette_entries());
+                self.refresh_finder();
             }
             Action::TogglePreview => {
                 self.preview.open = !self.preview.open;
@@ -1075,10 +1101,17 @@ impl NeutronApp {
         let tab = self.workspace.tabs.get(&tab_id)?;
         let dir = tab.location().as_path()?.to_path_buf();
 
-        let paths: Vec<PathBuf> = tab
-            .selection
-            .iter()
-            .filter(|&i| i < tab.list.len())
+        // Sorted into the order the rows appear in, because the selection is a
+        // set and iterating it directly gives a different order every run. That
+        // order is visible: it decides the order files go into a zip, onto the
+        // clipboard, and into a plugin's request — and a plugin writing a file
+        // per selected item would produce a differently-ordered file each time
+        // from the same selection.
+        let mut selected: Vec<usize> = tab.selection.iter().filter(|&i| i < tab.list.len()).collect();
+        selected.sort_by_key(|&i| tab.list.rank(i).unwrap_or(usize::MAX));
+
+        let paths: Vec<PathBuf> = selected
+            .into_iter()
             .map(|i| dir.join(tab.list.name(i)))
             .collect();
 
@@ -1382,7 +1415,18 @@ impl NeutronApp {
     /// Draws the open context menu and answers the thread waiting on it.
     fn context_menu_overlay(&mut self, ctx: &egui::Context, p: &neutron_ui::Palette) {
         while let Ok(pending) = self.menu_rx.try_recv() {
-            self.menu = Some(neutron_ui::MenuState::new(pending.items, pending.pos));
+            // Plugin rows are appended here rather than on the apartment
+            // thread: this is the side that knows what is installed, and it is
+            // also where the ids handed out have to be remembered.
+            let mut items = pending.items;
+            let has_selection = self.selection_paths().is_some();
+            let rows = self.plugins.menu_rows(has_selection);
+            if !rows.is_empty() {
+                items.push(neutron_core::MenuItem::separator());
+                items.extend(rows);
+            }
+
+            self.menu = Some(neutron_ui::MenuState::new(items, pending.pos));
             // Replaces any previous reply sender, which releases the thread
             // parked on it as dismissed.
             self.menu_reply = Some(pending.reply);
@@ -1399,8 +1443,23 @@ impl NeutronApp {
         };
 
         self.menu = None;
+
+        // A plugin row's id means nothing to the shell — handing it to
+        // `InvokeCommand` would invoke an unrelated verb. So the apartment
+        // thread is told the menu was dismissed, and the command runs here.
+        let plugin = answer.and_then(|id| self.plugins.menu_choice(id));
+        let for_shell = match plugin {
+            Some(_) => None,
+            None => answer,
+        };
+
         if let Some(reply) = self.menu_reply.take() {
-            let _ = reply.send(answer);
+            let _ = reply.send(for_shell);
+        }
+
+        if let Some(reference) = plugin {
+            let ctx = ctx.clone();
+            self.run_plugin(&ctx, &reference);
         }
     }
 
@@ -1517,6 +1576,7 @@ impl eframe::App for NeutronApp {
         // Before drawing: installs icons that arrived since the last frame, so
         // rows painted below pick them up immediately rather than a frame late.
         self.pump_archive_job();
+        self.pump_plugin(&ctx);
         self.sync_watchers(&ctx);
         self.drain_changes();
         self.pump_preview(&ctx);
@@ -1951,10 +2011,9 @@ impl NeutronApp {
 
         match self.finder.mode {
             crate::finder::Mode::Commands => {
-                let matched = crate::finder::match_commands(&self.finder.needle);
-                let status = format!("{} of {} commands", matched.len(), commands::ALL.len());
-                self.finder
-                    .set_rows(matched.into_iter().map(|(_, row)| row).collect(), status);
+                let matched = crate::finder::match_commands(&self.palette, &self.finder.needle);
+                let status = format!("{} of {} commands", matched.len(), self.palette.len());
+                self.finder.set_command_rows(matched, status);
             }
 
             crate::finder::Mode::Files => {
@@ -2072,13 +2131,17 @@ impl NeutronApp {
         };
 
         if mode == crate::finder::Mode::Commands {
-            // Matched by title: the row carries no id, and the catalogue is the
-            // only place ids live.
-            if let Some(command) = commands::ALL.iter().find(|c| c.title == row.primary) {
-                let id = command.id;
-                self.finder.close();
-                let ctx = self.ctx.clone();
-                self.run_command(&ctx, id);
+            // By position, through the invocation the row was built with. A
+            // lookup by title would run the wrong command as soon as two
+            // plugins offered the same one.
+            let Some(invoke) = self.finder.invoke_at(index).cloned() else {
+                return;
+            };
+            self.finder.close();
+            let ctx = self.ctx.clone();
+            match invoke {
+                commands::Invoke::Builtin(id) => self.run_command(&ctx, id),
+                commands::Invoke::Plugin(reference) => self.run_plugin(&ctx, &reference),
             }
             return;
         }
@@ -2150,6 +2213,9 @@ impl NeutronApp {
                 self.index.stop_server();
                 None
             }
+
+            C::ReloadPlugins => Some(Action::ReloadPlugins),
+            C::OpenPluginsFolder => self.plugins_folder().map(NodeId::Path).map(Action::Navigate),
 
             C::GoHome => known_folder("Home").map(Action::Navigate),
             C::GoDesktop => known_folder("Desktop").map(Action::Navigate),
@@ -2337,6 +2403,7 @@ impl NeutronApp {
                         }
 
                         self.archive_status(ui, p, actions);
+                        self.plugin_status(ui, p, actions);
                     });
                 });
             });
@@ -2481,6 +2548,96 @@ impl NeutronApp {
 
         // The folder the result landed in is watched, so the new archive or
         // folder appears on its own. Nothing to refresh here.
+    }
+
+    /// `%APPDATA%\\Neutron\\plugins`, created if it is not there yet.
+    ///
+    /// Created rather than reported missing, because the only reason to ask for
+    /// it is to put a plugin in it, and "the folder does not exist" is not a
+    /// useful answer to that.
+    fn plugins_folder(&mut self) -> Option<PathBuf> {
+        let dir = neutron_plugin::discover::plugins_dir()?;
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.plugins.note = Some(format!("could not open the plugins folder: {e}"));
+            return None;
+        }
+        Some(dir)
+    }
+
+    /// Runs a plugin command against the focused tab.
+    ///
+    /// The folder and selection are read here, at the moment the command is
+    /// chosen, rather than being carried in the action — a palette left open
+    /// while another pane is clicked would otherwise act on the wrong one.
+    fn run_plugin(&mut self, ctx: &egui::Context, reference: &crate::plugins::Ref) {
+        let Some(tab_id) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let Some(folder) = self
+            .workspace
+            .tabs
+            .get(&tab_id)
+            .and_then(|t| t.location().as_path())
+            .map(Path::to_path_buf)
+        else {
+            // A shell location with no filesystem path — This PC, Network.
+            // There is nothing to hand a plugin.
+            self.plugins.note = Some("This pane has no folder a plugin can act on".to_owned());
+            return;
+        };
+
+        let selection = self
+            .selection_paths()
+            .map(|(_, _, paths)| paths)
+            .unwrap_or_default();
+
+        self.plugins
+            .start(reference, tab_id, folder, selection, ctx);
+    }
+
+    /// Applies whatever the plugin worker reported.
+    fn pump_plugin(&mut self, ctx: &egui::Context) {
+        let Some((tab, outcome)) = self.plugins.poll() else {
+            return;
+        };
+
+        if let Some(error) = &outcome.error {
+            tracing::warn!("plugin: {error}");
+        }
+
+        // Navigation before the refresh, since navigating re-lists anyway.
+        if let Some(path) = outcome.navigate {
+            self.navigate(tab, NodeId::Path(path));
+        } else if outcome.refresh {
+            self.refresh_in_place(tab);
+        }
+
+        for path in outcome.open {
+            self.launch(path, neutron_shell::open::Verb::Open);
+        }
+
+        ctx.request_repaint();
+    }
+
+    /// The running plugin command, or what the last one said.
+    fn plugin_status(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
+        if let Some(label) = self.plugins.running_label() {
+            if ui
+                .add(egui::Button::new(egui::RichText::new("Stop").size(11.0)).small())
+                .on_hover_text("Stop this plugin command")
+                .clicked()
+            {
+                actions.push(Action::CancelPluginCommand);
+            }
+            // No percentage: the protocol has no progress, and inventing one
+            // would be a lie. A named command and a Stop is the honest amount.
+            ui.colored_label(p.accent, format!("{label}…"));
+            return;
+        }
+
+        if let Some(note) = self.plugins.note.as_ref() {
+            ui.colored_label(p.text_muted, note);
+        }
     }
 
     /// Starts and stops watchers so they match the folders tabs are showing.

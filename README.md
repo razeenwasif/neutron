@@ -256,6 +256,41 @@ without an export format.
 
 ---
 
+## Plugins
+
+A plugin is a folder under `%APPDATA%\Neutron\plugins` holding a `plugin.json`
+and a program. Its commands appear in the command palette and, if the manifest
+asks, in the right-click menu. Choosing one runs the program with the current
+folder and selection as one line of JSON on standard input, and acts on the
+lines it prints back.
+
+```json
+{"protocol":1,"command":"sha256","folder":"C:\\notes","selection":["C:\\notes\\a.txt"]}
+```
+```json
+{"type":"status","text":"1 file hashed"}
+{"type":"refresh"}
+```
+
+That is the whole interface, so a plugin can be written in anything that can
+read a line and print one — the example that ships in `examples/plugins/hashes`
+is twenty lines of PowerShell. **Open the plugins folder** in the palette
+creates the directory and takes you there; **Reload plugins** re-reads it
+without a restart, and reports the reason for anything it refused.
+
+Plugins are **separate processes**, not loaded libraries. A release build is
+`panic = "abort"`, so an in-process plugin that panics would take the window
+down with it; a child process that dies is an exit status. The host holds it to
+a deadline, drains all three of its pipes, and offers a Stop.
+
+This is **not a sandbox** — a plugin runs with your rights. What it does
+guarantee is that listing a plugin never runs it, that nothing appears in the
+palette that is not written in a file you can read, and that a plugin's output
+is treated as untrusted before it is drawn. `docs/plugins.md` has the full
+manifest reference and the rest of the protocol.
+
+---
+
 ## Privileges
 
 `neutron.exe` runs **unelevated**, deliberately. Indexing needs administrator

@@ -1808,6 +1808,7 @@ dependencies = [
  "neutron-core",
  "neutron-fuzzy",
  "neutron-index",
+ "neutron-plugin",
  "neutron-shell",
  "neutron-ui",
  "parking_lot",
@@ -1892,6 +1893,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows",
+]
+
+[[package]]
+name = "neutron-plugin"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

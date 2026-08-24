@@ -91,6 +91,12 @@ pub struct Finder {
     /// Rows the current source produced. Commands are matched in-process, so
     /// they land here directly; the two file modes fill it from the indexer.
     pub rows: Vec<Row>,
+    /// What each row runs, in command mode. Empty in the file modes.
+    ///
+    /// Kept parallel to `rows` and only ever written together with them, by
+    /// [`Finder::set_command_rows`] — a row resolved by title instead would run
+    /// the wrong command as soon as two plugins offered the same one.
+    pub invokes: Vec<crate::commands::Invoke>,
     /// Shown under the prompt — result counts, timings, or why there is
     /// nothing to show.
     pub status: String,
@@ -104,6 +110,7 @@ impl Default for Finder {
             needle: String::new(),
             cursor: 0,
             rows: Vec::new(),
+            invokes: Vec::new(),
             status: String::new(),
         }
     }
@@ -125,12 +132,14 @@ impl Finder {
         self.needle.clear();
         self.cursor = 0;
         self.rows.clear();
+        self.invokes.clear();
         self.status.clear();
     }
 
     pub fn close(&mut self) {
         self.open = false;
         self.rows.clear();
+        self.invokes.clear();
         self.needle.clear();
     }
 
@@ -147,12 +156,38 @@ impl Finder {
     }
 
     /// Replaces the rows, keeping the cursor in range.
+    ///
+    /// Clears the invocations, because rows from a file search do not run
+    /// anything — leaving stale ones would let a command row be activated from
+    /// a list that no longer contains it.
     pub fn set_rows(&mut self, rows: Vec<Row>, status: String) {
         self.rows = rows;
+        self.invokes.clear();
         self.status = status;
         if self.cursor >= self.rows.len() {
             self.cursor = 0;
         }
+    }
+
+    /// Replaces the rows in command mode, with what each one runs.
+    ///
+    /// Takes them as pairs so the two can never be set separately and drift.
+    pub fn set_command_rows(&mut self, matched: Vec<(crate::commands::Invoke, Row)>, status: String) {
+        self.rows = Vec::with_capacity(matched.len());
+        self.invokes = Vec::with_capacity(matched.len());
+        for (invoke, row) in matched {
+            self.rows.push(row);
+            self.invokes.push(invoke);
+        }
+        self.status = status;
+        if self.cursor >= self.rows.len() {
+            self.cursor = 0;
+        }
+    }
+
+    /// What the row at `index` runs, if it runs anything.
+    pub fn invoke_at(&self, index: usize) -> Option<&crate::commands::Invoke> {
+        self.invokes.get(index)
     }
 }
 
@@ -459,19 +494,27 @@ fn clipped(ui: &Ui, rect: Rect, text: &str, colour: Color32) {
 ///
 /// Commands never leave this process — there are a few dozen of them, so the
 /// round trip to the indexer would cost more than the match.
-pub fn match_commands(needle: &str) -> Vec<(usize, Row)> {
+///
+/// Each result carries what running it means rather than an index, so the
+/// catalogue can be rebuilt (a plugin reload) without a held result pointing at
+/// something else.
+pub fn match_commands(
+    catalogue: &[crate::commands::Entry],
+    needle: &str,
+) -> Vec<(crate::commands::Invoke, Row)> {
     let mut matcher = neutron_fuzzy::FuzzyMatcher::new();
-    let mut scored: Vec<(u32, usize, Row)> = crate::commands::ALL
+    let mut scored: Vec<(u32, usize, crate::commands::Invoke, Row)> = catalogue
         .iter()
         .enumerate()
-        .filter_map(|(i, command)| {
-            matcher.score(command.title, needle).map(|m| {
+        .filter_map(|(i, entry)| {
+            matcher.score(&entry.title, needle).map(|m| {
                 (
                     m.score,
                     i,
+                    entry.invoke.clone(),
                     Row {
-                        primary: command.title.to_owned(),
-                        secondary: command.hint.to_owned(),
+                        primary: entry.title.clone(),
+                        secondary: entry.hint.clone(),
                         matched: m.positions,
                         is_dir: false,
                     },
@@ -483,7 +526,7 @@ pub fn match_commands(needle: &str) -> Vec<(usize, Row)> {
     // An empty needle scores everything zero, so the catalogue's own order
     // survives — which is deliberate, since that order groups related commands.
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, i, row)| (i, row)).collect()
+    scored.into_iter().map(|(_, _, invoke, row)| (invoke, row)).collect()
 }
 
 #[cfg(test)]
@@ -566,9 +609,14 @@ mod tests {
         assert!(f.cursor < 2, "cursor {} is past the end", f.cursor);
     }
 
+    /// The built-in catalogue, with no plugins installed.
+    fn builtins() -> Vec<crate::commands::Entry> {
+        crate::commands::catalogue(&[])
+    }
+
     #[test]
     fn commands_match_fuzzily_and_report_positions() {
-        let hits = match_commands("sptr");
+        let hits = match_commands(&builtins(), "sptr");
         let first = &hits.first().expect("a match").1;
         assert_eq!(first.primary, "Split pane right");
         assert!(!first.matched.is_empty());
@@ -579,14 +627,66 @@ mod tests {
     fn an_empty_command_query_keeps_the_catalogue_order() {
         // With nothing typed the list is read, not filtered, and the catalogue
         // is grouped by what each command acts on.
-        let hits = match_commands("");
+        let hits = match_commands(&builtins(), "");
         assert_eq!(hits.len(), crate::commands::ALL.len());
         assert_eq!(hits[0].1.primary, crate::commands::ALL[0].title);
     }
 
     #[test]
     fn a_command_query_that_matches_nothing_returns_nothing() {
-        assert!(match_commands("zzzzqqq").is_empty());
+        assert!(match_commands(&builtins(), "zzzzqqq").is_empty());
+    }
+
+    #[test]
+    fn a_plugin_command_is_matched_and_carries_its_own_invocation() {
+        let plugins = vec![(
+            crate::plugins::Ref { plugin: "hash".into(), command: "sha256".into() },
+            "Copy SHA-256 of the selection".to_owned(),
+            "Checksums".to_owned(),
+        )];
+        let catalogue = crate::commands::catalogue(&plugins);
+
+        let hits = match_commands(&catalogue, "sha");
+        let (invoke, row) = hits.first().expect("the plugin command should match");
+        assert_eq!(row.primary, "Copy SHA-256 of the selection");
+        assert_eq!(
+            *invoke,
+            crate::commands::Invoke::Plugin(crate::plugins::Ref {
+                plugin: "hash".into(),
+                command: "sha256".into()
+            })
+        );
+    }
+
+    #[test]
+    fn command_rows_and_their_invocations_stay_in_step() {
+        let mut f = Finder::default();
+        let catalogue = builtins();
+        let matched = match_commands(&catalogue, "");
+        let count = matched.len();
+        f.set_command_rows(matched, String::new());
+
+        assert_eq!(f.rows.len(), count);
+        assert_eq!(f.invokes.len(), count);
+        for i in 0..count {
+            // The row at each position runs the entry whose title it shows.
+            let invoke = f.invoke_at(i).expect("every command row runs something");
+            let title = &f.rows[i].primary;
+            let entry = catalogue.iter().find(|e| &e.title == title).unwrap();
+            assert_eq!(*invoke, entry.invoke);
+        }
+    }
+
+    #[test]
+    fn switching_to_a_file_search_clears_the_invocations() {
+        // Otherwise activating row 3 of a file listing would run command 3.
+        let mut f = Finder::default();
+        f.set_command_rows(match_commands(&builtins(), ""), String::new());
+        assert!(!f.invokes.is_empty());
+
+        f.set_rows(rows(4), String::new());
+        assert!(f.invokes.is_empty());
+        assert!(f.invoke_at(0).is_none());
     }
 
     #[test]
