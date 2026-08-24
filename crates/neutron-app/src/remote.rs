@@ -68,6 +68,9 @@ impl Sessions {
         let mut refused = Vec::new();
 
         let entries = self.with_session(site_id, |transport| {
+            // Cleared each attempt: a reconnect runs this a second time, and
+            // without it every refused name would be logged twice.
+            refused.clear();
             transport.list(path, &mut refused)
         })?;
 

@@ -217,6 +217,14 @@
   before the guard — a silent no-op reads as broken key handling.
 
 #### 12. Known Cost
+- **The binary grew 15.5 MiB → 19.8 MiB for the servers.** Measured, not
+  estimated: release builds of the commit before and the commit after, same
+  toolchain and same `lto = "fat"` profile. `russh` + `rustls` + `tokio` +
+  `suppaftp` are that 4.3 MiB. For contrast, archives and plugins together cost
+  0.22 MiB — plugins added no new dependency at all, being a process and a pipe.
+  Worth stating plainly against a project whose pitch includes a single ~15 MB
+  binary. Nothing is loaded until a server is opened, so start-up and idle
+  memory are unaffected.
 - The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
 
 #### 13. Test Suite
