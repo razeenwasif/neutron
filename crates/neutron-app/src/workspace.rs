@@ -376,6 +376,67 @@ pub struct PersistedWorkspace {
     /// the field is simply absent and reads as closed.
     #[serde(default)]
     pub preview: bool,
+    /// How the user had it set up: theme, hidden files, view mode, sort.
+    ///
+    /// `default` for the same reason as `preview` — a session saved by an
+    /// older build simply has no preferences in it and gets the defaults.
+    #[serde(default)]
+    pub prefs: PersistedPrefs,
+}
+
+/// The settings a session carries.
+///
+/// # Why these are global rather than per folder
+///
+/// Explorer remembers a view mode per folder, and it is one of the most
+/// complained-about things it does: a folder opens in a layout you set months
+/// ago for a reason you no longer remember, and there is no way to see the rule
+/// you are subject to. One setting that means what it says is easier to live
+/// with than several hundred you cannot enumerate.
+///
+/// So these are taken from the focused tab when the session is saved and
+/// applied to every tab when it is restored.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedPrefs {
+    /// `true` for light. Named for the value rather than the enum so the JSON
+    /// stays readable to a human editing it.
+    #[serde(default)]
+    pub light_theme: bool,
+    #[serde(default)]
+    pub show_hidden: bool,
+    #[serde(default)]
+    pub grid: bool,
+    /// One of `name`, `size`, `modified`, `created`, `kind`. An unknown value
+    /// reads as `name` rather than failing the whole session.
+    #[serde(default)]
+    pub sort: String,
+    #[serde(default)]
+    pub descending: bool,
+}
+
+impl PersistedPrefs {
+    pub fn column(&self) -> neutron_core::SortColumn {
+        use neutron_core::SortColumn as C;
+        match self.sort.as_str() {
+            "size" => C::Size,
+            "modified" => C::Modified,
+            "created" => C::Created,
+            "kind" => C::Kind,
+            _ => C::Name,
+        }
+    }
+
+    pub fn set_column(&mut self, column: neutron_core::SortColumn) {
+        use neutron_core::SortColumn as C;
+        self.sort = match column {
+            C::Name => "name",
+            C::Size => "size",
+            C::Modified => "modified",
+            C::Created => "created",
+            C::Kind => "kind",
+        }
+        .to_owned();
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -473,7 +534,44 @@ impl Workspace {
             // know it exists — but it rides in the same snapshot, because a
             // second saved file for one boolean would be worse.
             preview: false,
+            // Taken from the focused tab: it is the one the user was actually
+            // looking at when they set things how they wanted them. The theme
+            // is filled in by the caller, for the same reason as `preview`.
+            prefs: self.prefs(),
         }
+    }
+
+    /// View settings for a tab about to be opened.
+    ///
+    /// Inherited from the focused tab, minus everything that belongs to *that*
+    /// tab rather than to the user's preference: the filter it is narrowed by
+    /// and where it is scrolled to. Without this, `Ctrl+T` in a grid opens a
+    /// list, and showing hidden files has to be turned on again per tab.
+    pub fn view_for_new_tab(&self) -> FileListState {
+        let Some(tab) = self.active_tab() else {
+            return FileListState::default();
+        };
+        let mut view = FileListState::default();
+        view.sort = tab.view.sort;
+        view.show_hidden = tab.view.show_hidden;
+        view.view = tab.view.view;
+        view
+    }
+
+    /// The focused tab's view settings, for saving.
+    fn prefs(&self) -> PersistedPrefs {
+        let Some(tab) = self.active_tab() else {
+            return PersistedPrefs::default();
+        };
+        let mut prefs = PersistedPrefs {
+            light_theme: false,
+            show_hidden: tab.view.show_hidden,
+            grid: tab.view.view == neutron_ui::file_list::ViewMode::Grid,
+            sort: String::new(),
+            descending: tab.view.sort.order == neutron_core::SortOrder::Descending,
+        };
+        prefs.set_column(tab.view.sort.column);
+        prefs
     }
 
     /// Rebuilds a workspace from a snapshot, or `None` if it is unusable.
@@ -530,6 +628,29 @@ impl Workspace {
             if let Some(g) = ws.groups.get_mut(&gid) {
                 g.active = pane.active.min(g.tabs.len().saturating_sub(1));
             }
+        }
+
+        // Every tab gets the saved view settings. Applied here, after the tabs
+        // exist, rather than threaded through `open_tab` — a tab created later
+        // by the user picks them up from the focused tab it is opened beside.
+        let sort = neutron_core::SortSpec {
+            column: saved.prefs.column(),
+            order: if saved.prefs.descending {
+                neutron_core::SortOrder::Descending
+            } else {
+                neutron_core::SortOrder::Ascending
+            },
+            ..Default::default()
+        };
+        let mode = if saved.prefs.grid {
+            neutron_ui::file_list::ViewMode::Grid
+        } else {
+            neutron_ui::file_list::ViewMode::List
+        };
+        for tab in ws.tabs.values_mut() {
+            tab.view.sort = sort;
+            tab.view.show_hidden = saved.prefs.show_hidden;
+            tab.view.view = mode;
         }
 
         // Drop any pane that ended up with no tabs, so a partially-restorable
@@ -648,6 +769,91 @@ mod tests {
         Workspace::new(NodeId::path("/start"))
     }
 
+    /// A workspace whose focused tab is set up the way a user might leave it.
+    fn configured() -> Workspace {
+        let mut w = ws();
+        let tab = w.active_tab_mut().expect("a tab");
+        tab.view.show_hidden = true;
+        tab.view.view = neutron_ui::file_list::ViewMode::Grid;
+        tab.view.sort = neutron_core::SortSpec {
+            column: neutron_core::SortColumn::Modified,
+            order: neutron_core::SortOrder::Descending,
+            ..Default::default()
+        };
+        w
+    }
+
+    #[test]
+    fn how_the_user_had_it_set_up_survives_a_restart() {
+        // Theme aside, this is the whole of "it opens the way I left it".
+        let saved = configured().persist();
+        assert!(saved.prefs.show_hidden);
+        assert!(saved.prefs.grid);
+        assert_eq!(saved.prefs.sort, "modified");
+        assert!(saved.prefs.descending);
+
+        let restored = Workspace::restore(&saved).expect("should restore");
+        let view = &restored.active_tab().expect("a tab").view;
+        assert!(view.show_hidden);
+        assert_eq!(view.view, neutron_ui::file_list::ViewMode::Grid);
+        assert_eq!(view.sort.column, neutron_core::SortColumn::Modified);
+        assert_eq!(view.sort.order, neutron_core::SortOrder::Descending);
+    }
+
+    #[test]
+    fn every_restored_tab_gets_the_saved_settings() {
+        // Not just the focused one — a session where half the tabs are in the
+        // wrong view mode is worse than one that forgot entirely.
+        let mut w = ws();
+        let group = w.focused_group().expect("a group").id;
+        w.open_tab(group, NodeId::path("/second"), FileListState::default());
+        w.split(Axis::Horizontal);
+        // Configured last, on whichever tab ended up focused — which is the
+        // one the user would have been looking at when they set it.
+        let tab = w.active_tab_mut().expect("a tab");
+        tab.view.show_hidden = true;
+        tab.view.view = neutron_ui::file_list::ViewMode::Grid;
+
+        let restored = Workspace::restore(&w.persist()).expect("should restore");
+        assert!(restored.tabs.len() >= 3);
+        for tab in restored.tabs.values() {
+            assert!(tab.view.show_hidden, "a tab restored with hidden files off");
+            assert_eq!(tab.view.view, neutron_ui::file_list::ViewMode::Grid);
+        }
+    }
+
+    #[test]
+    fn a_session_saved_before_preferences_existed_still_restores() {
+        // The field is simply absent, and absent has to mean "the defaults"
+        // rather than "refuse to open".
+        let json = r#"{"panes":[{"tabs":["/only"],"active":0}],"splits":[],"focused":0}"#;
+        let saved: PersistedWorkspace = serde_json::from_str(json).expect("should parse");
+        assert_eq!(saved.prefs, PersistedPrefs::default());
+        assert!(Workspace::restore(&saved).is_some());
+    }
+
+    #[test]
+    fn an_unknown_sort_column_reads_as_name_rather_than_failing() {
+        // Someone editing the file by hand, or a column that a later build
+        // added and this one does not know.
+        let prefs = PersistedPrefs { sort: "colour".into(), ..PersistedPrefs::default() };
+        assert_eq!(prefs.column(), neutron_core::SortColumn::Name);
+    }
+
+    #[test]
+    fn a_new_tab_inherits_the_view_but_not_the_filter() {
+        // Ctrl+T in a grid should open a grid. It should *not* open already
+        // narrowed by whatever the previous tab was searching for.
+        let mut w = configured();
+        w.active_tab_mut().unwrap().view.filter = "readme".into();
+
+        let view = w.view_for_new_tab();
+        assert!(view.show_hidden);
+        assert_eq!(view.view, neutron_ui::file_list::ViewMode::Grid);
+        assert_eq!(view.sort.column, neutron_core::SortColumn::Modified);
+        assert!(view.filter.is_empty(), "the new tab arrived pre-filtered");
+    }
+
     #[test]
     fn a_new_workspace_has_one_pane_with_one_tab() {
         let w = ws();
@@ -753,6 +959,7 @@ mod tests {
             splits: Vec::new(),
             focused: 0,
             preview: false,
+            prefs: PersistedPrefs::default(),
         };
         assert!(Workspace::restore(&empty).is_none());
     }
@@ -780,6 +987,7 @@ mod tests {
             // Points at a pane that does not exist.
             focused: 7,
             preview: false,
+            prefs: PersistedPrefs::default(),
         };
         let restored = Workspace::restore(&saved).expect("should still restore");
         assert!(restored.layout.contains(restored.focused));

@@ -56,6 +56,9 @@ pub enum CommandId {
 
     ConnectServer,
     ReloadSites,
+
+    OpenTerminal,
+    NewWindow,
 }
 
 pub struct CommandDef {
@@ -154,6 +157,13 @@ pub const ALL: &[CommandDef] = &[
         title: "Reload plugins",
         hint: "",
     },
+
+    CommandDef {
+        id: CommandId::OpenTerminal,
+        title: "Open a terminal here",
+        hint: "Ctrl+`",
+    },
+    CommandDef { id: CommandId::NewWindow, title: "Open a new window", hint: "Ctrl+N" },
 
     // Saved servers. Adding one has to be a dialog rather than a file, because
     // the password belongs in Credential Manager and something has to accept it

@@ -216,7 +216,36 @@
   all refuse with a sentence rather than doing nothing, which is what they did
   before the guard — a silent no-op reads as broken key handling.
 
-#### 12. Known Cost
+#### 12. Everyday Trust
+Four things stood between Neutron and being the file manager you actually reach
+for. None of them are features; they are what makes a tool one you stop checking
+up on.
+
+- **Failures now say so.** Eleven file operations — rename, new folder, paste,
+  delete, drop, drag, clipboard, open, context menu — ended in a
+  `tracing::warn!` and *nothing on screen*. Renaming to a name that already
+  existed looked exactly like a file manager that had ignored the keystroke.
+  There is now one status line (`notice.rs`) that everything reports through.
+- **An error stays; a receipt clears itself.** Information — "3 files hashed" —
+  clears after six seconds. An error stays until it is replaced or clicked away,
+  because an error nobody saw is an error that, to the user, did not happen. The
+  log still gets everything, in full; the status bar has one line.
+- **One surface, not three.** Archives, plugins and servers had each grown a
+  private note field, and all three drew into the same corner with no answer for
+  which won. The newest thing that happened is what a person wants to see.
+- **Preferences survive a restart.** Theme, hidden files, view mode and sort
+  were reset on every launch — the session remembered which folders were open
+  and nothing about how you wanted to look at them. Now saved with the session
+  and applied to every restored tab; a new tab inherits them from the tab it was
+  opened beside, so `Ctrl+T` in a grid no longer opens a list.
+- **Show hidden files became application-wide.** It was per tab, which with no
+  per-tab indicator reads as tabs disagreeing about what is in a folder.
+- **`Ctrl+\`` opens a terminal here, `Ctrl+N` opens a second window.** Both were
+  reachable — the terminal through the shell menu, a second window by launching
+  the exe again — and neither was reachable *quickly*, which for something done
+  thirty times a day is the same as not having it.
+
+#### 13. Known Cost
 - **The binary grew 15.5 MiB → 19.8 MiB for the servers.** Measured, not
   estimated: release builds of the commit before and the commit after, same
   toolchain and same `lto = "fat"` profile. `russh` + `rustls` + `tokio` +
@@ -227,7 +256,7 @@
   memory are unaffected.
 - The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
 
-#### 13. Test Suite
+#### 14. Test Suite
 - Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`,
   `neutron-index`, `neutron-archive`, `neutron-plugin`) passing on Linux.
 - `neutron-plugin` is tested against **real child processes** — plugins that
@@ -240,5 +269,5 @@
   particular — a server presenting a *different host key* than the one recorded
   is the case host key checking exists for, and no real server can be asked to
   do that on demand.
-- Full suite on the Windows target: 572 tests, clippy clean. The FTP and SFTP
+- Full suite on the Windows target: 592 tests, clippy clean. The FTP and SFTP
   suites run there too — the fake servers are ordinary std sockets.

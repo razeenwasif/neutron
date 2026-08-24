@@ -28,6 +28,8 @@ use neutron_plugin::discover::PluginSet;
 use neutron_plugin::host::Outcome;
 use neutron_plugin::manifest::Needs;
 
+use crate::notice::Level;
+
 use crate::loader::TabId;
 
 /// First menu id used for a plugin row.
@@ -57,8 +59,11 @@ pub struct Ref {
 pub struct PluginRuntime {
     set: PluginSet,
     running: Option<Running>,
-    /// Shown in the status bar until the next command starts.
-    pub note: Option<String>,
+    /// What to say in the status bar, and whether it is a failure.
+    ///
+    /// Drained by the app into the one notice surface rather than drawn here —
+    /// see [`crate::notice`] for why there is only one line.
+    pub note: Option<(crate::notice::Level, String)>,
     /// Menu ids handed out when the current context menu was built.
     menu_refs: Vec<Ref>,
 }
@@ -102,6 +107,7 @@ impl PluginRuntime {
             n => Some(format!("{n} plugins were not loaded — run \"Reload plugins\" for why")),
         };
 
+        let note = note.map(|text| (Level::Error, text));
         PluginRuntime { set, running: None, note, menu_refs: Vec::new() }
     }
 
@@ -119,6 +125,13 @@ impl PluginRuntime {
         };
 
         let found = self.set.plugins.len();
+        // A refusal is a failure worth keeping on screen; a plain count is a
+        // receipt that can clear itself.
+        let level = if self.set.errors.is_empty() {
+            Level::Info
+        } else {
+            Level::Error
+        };
         let mut note = match found {
             0 => "No plugins installed".to_owned(),
             1 => "1 plugin loaded".to_owned(),
@@ -134,7 +147,7 @@ impl PluginRuntime {
         } else if found == previous && found > 0 {
             note.push_str(" (unchanged)");
         }
-        self.note = Some(note);
+        self.note = Some((level, note));
     }
 
     /// Every plugin command, for the command palette.
@@ -207,19 +220,19 @@ impl PluginRuntime {
         ctx: &egui::Context,
     ) {
         if self.running.is_some() {
-            self.note = Some("A plugin command is already running".to_owned());
+            self.note = Some((Level::Info, "A plugin command is already running".to_owned()));
             return;
         }
 
         let Some((plugin, command)) = self.set.find(&reference.plugin, &reference.command) else {
             // Reachable: the set was re-read while the palette was open, or the
             // folder was deleted from under it.
-            self.note = Some(format!("{} is no longer installed", reference.plugin));
+            self.note = Some((Level::Error, format!("{} is no longer installed", reference.plugin)));
             return;
         };
 
         if command.needs == Needs::Selection && selection.is_empty() {
-            self.note = Some(format!("{} needs a selection", command.title));
+            self.note = Some((Level::Info, format!("{} needs a selection", command.title)));
             return;
         }
 
@@ -256,7 +269,7 @@ impl PluginRuntime {
             Err(e) => {
                 // Out of threads. Worth saying rather than appearing to ignore
                 // the click.
-                self.note = Some(format!("could not start {label}: {e}"));
+                self.note = Some((Level::Error, format!("could not start {label}: {e}")));
             }
         }
     }
@@ -281,11 +294,11 @@ impl PluginRuntime {
         let Running { label, tab, .. } = self.running.take()?;
 
         self.note = Some(match (&outcome.error, &outcome.status) {
-            (Some(error), _) => format!("{label} — {error}"),
-            (None, Some(status)) => format!("{label} — {status}"),
+            (Some(error), _) => (Level::Error, format!("{label} — {error}")),
+            (None, Some(status)) => (Level::Info, format!("{label} — {status}")),
             // Succeeded and said nothing. Silence reads as a broken menu
             // entry, so the host speaks for it.
-            (None, None) => format!("{label} — done"),
+            (None, None) => (Level::Info, format!("{label} — done")),
         });
 
         Some((tab, outcome))

@@ -11,6 +11,8 @@ crossbeam-channel.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-core.workspace = true

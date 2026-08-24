@@ -256,6 +256,22 @@ without an export format.
 
 ---
 
+## When something fails
+
+Every file operation that can fail says so, in one line at the right of the
+status bar. An **error stays there** until it is replaced or clicked away; a
+receipt — "3 files hashed" — clears itself after a few seconds. The log gets
+everything in full, because some failures have paragraphs behind them and the
+status bar has one line.
+
+This is not a small thing. Before it existed, eleven operations — rename, new
+folder, paste, delete, drop, drag, clipboard, open, context menu — ended in a
+log line and nothing on screen, so a rename that failed looked exactly like a
+file manager that had ignored the keystroke. A tool that fails silently is one
+you check with a second tool afterwards, and then you are using the second one.
+
+---
+
 ## Servers
 
 FTP, FTPS and SFTP servers appear in the sidebar under **Servers** and open like
@@ -360,6 +376,8 @@ do not.
 | `Alt+←` `Alt+→` | Back / forward |
 | *type a name* | Jump to it; repeat a letter to cycle matches |
 | `Ctrl+A` | Select all |
+| `Ctrl+N` | Open a second window here |
+| ``Ctrl+` `` | Open a terminal here — see `docs/terminal.md` |
 | `Ctrl+H` | Show hidden files |
 | `Ctrl+F` | Filter the current listing (`Esc` clears it) |
 | `Ctrl+Shift+F` | Search every volume (arrows move, `Enter` opens, `Esc` closes) |

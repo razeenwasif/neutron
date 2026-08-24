@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use neutron_core::places::Place;
 use neutron_core::{Axis, EntryList, GroupId, NodeId, SelectMode, SortColumn};
-use neutron_ui::file_list::{self, FileListAction, FileListState};
+use neutron_ui::file_list::{self, FileListAction};
 use neutron_ui::theme::{self, GUTTER, Palette, ThemeMode};
 
 use crate::header;
@@ -95,6 +95,12 @@ enum Action {
     ReloadSites,
     /// Stop the download that is running.
     CancelDownload,
+    /// Clear the status line.
+    DismissNotice,
+    /// Open a terminal at the focused tab's folder.
+    OpenTerminal,
+    /// Open another Neutron window on the focused tab's folder.
+    NewWindow,
     /// Re-read the plugins folder.
     ReloadPlugins,
     /// Put the selection on the clipboard. `cut` marks it for a move.
@@ -140,6 +146,17 @@ enum Action {
     BeginTabDrag(TabDrag),
     DropTab(GroupId),
     EndTabDrag,
+}
+
+/// Sends a failure from a worker to the one status line.
+///
+/// A free function rather than a method: it is called from inside the closures
+/// handed to the apartment pool, which may not touch application state at all.
+/// A disconnected channel means the window has gone, so the log is the only
+/// place left for it — which is where it goes.
+fn report(to: &crossbeam_channel::Sender<(crate::notice::Level, String)>, text: String) {
+    tracing::warn!("{text}");
+    let _ = to.send((crate::notice::Level::Error, text));
 }
 
 /// A remote file being fetched so it can be opened.
@@ -207,6 +224,16 @@ pub struct NeutronApp {
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
 
+    /// The one line that says what just happened. See [`crate::notice`].
+    notices: crate::notice::Notices,
+    /// Failures reported from workers, which may not touch application state.
+    ///
+    /// Almost every file operation runs on an apartment thread, so almost every
+    /// failure arrives from one. Without this they could only be logged, which
+    /// is where they all used to go.
+    notice_tx: crossbeam_channel::Sender<(crate::notice::Level, String)>,
+    notice_rx: crossbeam_channel::Receiver<(crate::notice::Level, String)>,
+
     /// Saved servers, for the sidebar and the dialog. The live connections
     /// live on the loader thread; this is only the list.
     sites: neutron_remote::Sites,
@@ -216,8 +243,6 @@ pub struct NeutronApp {
     connect: crate::connect::ConnectDialog,
     /// A remote file being fetched so it can be opened.
     download: Option<DownloadJob>,
-    /// What the last remote operation said, shown until the next one.
-    remote_note: Option<String>,
 
     /// Installed plugins, and the command running from one if any.
     plugins: crate::plugins::PluginRuntime,
@@ -230,8 +255,6 @@ pub struct NeutronApp {
 
     /// The archive job that is running, if any, and what it last reported.
     archive_job: Option<crate::archive_ops::ArchiveJob>,
-    /// What the last finished job did, shown until the next one starts.
-    archive_note: Option<String>,
 
     /// Directory watchers, one per distinct folder on screen.
     ///
@@ -306,7 +329,13 @@ impl NeutronApp {
     ) -> Self {
         startup.mark_gpu_ready();
 
-        let theme_mode = ThemeMode::default();
+        // Read before the first paint, so a light-theme session does not open
+        // dark and flip a frame later.
+        let theme_mode = if saved_prefs(cc).light_theme {
+            ThemeMode::Light
+        } else {
+            ThemeMode::Dark
+        };
         theme::apply(&cc.egui_ctx, theme_mode);
 
         let hwnd = window_handle(cc);
@@ -345,6 +374,7 @@ impl NeutronApp {
         let mut loader = Loader::spawn(cc.egui_ctx.clone());
         let sta = neutron_shell::sta::StaPool::spawn();
         let icons = IconService::new(sta.clone(), cc.egui_ctx.clone());
+        let (notice_tx, notice_rx) = crossbeam_channel::unbounded();
         let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
         let (open_as_tx, open_as_rx) = crossbeam_channel::unbounded();
         let (drive_tx, drive_rx) = crossbeam_channel::unbounded();
@@ -414,15 +444,16 @@ impl NeutronApp {
             drive_state,
             drive_tx,
             drive_rx,
+            notices: crate::notice::Notices::default(),
+            notice_tx,
+            notice_rx,
             sites,
             sites_error,
             connect: crate::connect::ConnectDialog::default(),
             download: None,
-            remote_note: None,
             plugins,
             palette,
             archive_job: None,
-            archive_note: None,
             watchers: std::collections::HashMap::new(),
             changed_tx,
             changed_rx,
@@ -661,6 +692,9 @@ impl NeutronApp {
             }
             Action::SubmitConnect => self.submit_connect(),
             Action::ReloadSites => self.reload_sites(),
+            Action::DismissNotice => self.notices.dismiss(),
+            Action::OpenTerminal => self.open_terminal(),
+            Action::NewWindow => self.new_window(),
             Action::CancelDownload => {
                 if let Some(job) = self.download.as_ref() {
                     job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -726,9 +760,18 @@ impl NeutronApp {
             }
 
             Action::ToggleHidden => {
-                if let Some(t) = self.workspace.active_tab_mut() {
-                    t.view.show_hidden = !t.view.show_hidden;
-                    t.refilter();
+                // Every tab, not just the focused one. "Show hidden files" is
+                // an answer to "what do I want to see", not a property of one
+                // folder — and with no per-tab indicator, having it on in one
+                // tab and off in the next reads as tabs showing different
+                // contents for no reason.
+                let show = self
+                    .workspace
+                    .active_tab()
+                    .is_some_and(|t| !t.view.show_hidden);
+                for tab in self.workspace.tabs.values_mut() {
+                    tab.view.show_hidden = show;
+                    tab.refilter();
                 }
             }
 
@@ -875,9 +918,8 @@ impl NeutronApp {
                             neutron_shell::places::home().unwrap_or_else(|| PathBuf::from(r"C:\")),
                         )
                     });
-                let tab =
-                    self.workspace
-                        .open_tab(group, location.clone(), FileListState::default());
+                let view = self.workspace.view_for_new_tab();
+                let tab = self.workspace.open_tab(group, location.clone(), view);
                 self.workspace.focused = group;
                 tracing::debug!(?group, ?tab, tabs = self.workspace.tabs.len(), "new tab");
                 self.reload(tab, location);
@@ -972,7 +1014,7 @@ impl NeutronApp {
             let (site, dir) = (site.to_owned(), dir.to_owned());
             let container = kind.is_container();
             let Ok(full) = neutron_remote::path::join(&dir, &name) else {
-                self.remote_note = Some(format!("{name} is not a name this can open"));
+                self.notices.error(format!("{name} is not a name this can open"));
                 return;
             };
             if container {
@@ -1041,6 +1083,7 @@ impl NeutronApp {
         let done = self.refresh_tx.clone();
 
         tracing::info!(count = paths.len(), "dragging out");
+        let notices = self.notice_tx.clone();
         self.sta.submit(move || {
             match neutron_shell::dragout::drag(&paths, owner) {
                 // Re-listed after any completed drop, not only after a move.
@@ -1051,7 +1094,7 @@ impl NeutronApp {
                     let _ = done.send(tab_id);
                 }
                 Ok(neutron_shell::dragout::Dropped::Cancelled) => {}
-                Err(e) => tracing::warn!("drag failed: {e}"),
+                Err(e) => report(&notices, format!("Drag failed: {e}")),
             }
             wake.request_repaint();
         });
@@ -1123,7 +1166,7 @@ impl NeutronApp {
             return;
         }
         if let Some(reason) = neutron_core::naming::rejection(&text) {
-            tracing::warn!("rename refused: {reason}");
+            self.notices.error(format!("Cannot rename to {text:?}: {reason}"));
             return;
         }
 
@@ -1138,15 +1181,34 @@ impl NeutronApp {
         };
         let from = dir.join(&edit.original);
 
+        // The commonest rename mistake, answered here rather than by the shell.
+        // `IFileOperation` reports a collision as `0x80070057: The parameter is
+        // incorrect` in a modal dialog, which tells the user nothing about what
+        // they did or how to fix it.
+        //
+        // Only when the *name* differs by more than case: `README.md` to
+        // `readme.md` is a real rename that Windows reports as already
+        // existing, because on this filesystem it is the same file.
+        // `to_lowercase` rather than `eq_ignore_ascii_case`: a name differing
+        // only in the case of a non-ASCII letter is the same rename, and
+        // refusing it would be a bug nobody could work around.
+        let same_file_different_case = text.to_lowercase() == edit.original.to_lowercase();
+        if !same_file_different_case && dir.join(&text).exists() {
+            self.notices
+                .error(format!("{text} is already here — pick another name"));
+            return;
+        }
+
         let owner = self.hwnd.unwrap_or(0);
         let wake = self.ctx.clone();
         let done = self.refresh_tx.clone();
         let tab = edit.tab;
 
         tracing::info!(from = %from.display(), to = %text, "rename");
+        let notices = self.notice_tx.clone();
         self.sta.submit(move || {
             if let Err(e) = neutron_shell::fileops::rename(&from, &text, owner) {
-                tracing::warn!("rename failed: {e}");
+                report(&notices, format!("Could not rename to {text:?}: {e}"));
             }
             let _ = done.send(tab);
             wake.request_repaint();
@@ -1173,6 +1235,7 @@ impl NeutronApp {
         let done = self.refresh_tx.clone();
         let created = self.created_tx.clone();
 
+        let notices = self.notice_tx.clone();
         self.sta.submit(move || {
             match neutron_shell::fileops::create_folder(&dir, owner) {
                 // The name is reported so the row can be found once the listing
@@ -1181,7 +1244,7 @@ impl NeutronApp {
                 Ok(name) => {
                     let _ = created.send((tab_id, name));
                 }
-                Err(e) => tracing::warn!("could not create folder: {e}"),
+                Err(e) => report(&notices, format!("Could not create a folder here: {e}")),
             }
             let _ = done.send(tab_id);
             wake.request_repaint();
@@ -1264,9 +1327,10 @@ impl NeutronApp {
         let failed = self.clip_fail_tx.clone();
 
         tracing::info!(count = paths.len(), ?how, "clipboard");
+        let notices = self.notice_tx.clone();
         self.sta.submit(move || {
             if let Err(e) = neutron_shell::clipboard::write(&paths, how) {
-                tracing::warn!("clipboard write failed: {e}");
+                report(&notices, format!("Could not put that on the clipboard: {e}"));
                 let _ = failed.send(());
             }
             wake.request_repaint();
@@ -1348,19 +1412,23 @@ impl NeutronApp {
         let wake = self.ctx.clone();
         let done = self.refresh_tx.clone();
 
+        let notices = self.notice_tx.clone();
         self.sta.submit(move || {
             let Some((paths, how)) = neutron_shell::clipboard::read() else {
                 tracing::debug!("nothing on the clipboard to paste");
                 return;
             };
             if !neutron_shell::clipboard::can_paste_into(&paths, &dir) {
-                tracing::warn!("refusing to paste a folder into itself");
+                report(
+                    &notices,
+                    "Cannot paste a folder into itself".to_owned(),
+                );
                 return;
             }
 
             tracing::info!(count = paths.len(), ?how, dest = %dir.display(), "paste");
             if let Err(e) = neutron_shell::fileops::transfer(&paths, &dir, how, owner) {
-                tracing::warn!("paste failed: {e}");
+                report(&notices, format!("Paste failed: {e}"));
             }
             let _ = done.send(tab_id);
             wake.request_repaint();
@@ -1389,9 +1457,10 @@ impl NeutronApp {
         let done = self.refresh_tx.clone();
 
         tracing::info!(count = paths.len(), ?disposal, "deleting");
+        let notices = self.notice_tx.clone();
         self.sta.submit(move || {
             if let Err(e) = neutron_shell::fileops::delete(&paths, disposal, owner) {
-                tracing::warn!("delete failed: {e}");
+                report(&notices, format!("Delete failed: {e}"));
             }
             // Refresh regardless of the outcome, for the reason above.
             let _ = done.send(tab_id);
@@ -1433,9 +1502,10 @@ impl NeutronApp {
         let done = self.refresh_tx.clone();
 
         tracing::info!(count = paths.len(), ?how, dest = %dir.display(), "drop");
+        let notices = self.notice_tx.clone();
         self.sta.submit(move || {
             if let Err(e) = neutron_shell::fileops::transfer(&paths, &dir, how, owner) {
-                tracing::warn!("drop failed: {e}");
+                report(&notices, format!("Could not copy those files here: {e}"));
             }
             let _ = done.send(tab_id);
             wake.request_repaint();
@@ -1496,6 +1566,7 @@ impl NeutronApp {
         let done = self.refresh_tx.clone();
         let offer = self.menu_tx.clone();
 
+        let notices = self.notice_tx.clone();
         self.sta.submit(move || {
             // Blocks this apartment for as long as the menu is open. The UI
             // thread keeps painting — that is the entire reason it is here.
@@ -1519,7 +1590,7 @@ impl NeutronApp {
                 neutron_shell::menu::open(&paths, present)
             };
             if let Err(e) = result {
-                tracing::warn!("context menu: {e}");
+                report(&notices, format!("The context menu could not be built: {e}"));
             }
             // The command may have renamed, deleted, or created something.
             // There is no way to know which, so re-list unconditionally.
@@ -1587,12 +1658,13 @@ impl NeutronApp {
     /// on a network or cloud path can block for many seconds.
     fn launch(&self, path: PathBuf, verb: neutron_shell::open::Verb) {
         let owner = self.hwnd.unwrap_or(0);
+        let notices = self.notice_tx.clone();
         self.sta.submit(move || {
             if let Err(e) = neutron_shell::open::shell_execute(&path, verb, owner) {
-                // Nothing is shown to the user yet. A toast for this belongs
-                // with the rest of the error surface, which does not exist —
-                // the status bar only reports the current listing.
-                tracing::warn!(path = %path.display(), "{e}");
+                report(
+                    &notices,
+                    format!("Could not open {}: {e}", path.display()),
+                );
             }
         });
     }
@@ -1653,6 +1725,9 @@ impl eframe::App for NeutronApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let mut snapshot = self.workspace.persist();
         snapshot.preview = self.preview.open;
+        // The theme belongs to the window, not to the pane tree, so the
+        // workspace cannot fill it in itself.
+        snapshot.prefs.light_theme = self.theme_mode == ThemeMode::Light;
         if let Ok(json) = serde_json::to_string(&snapshot) {
             storage.set_string(STORAGE_KEY, json);
         }
@@ -1694,6 +1769,7 @@ impl eframe::App for NeutronApp {
         self.pump_archive_job();
         self.pump_plugin(&ctx);
         self.pump_download();
+        self.drain_notices(&ctx);
         self.sync_watchers(&ctx);
         self.drain_changes();
         self.pump_preview(&ctx);
@@ -1742,10 +1818,23 @@ impl eframe::App for NeutronApp {
 /// window rather than to the pane tree, and because a `--start-path` launch
 /// skips the workspace restore entirely but should still remember it.
 fn saved_preview_open(cc: &eframe::CreationContext<'_>) -> bool {
+    saved_session(cc).is_some_and(|saved| saved.preview)
+}
+
+/// The saved settings, or the defaults on a first run.
+///
+/// Read separately from the workspace restore because the theme has to be
+/// applied before the first paint, which happens before the pane tree is built.
+fn saved_prefs(cc: &eframe::CreationContext<'_>) -> crate::workspace::PersistedPrefs {
+    saved_session(cc).map(|saved| saved.prefs).unwrap_or_default()
+}
+
+fn saved_session(
+    cc: &eframe::CreationContext<'_>,
+) -> Option<crate::workspace::PersistedWorkspace> {
     cc.storage
         .and_then(|s| s.get_string(STORAGE_KEY))
         .and_then(|json| serde_json::from_str::<crate::workspace::PersistedWorkspace>(&json).ok())
-        .is_some_and(|saved| saved.preview)
 }
 
 /// A rename in progress.
@@ -1882,7 +1971,9 @@ impl NeutronApp {
         }
 
         if cleared_remote_note {
-            self.remote_note = None;
+            // A folder that opened is its own proof, so "Connecting…" goes.
+            // An error stays: it has still not been acknowledged.
+            self.notices.dismiss_info();
         }
 
         // Title tracks the focused tab, so the taskbar entry is identifiable
@@ -2052,7 +2143,16 @@ impl NeutronApp {
 
                 if shift {
                     bindings.push((egui::Key::N, Action::NewFolder));
+                } else {
+                    // Ctrl+N is a new window everywhere else; Ctrl+Shift+N is
+                    // a new folder in every file manager. Both conventions are
+                    // strong enough that neither can be given to the other.
+                    bindings.push((egui::Key::N, Action::NewWindow));
                 }
+
+                // Ctrl+` for the terminal, as in the editor this is most often
+                // sitting beside.
+                bindings.push((egui::Key::Backtick, Action::OpenTerminal));
 
                 if let Some(group) = self.workspace.focused_group().map(|g| g.id) {
                     bindings.push((egui::Key::T, Action::NewTab(group)));
@@ -2346,6 +2446,9 @@ impl NeutronApp {
                 None
             }
 
+            C::OpenTerminal => Some(Action::OpenTerminal),
+            C::NewWindow => Some(Action::NewWindow),
+
             C::ConnectServer => Some(Action::OpenConnect),
             C::ReloadSites => Some(Action::ReloadSites),
 
@@ -2540,6 +2643,7 @@ impl NeutronApp {
                         self.archive_status(ui, p, actions);
                         self.plugin_status(ui, p, actions);
                         self.download_status(ui, p, actions);
+                        self.notice_bar(ui, p, actions);
                     });
                 });
             });
@@ -2579,11 +2683,6 @@ impl NeutronApp {
                 )
             };
             ui.colored_label(p.accent, text);
-            return;
-        }
-
-        if let Some(note) = self.archive_note.as_ref() {
-            ui.colored_label(p.text_muted, note);
         }
     }
 
@@ -2600,7 +2699,7 @@ impl NeutronApp {
             .find(|p| neutron_archive::format_of(p).is_some())
             .cloned()
         else {
-            self.archive_note = Some("That is not an archive Neutron can open".to_owned());
+            self.notices.error("That is not an archive Neutron can open");
             return;
         };
         let Some(format) = neutron_archive::format_of(&archive) else {
@@ -2647,11 +2746,11 @@ impl NeutronApp {
         if self.archive_job.is_some() {
             // Refused rather than queued: archive work is disk-bound, so two at
             // once makes both slower, and the status bar has room for one line.
-            self.archive_note =
-                Some("Already busy with an archive — wait for it to finish".to_owned());
+            self.notices
+                .info("Already busy with an archive — wait for it to finish");
             return;
         }
-        self.archive_note = None;
+        self.notices.dismiss_info();
         self.archive_job = Some(job);
     }
 
@@ -2665,7 +2764,7 @@ impl NeutronApp {
         };
 
         self.archive_job = None;
-        self.archive_note = Some(match finished {
+        let (level, text) = match finished {
             crate::archive_ops::Finished::Done { label, summary } => {
                 if !summary.refused.is_empty() {
                     // Logged in full, summarised on screen: the status bar has
@@ -2674,13 +2773,17 @@ impl NeutronApp {
                         tracing::warn!("archive: {refusal}");
                     }
                 }
-                format!("{label} — {}", crate::archive_ops::describe(&summary))
+                (
+                    crate::notice::Level::Info,
+                    format!("{label} — {}", crate::archive_ops::describe(&summary)),
+                )
             }
-            crate::archive_ops::Finished::Failed { label, error } => {
-                tracing::warn!("{label} failed: {error}");
-                format!("{label} failed: {error}")
-            }
-        });
+            crate::archive_ops::Finished::Failed { label, error } => (
+                crate::notice::Level::Error,
+                format!("{label} failed: {error}"),
+            ),
+        };
+        self.notices.raise_reported(level, text);
 
         // The folder the result landed in is watched, so the new archive or
         // folder appears on its own. Nothing to refresh here.
@@ -2694,7 +2797,7 @@ impl NeutronApp {
     fn plugins_folder(&mut self) -> Option<PathBuf> {
         let dir = neutron_plugin::discover::plugins_dir()?;
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.plugins.note = Some(format!("could not open the plugins folder: {e}"));
+            self.notices.error(format!("Could not open the plugins folder: {e}"));
             return None;
         }
         Some(dir)
@@ -2718,7 +2821,8 @@ impl NeutronApp {
         else {
             // A shell location with no filesystem path — This PC, Network.
             // There is nothing to hand a plugin.
-            self.plugins.note = Some("This pane has no folder a plugin can act on".to_owned());
+            self.notices
+                .info("This pane has no folder a plugin can act on");
             return;
         };
 
@@ -2729,6 +2833,33 @@ impl NeutronApp {
 
         self.plugins
             .start(reference, tab_id, folder, selection, ctx);
+    }
+
+    /// Collects failures reported from workers, and clears a notice that has
+    /// run its course.
+    fn drain_notices(&mut self, ctx: &egui::Context) {
+        while let Ok((level, text)) = self.notice_rx.try_recv() {
+            match level {
+                crate::notice::Level::Error => {
+                    // Already logged where it was raised; raising it here would
+                    // log it twice.
+                    self.notices.raise_reported(level, text);
+                }
+                crate::notice::Level::Info => self.notices.info(text),
+            }
+        }
+
+        // The plugin runtime keeps its own pending message rather than holding
+        // a reference to the surface, so it is collected here.
+        if let Some((level, text)) = self.plugins.note.take() {
+            self.notices.raise_reported(level, text);
+        }
+
+        // Without this an information notice would sit there until something
+        // else happened to cause a repaint.
+        if let Some(remaining) = self.notices.tick() {
+            ctx.request_repaint_after(remaining);
+        }
     }
 
     /// Applies whatever the plugin worker reported.
@@ -2755,6 +2886,52 @@ impl NeutronApp {
         ctx.request_repaint();
     }
 
+    /// Opens a terminal at the focused tab's folder.
+    ///
+    /// Runs on an apartment thread like every other launch: creating a process
+    /// reads the registry and can block, and the frame must not.
+    fn open_terminal(&mut self) {
+        let Some(dir) = self.focused_folder("open a terminal in") else {
+            return;
+        };
+        let notices = self.notice_tx.clone();
+        self.sta.submit(move || {
+            if let Err(e) = neutron_shell::terminal::open_at(&dir) {
+                report(&notices, format!("Could not open a terminal: {e}"));
+            }
+        });
+    }
+
+    /// Opens a second Neutron window on the focused tab's folder.
+    fn new_window(&mut self) {
+        let Some(dir) = self.focused_folder("open a window on") else {
+            return;
+        };
+        let notices = self.notice_tx.clone();
+        self.sta.submit(move || {
+            if let Err(e) = neutron_shell::terminal::new_window(&dir) {
+                report(&notices, format!("Could not open a second window: {e}"));
+            }
+        });
+    }
+
+    /// The focused tab's folder, or a notice saying why there isn't one.
+    ///
+    /// "This PC", a server and a Drive folder are all real places with no path
+    /// a process can be started in, and both callers need exactly that answer.
+    fn focused_folder(&mut self, verb: &str) -> Option<PathBuf> {
+        let folder = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.location().as_path())
+            .map(Path::to_path_buf);
+        if folder.is_none() {
+            self.notices
+                .info(format!("There is no folder here to {verb}"));
+        }
+        folder
+    }
+
     /// Refuses an operation that would write to a server, and says so.
     ///
     /// Nothing here writes to a remote server yet. Every one of these
@@ -2768,7 +2945,7 @@ impl NeutronApp {
             .active_tab()
             .is_some_and(|t| matches!(t.location(), NodeId::Remote { .. }));
         if remote {
-            self.remote_note = Some(format!("Neutron cannot {what} a server yet"));
+            self.notices.info(format!("Neutron cannot {what} a server yet"));
         }
         remote
     }
@@ -2795,7 +2972,7 @@ impl NeutronApp {
         self.reload_sites();
 
         let start = site.start_path();
-        self.remote_note = Some(format!("Connecting to {}…", site.address()));
+        self.notices.info(format!("Connecting to {}…", site.address()));
         if let Some(tab) = self.workspace.active_tab_id() {
             self.navigate(tab, NodeId::remote(site.id.as_str(), start.as_str()));
         }
@@ -2808,7 +2985,7 @@ impl NeutronApp {
                 let count = sites.sites.len();
                 self.sites = sites;
                 self.sites_error = None;
-                self.remote_note = Some(match count {
+                self.notices.info(match count {
                     0 => "No servers saved".to_owned(),
                     1 => "1 server saved".to_owned(),
                     n => format!("{n} servers saved"),
@@ -2816,7 +2993,7 @@ impl NeutronApp {
             }
             Err(e) => {
                 self.sites_error = Some(e.clone());
-                self.remote_note = Some(format!("sites.json: {e}"));
+                self.notices.error(format!("sites.json: {e}"));
             }
         }
         // The loader holds the connections, so it has to hear about this too.
@@ -2830,16 +3007,16 @@ impl NeutronApp {
     /// not do — see the note in the status bar when it lands.
     fn start_download(&mut self, site_id: &str, remote_path: String, name: String) {
         if self.download.is_some() {
-            self.remote_note = Some("Already fetching a file — wait for it to finish".to_owned());
+            self.notices.info("Already fetching a file — wait for it to finish");
             return;
         }
 
         let Some(site) = self.sites.get(site_id).cloned() else {
-            self.remote_note = Some(format!("no saved server called {site_id:?}"));
+            self.notices.error(format!("No saved server called {site_id:?}"));
             return;
         };
         let Some(destination) = crate::remote::cache_path(site_id, &remote_path) else {
-            self.remote_note = Some(format!("{name} cannot be saved under that name"));
+            self.notices.error(format!("{name} cannot be saved under that name"));
             return;
         };
 
@@ -2877,7 +3054,7 @@ impl NeutronApp {
 
         match spawned {
             Ok(_) => {
-                self.remote_note = None;
+                self.notices.dismiss_info();
                 self.download = Some(DownloadJob {
                     label: format!("Fetching {name}"),
                     bytes,
@@ -2885,7 +3062,7 @@ impl NeutronApp {
                     done: rx,
                 });
             }
-            Err(e) => self.remote_note = Some(format!("could not start the download: {e}")),
+            Err(e) => self.notices.error(format!("Could not start the download: {e}")),
         }
     }
 
@@ -2905,13 +3082,10 @@ impl NeutronApp {
                 // Named as a copy, because it is one: editing it does not write
                 // back to the server, and a user who assumes otherwise loses
                 // work.
-                self.remote_note = Some(format!("{label} — opened a local copy"));
+                self.notices.info(format!("{label} — opened a local copy"));
                 self.launch(path, neutron_shell::open::Verb::Open);
             }
-            Err(reason) => {
-                tracing::warn!("{label}: {reason}");
-                self.remote_note = Some(format!("{label} — {reason}"));
-            }
+            Err(reason) => self.notices.error(format!("{label} — {reason}")),
         }
     }
 
@@ -2933,11 +3107,6 @@ impl NeutronApp {
                 p.accent,
                 format!("{} — {}", job.label, neutron_ui::format::size(Some(done))),
             );
-            return;
-        }
-
-        if let Some(note) = self.remote_note.as_ref() {
-            ui.colored_label(p.text_muted, note);
         }
     }
 
@@ -3026,6 +3195,45 @@ impl NeutronApp {
         });
     }
 
+    /// The one line that says what just happened.
+    ///
+    /// Drawn last in the right-to-left row, so it takes whatever width is left
+    /// after the running-job indicators rather than pushing them off the edge.
+    /// Clicking it dismisses it — which is the only way to clear an error, and
+    /// is why an error is drawn as something you can click.
+    fn notice_bar(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
+        let Some(notice) = self.notices.current() else {
+            return;
+        };
+
+        let error = notice.level == crate::notice::Level::Error;
+        let text = if error {
+            // The glyph survives being read out of the corner of an eye, which
+            // a sentence in a slightly different colour does not.
+            format!("⚠ {}", notice.text)
+        } else {
+            notice.text.clone()
+        };
+
+        let response = ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .color(if error { p.danger } else { p.text_muted }),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_text(if error {
+                "Click to dismiss. The full error is in the log."
+            } else {
+                "Click to dismiss"
+            });
+
+        if response.clicked() {
+            actions.push(Action::DismissNotice);
+        }
+    }
+
     /// The running plugin command, or what the last one said.
     fn plugin_status(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
         if let Some(label) = self.plugins.running_label() {
@@ -3039,11 +3247,6 @@ impl NeutronApp {
             // No percentage: the protocol has no progress, and inventing one
             // would be a lie. A named command and a Stop is the honest amount.
             ui.colored_label(p.accent, format!("{label}…"));
-            return;
-        }
-
-        if let Some(note) = self.plugins.note.as_ref() {
-            ui.colored_label(p.text_muted, note);
         }
     }
 
