@@ -40,6 +40,17 @@ struct Request {
     show_hidden: bool,
 }
 
+/// What the worker is being asked to do.
+///
+/// Remote sessions live on the worker thread — they are not `Sync`, and a
+/// connection has to be used from one thread anyway — so re-reading the saved
+/// servers has to travel down the same channel as the work, rather than being
+/// a method on the handle.
+enum Job {
+    Load(Request),
+    ReloadSites,
+}
+
 /// A finished load, ready to display.
 ///
 /// Carries no path: the `(tab, generation)` pair the result is delivered with
@@ -63,7 +74,7 @@ pub enum LoadResult {
 type Generations = Arc<Mutex<HashMap<TabId, u64>>>;
 
 pub struct Loader {
-    requests: Sender<Request>,
+    requests: Sender<Job>,
     results: Receiver<(TabId, u64, LoadResult)>,
     generations: Generations,
     next_generation: u64,
@@ -71,7 +82,7 @@ pub struct Loader {
 
 impl Loader {
     pub fn spawn(ctx: egui::Context) -> Self {
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<Request>();
+        let (req_tx, req_rx) = crossbeam_channel::unbounded::<Job>();
         let (res_tx, res_rx) = crossbeam_channel::unbounded();
         let generations: Generations = Arc::new(Mutex::new(HashMap::new()));
 
@@ -103,15 +114,23 @@ impl Loader {
 
         // Send failure means the worker thread died, which surfaces on the next
         // poll rather than panicking on the UI thread.
-        let _ = self.requests.send(Request {
+        let _ = self.requests.send(Job::Load(Request {
             tab,
             generation,
             id,
             sort,
             show_hidden,
-        });
+        }));
 
         generation
+    }
+
+    /// Tells the worker to re-read `sites.json` and drop its connections.
+    ///
+    /// Sent after the connect dialog saves a server, so the new one is
+    /// reachable without a restart.
+    pub fn reload_sites(&self) {
+        let _ = self.requests.send(Job::ReloadSites);
     }
 
     /// Drops a closed tab's bookkeeping.
@@ -132,7 +151,7 @@ impl Loader {
 }
 
 fn worker(
-    requests: Receiver<Request>,
+    requests: Receiver<Job>,
     results: Sender<(TabId, u64, LoadResult)>,
     generations: Generations,
     ctx: egui::Context,
@@ -148,8 +167,19 @@ fn worker(
     // One provider for the thread's life: it caches the access token, and a
     // fresh one per request would refresh on every listing.
     let drive = neutron_cloud::google::GoogleDrive::new();
+    // Connections to saved servers, opened on demand and kept for the thread's
+    // life. See `crate::remote` for why they live here and not in the app.
+    let mut sessions = crate::remote::Sessions::load();
 
-    while let Ok(req) = requests.recv() {
+    while let Ok(job) = requests.recv() {
+        let req = match job {
+            Job::Load(req) => req,
+            Job::ReloadSites => {
+                sessions.reload();
+                continue;
+            }
+        };
+
         // Cheapest possible staleness check: skip superseded work before
         // touching the filesystem at all.
         if is_stale(&generations, req.tab, req.generation) {
@@ -162,6 +192,11 @@ fn worker(
         // backend is asked only for the nodes it claims.
         let outcome = match &req.id {
             NodeId::Cloud { id, .. } => drive.list(id),
+            // Before the shell backend is asked: a remote path is a POSIX
+            // string and the shell would make something of it.
+            NodeId::Remote { site, path } => sessions
+                .list(site, path)
+                .map_err(neutron_core::NamespaceError::Other),
             id if shell.handles(id) => shell.enumerate(id),
             id => fs.enumerate(id),
         };

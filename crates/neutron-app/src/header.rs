@@ -388,8 +388,52 @@ fn filter_field(
 /// Elides the *left* because the tail is what identifies the location: given
 /// `C:\Users\Razeen\Projects\Neutron\crates`, dropping `C:\Users` costs nothing
 /// and dropping `Neutron\crates` costs everything.
+/// The clickable trail for a location, root-first, or `None` for a location
+/// that has no ancestors this side of a COM call.
+///
+/// Each segment carries the whole [`NodeId`] rather than a path, because a
+/// remote trail's segments are only meaningful with their site attached — half
+/// a remote crumb is a POSIX path on nothing in particular.
+fn segments(location: &NodeId) -> Option<Vec<(String, NodeId)>> {
+    match location {
+        NodeId::Path(path) => {
+            let mut segments = Vec::new();
+            let mut acc = PathBuf::new();
+            for component in path.components() {
+                acc.push(component.as_os_str());
+                // The root prints as `C:\`; trim the separator so it does not
+                // read "C:\ › Users".
+                let label = component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .trim_end_matches(['\\', '/'])
+                    .to_owned();
+                if !label.is_empty() {
+                    segments.push((label, NodeId::Path(acc.clone())));
+                }
+            }
+            (!segments.is_empty()).then_some(segments)
+        }
+
+        // The site first, then the POSIX path under it — so a remote pane says
+        // *which* server it is on, which "docs" alone does not.
+        NodeId::Remote { site, path } => {
+            let mut segments = vec![(site.to_string(), NodeId::remote(site.clone(), "/"))];
+            let mut acc = String::new();
+            for part in path.split('/').filter(|p| !p.is_empty()) {
+                acc.push('/');
+                acc.push_str(part);
+                segments.push((part.to_owned(), NodeId::remote(site.clone(), acc.as_str())));
+            }
+            Some(segments)
+        }
+
+        _ => None,
+    }
+}
+
 fn breadcrumb(ui: &mut Ui, p: &Palette, rect: Rect, location: &NodeId) -> Option<NodeId> {
-    let Some(path) = location.as_path() else {
+    let Some(segments) = segments(location) else {
         // A shell location has no path to split into ancestors — "This PC" is
         // one item, and the shell's own parent chain needs COM to walk, which
         // cannot happen while painting. The name alone is honest; the sidebar
@@ -403,26 +447,6 @@ fn breadcrumb(ui: &mut Ui, p: &Palette, rect: Rect, location: &NodeId) -> Option
         );
         return None;
     };
-
-    // (label, path) root-first, accumulating components.
-    let mut segments: Vec<(String, PathBuf)> = Vec::new();
-    let mut acc = PathBuf::new();
-    for component in path.components() {
-        acc.push(component.as_os_str());
-        // The root prints as `C:\`; trim the separator so it does not read
-        // "C:\ › Users".
-        let label = component
-            .as_os_str()
-            .to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_owned();
-        if !label.is_empty() {
-            segments.push((label, acc.clone()));
-        }
-    }
-    if segments.is_empty() {
-        return None;
-    }
 
     let font = egui::FontId::proportional(12.0);
     let chevron = 16.0;
@@ -517,7 +541,7 @@ fn breadcrumb(ui: &mut Ui, p: &Palette, rect: Rect, location: &NodeId) -> Option
                 if response.hovered() { p.text } else { p.text_muted },
             );
             if response.clicked() {
-                action = Some(NodeId::Path(target.clone()));
+                action = Some(target.clone());
             }
         }
         x += w;
@@ -530,6 +554,41 @@ fn breadcrumb(ui: &mut Ui, p: &Palette, rect: Rect, location: &NodeId) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_trail_starts_with_the_site() {
+        // "docs" alone does not say which server it is on, and a remote pane
+        // looks exactly like a local one otherwise.
+        let trail = segments(&NodeId::remote("nas", "/volume1/docs")).expect("a trail");
+        let labels: Vec<&str> = trail.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, ["nas", "volume1", "docs"]);
+    }
+
+    #[test]
+    fn every_remote_crumb_keeps_its_site() {
+        // A crumb that lost it would navigate to a POSIX path on nothing in
+        // particular.
+        let trail = segments(&NodeId::remote("nas", "/a/b")).expect("a trail");
+        for (_, target) in &trail {
+            assert_eq!(target.as_remote().map(|(site, _)| site), Some("nas"));
+        }
+        assert_eq!(trail[0].1, NodeId::remote("nas", "/"));
+        assert_eq!(trail[1].1, NodeId::remote("nas", "/a"));
+        assert_eq!(trail[2].1, NodeId::remote("nas", "/a/b"));
+    }
+
+    #[test]
+    fn a_site_root_is_a_trail_of_one() {
+        let trail = segments(&NodeId::remote("nas", "/")).expect("a trail");
+        assert_eq!(trail.len(), 1);
+        assert_eq!(trail[0].0, "nas");
+    }
+
+    #[test]
+    fn a_shell_location_has_no_trail_to_walk() {
+        // Its parent chain needs COM, which cannot happen while painting.
+        assert!(segments(&NodeId::shell("::{GUID}", "This PC")).is_none());
+    }
 
     #[test]
     fn a_short_pane_spends_its_height_on_rows() {

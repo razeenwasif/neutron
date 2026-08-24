@@ -69,3 +69,7 @@ pub mod shell_ns;
 pub mod icons;
 
 pub mod sta;
+
+/// Windows Credential Manager. One file rather than a `#[path]` pair: only the
+/// Win32 half inside it is gated, and the non-Windows stub is three functions.
+pub mod credentials;

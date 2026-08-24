@@ -1,0 +1,44 @@
+[package]
+name = "neutron-remote"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+neutron-core.workspace = true
+neutron-shell.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+# FTP. The sync API, because everything here runs on a worker thread that is
+# allowed to block — see the crate docs.
+suppaftp = { version = "10", features = ["rustls-ring"] }
+
+# SFTP. `russh` is pure Rust, which matters more than it sounds: the
+# alternative is libssh2 through a C build, and this project cross-compiles
+# from WSL to the MSVC toolchain, where every C dependency is a new way for the
+# build to break.
+russh = "0.63"
+russh-sftp = "2.4"
+# Only ever a current-thread runtime driving one connection. russh is async and
+# there is no sync client worth using; this keeps that contained to one thread.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+# Root certificates for FTPS. The same set reqwest already uses for Drive.
+webpki-roots = "1"
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = ["Win32_Foundation", "Win32_Security_Credentials"]
+
+[dev-dependencies]
+# The integration tests stand up real servers: an FTP one written by hand, and
+# an SSH one built from russh's own server side — the only way to test what a
+# client does when the host key changes.
+parking_lot = { workspace = true }
+rand = "0.10"
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }

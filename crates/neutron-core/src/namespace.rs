@@ -8,7 +8,7 @@ use crate::entry::EntryList;
 
 /// Identifies a browsable location.
 ///
-/// Neutron browses three fundamentally different kinds of place, and conflating
+/// Neutron browses four fundamentally different kinds of place, and conflating
 /// them into a string path is how file managers end up unable to represent
 /// "This PC" or a Drive folder. Keeping them as distinct variants means the
 /// dispatch in `neutron-shell` is a match rather than a guess.
@@ -51,6 +51,20 @@ pub enum NodeId {
         provider: CloudProviderId,
         id: Arc<str>,
     },
+
+    /// A directory on a saved FTP, FTPS or SFTP server.
+    ///
+    /// Two parts, because neither alone identifies anything: `/pub` means
+    /// nothing without knowing whose `/pub`, and a server is not a location.
+    /// The path is POSIX and absolute — see `neutron_remote::path` — which is
+    /// why it is a string rather than a `PathBuf`: a `PathBuf` on Windows would
+    /// normalise the separators to backslashes and stop being a remote path.
+    Remote {
+        /// The site's id, from `sites.json`.
+        site: Arc<str>,
+        /// An absolute POSIX path on that server.
+        path: Arc<str>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,10 +87,26 @@ impl NodeId {
         }
     }
 
-    /// Whether the fast `FindFirstFileExW` enumeration path applies. Shell and
-    /// cloud nodes must go through their own backends.
+    /// Whether the fast `FindFirstFileExW` enumeration path applies. Shell,
+    /// cloud and remote nodes must go through their own backends.
     pub fn is_filesystem(&self) -> bool {
         matches!(self, NodeId::Path(_))
+    }
+
+    /// A directory on a saved server.
+    pub fn remote(site: impl Into<Arc<str>>, path: impl Into<Arc<str>>) -> Self {
+        NodeId::Remote {
+            site: site.into(),
+            path: path.into(),
+        }
+    }
+
+    /// The site and path, when this is a remote node.
+    pub fn as_remote(&self) -> Option<(&str, &str)> {
+        match self {
+            NodeId::Remote { site, path } => Some((site, path)),
+            _ => None,
+        }
     }
 
     /// A shell namespace location.
@@ -108,6 +138,12 @@ impl NodeId {
                 CloudProviderId::GoogleDrive => "Google Drive".to_owned(),
                 CloudProviderId::OneDrive => "OneDrive".to_owned(),
             },
+            // The last segment, or the site's id at the root — a tab titled
+            // "/" says nothing about which server it is on.
+            NodeId::Remote { site, path } => match path.rsplit('/').next() {
+                Some(name) if !name.is_empty() => name.to_owned(),
+                _ => site.to_string(),
+            },
         }
     }
 
@@ -115,6 +151,19 @@ impl NodeId {
     pub fn parent(&self) -> Option<NodeId> {
         match self {
             NodeId::Path(p) => p.parent().map(|p| NodeId::Path(p.to_path_buf())),
+            // A remote path is POSIX and absolute, so its parent is derivable
+            // without asking the server. `/` has none, which is what stops the
+            // Up button walking off the top of a site.
+            NodeId::Remote { site, path } => {
+                let trimmed = path.trim_end_matches('/');
+                match trimmed.rfind('/') {
+                    None => None,
+                    // The parent of `/pub` is the root, not the empty string.
+                    Some(0) if trimmed.len() > 1 => Some(NodeId::remote(site.clone(), "/")),
+                    Some(0) => None,
+                    Some(cut) => Some(NodeId::remote(site.clone(), &trimmed[..cut])),
+                }
+            }
             // Shell and cloud parents need their backend to resolve, so they
             // are not derivable here.
             _ => None,
@@ -128,6 +177,7 @@ impl fmt::Display for NodeId {
             NodeId::Path(p) => write!(f, "{}", p.display()),
             NodeId::Shell { parsing, .. } => write!(f, "{parsing}"),
             NodeId::Cloud { provider, id } => write!(f, "<{provider:?}:{id}>"),
+            NodeId::Remote { site, path } => write!(f, "{site}:{path}"),
         }
     }
 }
@@ -164,4 +214,52 @@ pub trait Namespace: Send + Sync {
     /// fail the whole listing — implementations skip the unreadable entry and
     /// continue, because a half-listed folder is far more useful than an error.
     fn enumerate(&self, id: &NodeId) -> Result<EntryList, NamespaceError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_remote_parent_walks_up_and_stops_at_the_site_root() {
+        let deep = NodeId::remote("nas", "/volume1/media/photos");
+        let parent = deep.parent().expect("a parent");
+        assert_eq!(parent, NodeId::remote("nas", "/volume1/media"));
+
+        let one_deep = NodeId::remote("nas", "/pub");
+        assert_eq!(one_deep.parent(), Some(NodeId::remote("nas", "/")));
+
+        // The root of a site has no parent, which is what stops the Up button
+        // walking off the top of it.
+        assert_eq!(NodeId::remote("nas", "/").parent(), None);
+    }
+
+    #[test]
+    fn a_remote_parent_keeps_the_site() {
+        // Losing the site would send the pane to a path on nothing in
+        // particular, which is far worse than refusing to move.
+        let parent = NodeId::remote("nas", "/a/b").parent().unwrap();
+        assert_eq!(parent.as_remote().map(|(site, _)| site), Some("nas"));
+    }
+
+    #[test]
+    fn a_remote_tab_is_titled_by_its_folder_and_a_site_root_by_its_site() {
+        assert_eq!(NodeId::remote("nas", "/a/photos").display_name(), "photos");
+        // A tab titled "/" says nothing about which server it is on.
+        assert_eq!(NodeId::remote("nas", "/").display_name(), "nas");
+    }
+
+    #[test]
+    fn a_remote_node_is_not_a_filesystem_path() {
+        // Anything that treated it as one would hand a POSIX string to
+        // FindFirstFileExW and enumerate a folder on the local disk.
+        let node = NodeId::remote("nas", "/pub");
+        assert!(!node.is_filesystem());
+        assert_eq!(node.as_path(), None);
+    }
+
+    #[test]
+    fn remote_nodes_on_different_sites_are_different_locations() {
+        assert_ne!(NodeId::remote("a", "/pub"), NodeId::remote("b", "/pub"));
+    }
 }

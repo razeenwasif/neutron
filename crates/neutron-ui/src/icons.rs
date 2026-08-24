@@ -52,6 +52,9 @@ pub enum Glyph {
     Grid,
     /// Stacked lines — switch to the list view.
     List,
+    /// A saved FTP/SFTP server — drawn as a globe, because what distinguishes
+    /// it from a drive is that it is somewhere else.
+    Server,
 }
 
 /// Draws `glyph` centred on `centre`.
@@ -63,6 +66,7 @@ pub fn draw(painter: &Painter, centre: Pos2, glyph: Glyph, colour: Color32) {
         Glyph::Cloud => cloud(painter, centre, stroke),
         Glyph::Drive => drive(painter, centre, stroke, colour),
         Glyph::Terminal => terminal(painter, centre, stroke),
+        Glyph::Server => server(painter, centre, stroke),
         Glyph::Search => search(painter, centre, stroke),
         Glyph::ArrowLeft => arrow(painter, centre, stroke, -1.0, false),
         Glyph::ArrowRight => arrow(painter, centre, stroke, 1.0, false),
@@ -162,6 +166,24 @@ fn drive(painter: &Painter, c: Pos2, stroke: Stroke, colour: Color32) {
     // Activity dot on each, at the right where a drive light would be.
     painter.circle_filled(pos2(c.x + 4.5, c.y - 3.25), 1.0, colour);
     painter.circle_filled(pos2(c.x + 4.5, c.y + 3.25), 1.0, colour);
+}
+
+fn server(painter: &Painter, c: Pos2, stroke: Stroke) {
+    // A globe. The stack-of-platters shape is already the local drive, and the
+    // one thing a saved server is not is local.
+    painter.circle_stroke(c, 6.5, stroke);
+    // The meridian, as an ellipse drawn from its own points — egui has no
+    // ellipse primitive and an arc pair reads as a broken circle at 16pt.
+    let mut meridian = Vec::with_capacity(33);
+    for step in 0..=32 {
+        let angle = step as f32 / 32.0 * std::f32::consts::TAU;
+        meridian.push(pos2(c.x + angle.sin() * 3.1, c.y - angle.cos() * 6.5));
+    }
+    painter.add(Shape::line(meridian, stroke));
+    painter.add(Shape::line(
+        vec![pos2(c.x - 6.5, c.y), pos2(c.x + 6.5, c.y)],
+        stroke,
+    ));
 }
 
 fn terminal(painter: &Painter, c: Pos2, stroke: Stroke) {

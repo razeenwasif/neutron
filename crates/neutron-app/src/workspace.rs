@@ -394,6 +394,9 @@ pub struct PersistedPane {
 pub enum PersistedLocation {
     Path(String),
     Shell { parsing: String, display: String },
+    /// A folder on a saved server. Restorable because it is named by the site's
+    /// id and a path, both of which outlive the connection.
+    Remote { site: String, path: String },
 }
 
 impl PersistedLocation {
@@ -403,6 +406,10 @@ impl PersistedLocation {
             NodeId::Shell { parsing, display } => Some(PersistedLocation::Shell {
                 parsing: parsing.to_string(),
                 display: display.to_string(),
+            }),
+            NodeId::Remote { site, path } => Some(PersistedLocation::Remote {
+                site: site.to_string(),
+                path: path.to_string(),
             }),
             // A cloud node's id is only meaningful while its provider is
             // connected, so restoring one would produce a tab that cannot load.
@@ -415,6 +422,9 @@ impl PersistedLocation {
             PersistedLocation::Path(p) => NodeId::Path(PathBuf::from(p)),
             PersistedLocation::Shell { parsing, display } => {
                 NodeId::shell(parsing.as_str(), display.as_str())
+            }
+            PersistedLocation::Remote { site, path } => {
+                NodeId::remote(site.as_str(), path.as_str())
             }
         }
     }

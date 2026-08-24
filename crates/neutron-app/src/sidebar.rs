@@ -145,6 +145,7 @@ fn glyph_for(place: &Place) -> Glyph {
         PlaceKind::Cloud => Glyph::Cloud,
         PlaceKind::Wsl => Glyph::Terminal,
         PlaceKind::Shell => Glyph::Diamond,
+        PlaceKind::Server => Glyph::Server,
         // Home gets its own glyph; the other known folders are folders.
         PlaceKind::KnownFolder if place.name == "Home" => Glyph::Home,
         PlaceKind::KnownFolder => Glyph::Folder,

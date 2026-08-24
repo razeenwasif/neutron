@@ -14,6 +14,8 @@ pub enum PlaceKind {
     Wsl,
     /// A shell namespace root — This PC, Network, Control Panel, Recycle Bin.
     Shell,
+    /// A saved FTP, FTPS or SFTP server.
+    Server,
 }
 
 /// Capacity of a volume, when it could be determined.

@@ -53,6 +53,9 @@ pub enum CommandId {
 
     ReloadPlugins,
     OpenPluginsFolder,
+
+    ConnectServer,
+    ReloadSites,
 }
 
 pub struct CommandDef {
@@ -149,6 +152,20 @@ pub const ALL: &[CommandDef] = &[
     CommandDef {
         id: CommandId::ReloadPlugins,
         title: "Reload plugins",
+        hint: "",
+    },
+
+    // Saved servers. Adding one has to be a dialog rather than a file, because
+    // the password belongs in Credential Manager and something has to accept it
+    // as typed input.
+    CommandDef {
+        id: CommandId::ConnectServer,
+        title: "Connect to a server",
+        hint: "",
+    },
+    CommandDef {
+        id: CommandId::ReloadSites,
+        title: "Reload saved servers",
         hint: "",
     },
 ];

@@ -172,14 +172,65 @@
   the rows appear in, which also fixes the order files go into a zip and onto
   the clipboard.
 
-#### 11. Known Cost
+#### 11. Saved Servers — FTP, FTPS and SFTP
+- A server saved in `%APPDATA%\Neutron\sites.json` appears in the sidebar under
+  **Servers**, opens like a folder, and its files sort, filter and preview the
+  way local ones do. Added through **Connect to a server** in the palette, since
+  the password has to be typed somewhere and it does not belong in a file.
+  Guide in `docs/servers.md`.
+- **Both protocol clients are pure Rust** — `suppaftp` and `russh`. The
+  alternative for SSH is libssh2 through a C build, and this project
+  cross-compiles from WSL to the MSVC toolchain, where every C dependency is a
+  new way for the build to break. `russh` is async, so `sftp.rs` owns a
+  current-thread Tokio runtime and blocks on it; the runtime never leaves that
+  struct and no other crate learns about async.
+- **MLSD before LIST.** `LIST` has no specification — what comes back is
+  whatever the server thought a human would like to read, and a Unix listing
+  infers a file's *year* from today's date. `MLSD` (RFC 3659) returns typed
+  facts. `FEAT` is asked once per connection and `LIST` parsing is the fallback.
+- **Binary mode, set before anything transfers.** FTP's ASCII mode rewrites line
+  endings inside the transfer, so a zip arrives corrupt and the transfer reports
+  success. There is a test asserting `TYPE I` precedes the first `RETR`.
+- **SSH host keys are checked**, trust-on-first-use and then enforced. A changed
+  key is a hard refusal showing both fingerprints, in OpenSSH's own
+  `SHA256:` format so `ssh-keyscan | ssh-keygen -lf -` is directly comparable.
+  Plenty of libraries' example code answers `check_server_key` with `Ok(true)`;
+  that is the bug, written down.
+- **A listed name is hostile input.** A server can answer with an entry called
+  `../../../../Windows/System32/drivers/etc/hosts`, and a client that joins it
+  onto a download folder writes exactly there — Zip Slip with a different
+  transport. Any listed name with a separator, `..`, a colon, a control
+  character or a Windows device name is refused; the folder still opens.
+- Passwords live in Credential Manager under `Neutron/Site/<id>`, never in
+  `sites.json`. A site with no saved password is not dialled with an empty one —
+  some servers count that as a failed attempt.
+- Connections are made once per site and reused, with exactly one reconnect on
+  failure: servers close idle connections, and retrying forever against one that
+  is rate-limiting logins is how an account gets locked. Downloads open their own
+  connection, because FTP cannot interleave and a listing would otherwise wait
+  behind a transfer.
+- Opening a remote file fetches it to `%TEMP%\Neutron\<site>\` and opens the
+  copy. The status bar says **opened a local copy**, because editing it does not
+  write back.
+- **Nothing writes to a server yet.** Rename, delete, paste, new folder and drop
+  all refuse with a sentence rather than doing nothing, which is what they did
+  before the guard — a silent no-op reads as broken key handling.
+
+#### 12. Known Cost
 - The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
 
-#### 12. Test Suite
+#### 13. Test Suite
 - Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`,
   `neutron-index`, `neutron-archive`, `neutron-plugin`) passing on Linux.
 - `neutron-plugin` is tested against **real child processes** — plugins that
   hang, crash, print nonsense, never read their input, print forever, or emit
   one endless line. Those are the cases a mock cannot check, because the failure
   being guarded against is the pipe and the process.
-- Full suite on the Windows target: 474 tests, clippy clean.
+- `neutron-remote` is tested against **real servers over real sockets**, both
+  written in the test files: an FTP server that can be told to lie, and an SSH
+  server built from `russh`'s own server side. The second exists for one test in
+  particular — a server presenting a *different host key* than the one recorded
+  is the case host key checking exists for, and no real server can be asked to
+  do that on demand.
+- Full suite on the Windows target: 572 tests, clippy clean. The FTP and SFTP
+  suites run there too — the fake servers are ordinary std sockets.

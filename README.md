@@ -256,6 +256,33 @@ without an export format.
 
 ---
 
+## Servers
+
+FTP, FTPS and SFTP servers appear in the sidebar under **Servers** and open like
+folders. **Connect to a server** in the palette adds one; everything but the
+password is written to `%APPDATA%\Neutron\sites.json`, and the password goes
+into Windows Credential Manager under `Neutron/Site/<id>`.
+
+Both clients are pure Rust — `suppaftp` and `russh` — because the alternative
+for SSH is libssh2 through a C build, and this project cross-compiles from WSL
+to the MSVC toolchain, where every C dependency is a new way for the build to
+break at a bad moment.
+
+Two things it takes seriously. **SSH host keys are checked**: recorded on the
+first connection and enforced after it, with a changed key refused outright and
+both fingerprints shown, in the same `SHA256:` format OpenSSH prints so you can
+compare them. And **a directory listing is data the server chooses** — a name
+like `../../../../Windows/System32/drivers/etc/hosts` is a valid listing entry,
+and a client that joins it onto a download folder writes exactly there, so any
+listed name carrying path structure is refused and the folder opens without it.
+
+Opening a remote file fetches a copy to `%TEMP%` and opens that; editing it does
+not write back, and the status bar says so. Nothing writes to a server yet —
+rename, delete, paste and new folder all refuse with a sentence.
+`docs/servers.md` has the manifest reference and the rest.
+
+---
+
 ## Plugins
 
 A plugin is a folder under `%APPDATA%\Neutron\plugins` holding a `plugin.json`

@@ -82,6 +82,19 @@ enum Action {
     CancelArchiveJob,
     /// Stop the plugin command that is running.
     CancelPluginCommand,
+
+    // --- saved servers ---
+    /// Show the "Connect to a server" dialog.
+    OpenConnect,
+    CloseConnect,
+    SetConnectField(crate::connect::Field, String),
+    SetConnectProtocol(neutron_remote::Protocol),
+    /// Save the dialog's server and open it.
+    SubmitConnect,
+    /// Re-read `sites.json`.
+    ReloadSites,
+    /// Stop the download that is running.
+    CancelDownload,
     /// Re-read the plugins folder.
     ReloadPlugins,
     /// Put the selection on the clipboard. `cut` marks it for a move.
@@ -127,6 +140,16 @@ enum Action {
     BeginTabDrag(TabDrag),
     DropTab(GroupId),
     EndTabDrag,
+}
+
+/// A remote file being fetched so it can be opened.
+struct DownloadJob {
+    /// "Fetching notes.txt", for the status bar.
+    label: String,
+    /// Bytes written so far, updated by the worker.
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: crossbeam_channel::Receiver<Result<PathBuf, String>>,
 }
 
 /// Incremental result from the sidebar scan.
@@ -183,6 +206,18 @@ pub struct NeutronApp {
     /// apartment thread, because only the shell knows and asking blocks.
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
+
+    /// Saved servers, for the sidebar and the dialog. The live connections
+    /// live on the loader thread; this is only the list.
+    sites: neutron_remote::Sites,
+    /// Why `sites.json` would not load, if it would not.
+    sites_error: Option<String>,
+    /// The "Connect to a server" dialog.
+    connect: crate::connect::ConnectDialog,
+    /// A remote file being fetched so it can be opened.
+    download: Option<DownloadJob>,
+    /// What the last remote operation said, shown until the next one.
+    remote_note: Option<String>,
 
     /// Installed plugins, and the command running from one if any.
     plugins: crate::plugins::PluginRuntime,
@@ -291,6 +326,16 @@ impl NeutronApp {
         // the window never appeared at all.
         let places_rx = spawn_places_discovery(cc.egui_ctx.clone());
 
+        // The saved servers, for the sidebar. Reading a small JSON file; no
+        // connection is opened until one is chosen.
+        let (sites, sites_error) = match neutron_remote::site::load() {
+            Ok(sites) => (sites, None),
+            Err(e) => {
+                tracing::warn!("sites.json: {e}");
+                (neutron_remote::Sites::default(), Some(e))
+            }
+        };
+
         // Reads manifests and nothing else — no plugin runs until a command
         // is chosen — so this is a directory listing on the startup path.
         let plugins = crate::plugins::PluginRuntime::load();
@@ -369,6 +414,11 @@ impl NeutronApp {
             drive_state,
             drive_tx,
             drive_rx,
+            sites,
+            sites_error,
+            connect: crate::connect::ConnectDialog::default(),
+            download: None,
+            remote_note: None,
             plugins,
             palette,
             archive_job: None,
@@ -565,7 +615,11 @@ impl NeutronApp {
             }
 
             Action::DragOut => self.drag_out(),
-            Action::BeginRename => self.begin_rename(ctx),
+            Action::BeginRename => {
+                if !self.refuse_on_remote("rename") {
+                    self.begin_rename(ctx);
+                }
+            }
             Action::RenameTyped(text) => {
                 if let Some(r) = self.rename.as_mut() {
                     r.text = text;
@@ -575,16 +629,43 @@ impl NeutronApp {
             Action::RenameCancel => {
                 self.close_rename(ctx);
             }
-            Action::NewFolder => self.new_folder(),
+            Action::NewFolder => {
+                if !self.refuse_on_remote("create folders") {
+                    self.new_folder();
+                }
+            }
             Action::RefreshIndex => self.index.refresh_index(),
-            Action::ExtractSelection => self.extract_selection(),
-            Action::CompressSelection => self.compress_selection(),
+            Action::ExtractSelection => {
+                if !self.refuse_on_remote("extract on") {
+                    self.extract_selection();
+                }
+            }
+            Action::CompressSelection => {
+                if !self.refuse_on_remote("compress on") {
+                    self.compress_selection();
+                }
+            }
             Action::CancelArchiveJob => {
                 if let Some(job) = self.archive_job.as_ref() {
                     job.cancel();
                 }
             }
             Action::CancelPluginCommand => self.plugins.cancel(),
+
+            Action::OpenConnect => self.connect.open(),
+            Action::CloseConnect => self.connect.close(),
+            Action::SetConnectField(field, text) => self.connect.set(field, text),
+            Action::SetConnectProtocol(protocol) => {
+                self.connect.protocol = protocol;
+                self.connect.error = None;
+            }
+            Action::SubmitConnect => self.submit_connect(),
+            Action::ReloadSites => self.reload_sites(),
+            Action::CancelDownload => {
+                if let Some(job) = self.download.as_ref() {
+                    job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             Action::ReloadPlugins => {
                 self.plugins.reload();
                 self.palette = commands::catalogue(&self.plugins.palette_entries());
@@ -605,8 +686,16 @@ impl NeutronApp {
                 }
             }
 
-            Action::Clip { cut } => self.clip_selection(cut),
-            Action::Paste => self.paste(),
+            Action::Clip { cut } => {
+                if !self.refuse_on_remote(if cut { "cut from" } else { "copy from" }) {
+                    self.clip_selection(cut);
+                }
+            }
+            Action::Paste => {
+                if !self.refuse_on_remote("paste into") {
+                    self.paste();
+                }
+            }
 
             Action::ClearSelection => {
                 if let Some(t) = self.workspace.active_tab_mut() {
@@ -668,7 +757,11 @@ impl NeutronApp {
                 }
             }
 
-            Action::Delete { permanent } => self.delete_selection(permanent),
+            Action::Delete { permanent } => {
+                if !self.refuse_on_remote("delete from") {
+                    self.delete_selection(permanent);
+                }
+            }
 
             Action::SetGridColumns { group, columns } => {
                 if let Some(tab) = self
@@ -685,7 +778,11 @@ impl NeutronApp {
 
             Action::ContextMenu { idx, pos } => self.context_menu(idx, pos),
 
-            Action::DropFiles { group, paths, copy } => self.drop_files(group, paths, copy),
+            Action::DropFiles { group, paths, copy } => {
+                if !self.refuse_on_remote("copy files into") {
+                    self.drop_files(group, paths, copy);
+                }
+            }
 
             Action::ToggleFinder(mode) => {
                 self.finder.toggle(mode);
@@ -864,6 +961,25 @@ impl NeutronApp {
                 NodeId::shell(target, name)
             };
             self.navigate(tab, node);
+            return;
+        }
+
+        // A server's rows are addressed by joining a name to a POSIX path,
+        // and the name has already been through `safe_name` on the way into
+        // the listing — but this is where it becomes a path, so it is checked
+        // again here rather than trusted.
+        if let Some((site, dir)) = t.location().as_remote() {
+            let (site, dir) = (site.to_owned(), dir.to_owned());
+            let container = kind.is_container();
+            let Ok(full) = neutron_remote::path::join(&dir, &name) else {
+                self.remote_note = Some(format!("{name} is not a name this can open"));
+                return;
+            };
+            if container {
+                self.navigate(tab, NodeId::remote(site.as_str(), full.as_str()));
+            } else {
+                self.start_download(&site, full, name);
+            }
             return;
         }
 
@@ -1577,6 +1693,7 @@ impl eframe::App for NeutronApp {
         // rows painted below pick them up immediately rather than a frame late.
         self.pump_archive_job();
         self.pump_plugin(&ctx);
+        self.pump_download();
         self.sync_watchers(&ctx);
         self.drain_changes();
         self.pump_preview(&ctx);
@@ -1601,6 +1718,7 @@ impl eframe::App for NeutronApp {
         // Drawn last so it covers everything, and after input routing so the
         // overlay's own keys win while it is open.
         self.finder_overlay(ui, &p, &mut actions);
+        self.connect_overlay(ui, &p, &mut actions);
 
 
         // Queued *after* drawing so a `DropTab` pushed by a tab strip this
@@ -1721,6 +1839,10 @@ impl NeutronApp {
     }
 
     fn drain_loads(&mut self, ctx: &egui::Context) {
+        // Set when a remote folder arrives, and applied after the loop — `tab`
+        // borrows `self.workspace` mutably for the whole body.
+        let mut cleared_remote_note = false;
+
         while let Some((tab_id, generation, result)) = self.loader.poll() {
             let Some(tab) = self.workspace.tabs.get_mut(&tab_id) else {
                 continue;
@@ -1743,6 +1865,12 @@ impl NeutronApp {
                         Some(wanted) => tab.restore_selection(&wanted),
                         None => tab.selection.clear(),
                     }
+                    // A folder that opened is its own proof. Leaving
+                    // "Connecting to …" up beside a listing that plainly
+                    // arrived is a status line telling a small lie.
+                    if matches!(tab.location(), NodeId::Remote { .. }) {
+                        cleared_remote_note = true;
+                    }
                 }
                 LoadResult::Failed { id, error } => {
                     tab.status = Status::Error(format!("{id}: {error}"));
@@ -1751,6 +1879,10 @@ impl NeutronApp {
                     tab.selection.clear();
                 }
             }
+        }
+
+        if cleared_remote_note {
+            self.remote_note = None;
         }
 
         // Title tracks the focused tab, so the taskbar entry is identifiable
@@ -2214,6 +2346,9 @@ impl NeutronApp {
                 None
             }
 
+            C::ConnectServer => Some(Action::OpenConnect),
+            C::ReloadSites => Some(Action::ReloadSites),
+
             C::ReloadPlugins => Some(Action::ReloadPlugins),
             C::OpenPluginsFolder => self.plugins_folder().map(NodeId::Path).map(Action::Navigate),
 
@@ -2404,6 +2539,7 @@ impl NeutronApp {
 
                         self.archive_status(ui, p, actions);
                         self.plugin_status(ui, p, actions);
+                        self.download_status(ui, p, actions);
                     });
                 });
             });
@@ -2617,6 +2753,277 @@ impl NeutronApp {
         }
 
         ctx.request_repaint();
+    }
+
+    /// Refuses an operation that would write to a server, and says so.
+    ///
+    /// Nothing here writes to a remote server yet. Every one of these
+    /// operations reaches for a local path the tab does not have, so without
+    /// this they are silent no-ops — the user presses Delete on a remote file
+    /// and nothing at all happens, which reads as a bug in the key handling
+    /// rather than as a missing feature.
+    fn refuse_on_remote(&mut self, what: &str) -> bool {
+        let remote = self
+            .workspace
+            .active_tab()
+            .is_some_and(|t| matches!(t.location(), NodeId::Remote { .. }));
+        if remote {
+            self.remote_note = Some(format!("Neutron cannot {what} a server yet"));
+        }
+        remote
+    }
+
+    /// Saves the dialog's server, then opens it in the focused tab.
+    fn submit_connect(&mut self) {
+        let site = match self.connect.to_site(&self.sites) {
+            Ok(site) => site,
+            Err(reason) => {
+                self.connect.error = Some(reason);
+                return;
+            }
+        };
+
+        if let Err(reason) = crate::connect::save(&site, self.connect.password()) {
+            self.connect.error = Some(reason);
+            return;
+        }
+
+        self.connect.close();
+        // Re-read rather than pushing the new site onto the in-memory list:
+        // the file is the truth, and this is also how the sidebar picks up an
+        // edit made by hand.
+        self.reload_sites();
+
+        let start = site.start_path();
+        self.remote_note = Some(format!("Connecting to {}…", site.address()));
+        if let Some(tab) = self.workspace.active_tab_id() {
+            self.navigate(tab, NodeId::remote(site.id.as_str(), start.as_str()));
+        }
+    }
+
+    /// Re-reads `sites.json`, here and on the loader thread.
+    fn reload_sites(&mut self) {
+        match neutron_remote::site::load() {
+            Ok(sites) => {
+                let count = sites.sites.len();
+                self.sites = sites;
+                self.sites_error = None;
+                self.remote_note = Some(match count {
+                    0 => "No servers saved".to_owned(),
+                    1 => "1 server saved".to_owned(),
+                    n => format!("{n} servers saved"),
+                });
+            }
+            Err(e) => {
+                self.sites_error = Some(e.clone());
+                self.remote_note = Some(format!("sites.json: {e}"));
+            }
+        }
+        // The loader holds the connections, so it has to hear about this too.
+        self.loader.reload_sites();
+    }
+
+    /// Fetches a remote file into the cache, then opens it with the shell.
+    ///
+    /// A copy, deliberately: editing it does not write back. Saying so is
+    /// better than pretending to a two-way sync that this protocol layer does
+    /// not do — see the note in the status bar when it lands.
+    fn start_download(&mut self, site_id: &str, remote_path: String, name: String) {
+        if self.download.is_some() {
+            self.remote_note = Some("Already fetching a file — wait for it to finish".to_owned());
+            return;
+        }
+
+        let Some(site) = self.sites.get(site_id).cloned() else {
+            self.remote_note = Some(format!("no saved server called {site_id:?}"));
+            return;
+        };
+        let Some(destination) = crate::remote::cache_path(site_id, &remote_path) else {
+            self.remote_note = Some(format!("{name} cannot be saved under that name"));
+            return;
+        };
+
+        let bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        let worker_bytes = std::sync::Arc::clone(&bytes);
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let wake = self.ctx.clone();
+        let target = destination.clone();
+
+        let spawned = std::thread::Builder::new()
+            .name("neutron-download".into())
+            .spawn(move || {
+                let outcome = crate::remote::download(
+                    &site,
+                    &remote_path,
+                    &target,
+                    &mut |done| {
+                        worker_bytes.store(done, std::sync::atomic::Ordering::Relaxed);
+                        // Repainting per chunk would cost more than the
+                        // transfer on a fast link; the status bar is already
+                        // repainting for the drifting ground.
+                        if worker_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            neutron_remote::Continue::Stop
+                        } else {
+                            neutron_remote::Continue::Yes
+                        }
+                    },
+                );
+                let _ = tx.send(outcome.map(|_| target));
+                wake.request_repaint();
+            });
+
+        match spawned {
+            Ok(_) => {
+                self.remote_note = None;
+                self.download = Some(DownloadJob {
+                    label: format!("Fetching {name}"),
+                    bytes,
+                    cancel,
+                    done: rx,
+                });
+            }
+            Err(e) => self.remote_note = Some(format!("could not start the download: {e}")),
+        }
+    }
+
+    /// Applies a finished download.
+    fn pump_download(&mut self) {
+        let Some(job) = self.download.as_ref() else {
+            return;
+        };
+        let Ok(outcome) = job.done.try_recv() else {
+            return;
+        };
+        let label = job.label.clone();
+        self.download = None;
+
+        match outcome {
+            Ok(path) => {
+                // Named as a copy, because it is one: editing it does not write
+                // back to the server, and a user who assumes otherwise loses
+                // work.
+                self.remote_note = Some(format!("{label} — opened a local copy"));
+                self.launch(path, neutron_shell::open::Verb::Open);
+            }
+            Err(reason) => {
+                tracing::warn!("{label}: {reason}");
+                self.remote_note = Some(format!("{label} — {reason}"));
+            }
+        }
+    }
+
+    /// The running download, or what the last remote operation said.
+    fn download_status(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
+        if let Some(job) = self.download.as_ref() {
+            if ui
+                .add(egui::Button::new(egui::RichText::new("Stop").size(11.0)).small())
+                .on_hover_text("Stop this download. The partial file is removed.")
+                .clicked()
+            {
+                actions.push(Action::CancelDownload);
+            }
+            // Bytes rather than a percentage: neither protocol reliably reports
+            // a size up front, and a percentage that jumps or stalls at 99 is
+            // worse than a number that is plainly still moving.
+            let done = job.bytes.load(std::sync::atomic::Ordering::Relaxed);
+            ui.colored_label(
+                p.accent,
+                format!("{} — {}", job.label, neutron_ui::format::size(Some(done))),
+            );
+            return;
+        }
+
+        if let Some(note) = self.remote_note.as_ref() {
+            ui.colored_label(p.text_muted, note);
+        }
+    }
+
+    /// The connect dialog, and the text fields it cannot draw itself.
+    fn connect_overlay(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
+        if !self.connect.open {
+            return;
+        }
+
+        if let Some(action) = crate::connect::show(ui, p, &self.connect) {
+            actions.push(match action {
+                crate::connect::ConnectAction::Close => Action::CloseConnect,
+                crate::connect::ConnectAction::Submit => Action::SubmitConnect,
+                crate::connect::ConnectAction::SetProtocol(protocol) => {
+                    Action::SetConnectProtocol(protocol)
+                }
+            });
+        }
+
+        let screen = ui.ctx().content_rect();
+
+        // Where the caret should be when nothing in the dialog has it: the
+        // first field still empty, so opening the dialog starts at the top and
+        // clicking a protocol chip — which takes focus away, being an ordinary
+        // clickable — returns it to where there is still work to do rather than
+        // dropping it into the file list behind.
+        let field_id = |field| egui::Id::new(("neutron-connect-field", field));
+        let focused = ui.memory(|m| m.focused());
+        let ours = crate::connect::FIELDS
+            .iter()
+            .any(|&f| focused == Some(field_id(f)));
+        let wants_caret = crate::connect::FIELDS
+            .iter()
+            .copied()
+            .find(|&f| self.connect.value(f).is_empty())
+            .unwrap_or(crate::connect::FIELDS[0]);
+
+        for &field in crate::connect::FIELDS {
+            let rect = crate::connect::field_rect(screen, field);
+            let id = field_id(field);
+
+            let mut text = self.connect.value(field).to_owned();
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layer_id(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        "neutron-connect".into(),
+                    )),
+            );
+
+            let output = egui::TextEdit::singleline(&mut text)
+                .id(id)
+                .password(crate::connect::is_secret(field))
+                .background_color(egui::Color32::TRANSPARENT)
+                .desired_width(rect.width())
+                .font(egui::FontId::proportional(13.0))
+                .text_color(p.text)
+                .hint_text(
+                    egui::RichText::new(crate::connect::hint(field, self.connect.protocol))
+                        .color(p.text_faint)
+                        .size(13.0),
+                )
+                .show(&mut child);
+
+            if !ours && field == wants_caret {
+                child.memory_mut(|m| m.request_focus(id));
+            }
+
+            if text != self.connect.value(field) {
+                actions.push(Action::SetConnectField(field, text));
+            }
+
+            let _ = output;
+        }
+
+        // Handled here rather than in the main key table, which is skipped
+        // while a text field has focus — which is the whole time this is open.
+        ui.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                actions.push(Action::CloseConnect);
+            }
+            if i.key_pressed(egui::Key::Enter) {
+                actions.push(Action::SubmitConnect);
+            }
+        });
     }
 
     /// The running plugin command, or what the last one said.
@@ -2961,6 +3368,34 @@ impl NeutronApp {
                             actions.push(Action::ConnectDrive);
                         }
                     }
+                }
+
+                // Always shown, unlike Linux below: the section is where a
+                // server gets added, so hiding it when there are none would
+                // hide the only way to make one.
+                sidebar::section(ui, p, "Servers");
+                for site in &self.sites.sites {
+                    let place = neutron_core::places::Place {
+                        name: site.display().to_owned(),
+                        id: NodeId::remote(site.id.as_str(), site.start_path().as_str()),
+                        kind: neutron_core::places::PlaceKind::Server,
+                        capacity: None,
+                    };
+                    if sidebar::row(ui, p, &place, current) {
+                        actions.push(Action::Navigate(place.id.clone()));
+                    }
+                }
+                if let Some(reason) = &self.sites_error {
+                    sidebar::placeholder_row(
+                        ui,
+                        p,
+                        "sites.json could not be read",
+                        neutron_ui::icons::Glyph::Server,
+                        reason,
+                    );
+                }
+                if sidebar::action_row(ui, p, "Add a server…", neutron_ui::icons::Glyph::Server) {
+                    actions.push(Action::OpenConnect);
                 }
 
                 // Only shown when WSL is actually installed. An empty "Linux"
