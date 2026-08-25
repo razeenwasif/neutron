@@ -71,29 +71,34 @@ impl ArchiveJob {
     }
 }
 
-/// Starts extracting `archive` into `destination`.
-pub fn extract(
-    archive: PathBuf,
-    destination: PathBuf,
-    format: Format,
-    ctx: egui::Context,
-) -> ArchiveJob {
+/// Starts extracting `archive` into a folder beside it.
+///
+/// The destination is chosen on the worker, not by the caller. Picking a name
+/// nothing is using means a `stat` per candidate and up to 9,998 of them for a
+/// folder that already has `photos`, `photos (2)`, `photos (3)`… — and a stat
+/// on a sleeping drive or a disconnected share is exactly the blocking call the
+/// paint thread must never make.
+pub fn extract(archive: PathBuf, format: Format, ctx: egui::Context) -> ArchiveJob {
     let label = format!(
         "Extracting {}",
         archive.file_name().unwrap_or_default().to_string_lossy()
     );
     spawn(label.clone(), ctx, move |report| {
+        let destination = neutron_archive::destination_for(&archive, |p| p.exists())
+            .ok_or_else(|| {
+                std::io::Error::other("that archive is not in a folder to extract into")
+            })?;
         neutron_archive::extract::extract(&archive, &destination, format, report)
     })
 }
 
-/// Starts writing `sources` into a new zip at `output`.
-pub fn compress(
-    sources: Vec<PathBuf>,
-    base: PathBuf,
-    output: PathBuf,
-    ctx: egui::Context,
-) -> ArchiveJob {
+/// Starts writing `sources` into a new zip beside them.
+///
+/// The output name is chosen on the worker for the same reason the extract
+/// destination is: finding an unused one is a `stat` per candidate, in a loop.
+/// Numbered rather than overwriting — zipping the same folder twice should not
+/// silently replace the first archive.
+pub fn compress(sources: Vec<PathBuf>, base: PathBuf, ctx: egui::Context) -> ArchiveJob {
     let label = match sources.len() {
         1 => format!(
             "Compressing {}",
@@ -102,6 +107,11 @@ pub fn compress(
         n => format!("Compressing {n} items"),
     };
     spawn(label.clone(), ctx, move |report| {
+        let name = neutron_archive::create::suggested_name(&sources, &base);
+        let chosen = neutron_core::naming::next_available(name.trim_end_matches(".zip"), |c| {
+            base.join(format!("{c}.zip")).exists()
+        });
+        let output = base.join(format!("{chosen}.zip"));
         neutron_archive::create::zip(&sources, &base, &output, report)
     })
 }

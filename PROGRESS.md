@@ -384,7 +384,63 @@ is exhaustive. And Drive's API errors nest — `{"error":{"code":403,"message":�
 "HTTP 403" and discarding the message. The useful failures all live in that
 message: an export over Drive's 10MB cap, an exhausted quota, sharing revoked.
 
-#### 16. Test Suite
+
+#### 16. The One Rule, Actually Held
+
+The rule this project is built on is that the UI thread only ever touches plain
+memory. It was being broken in six places, all of them added one at a time by
+someone who knew the rule — which is the way this particular rule always goes,
+because the cost is invisible on the machine you are writing it on.
+
+Every one of these is instant on a local SSD. That is exactly why they survived.
+The stall they cause needs a sleeping external drive, a disconnected network
+share, or a `%APPDATA%` redirected to a roaming profile over a VPN — and on a
+file manager whose entire pitch is that it does not stall, those are not
+edge cases, they are the cases.
+
+| Where | What it was doing |
+|---|---|
+| `commit_rename` | one `stat` to answer "is that name taken?" |
+| `extract_selection` | `destination_for`, a `stat` per candidate |
+| `compress_selection` | `next_available`, a `stat` per candidate, in a loop |
+| `plugins_folder` | `create_dir_all` under `%APPDATA%` |
+| `submit_connect` | writing `sites.json` and a Credential Manager call |
+| `forget_server` | the same, and this one was mine, added in section 14 |
+
+The two archive ones are the worst of them. `destination_for` walks
+`photos`, `photos (2)`, `photos (3)`… up to 9,998 candidates, and stats every
+one, so extracting into a folder that already holds a run of them was a
+four-figure number of blocking calls on the thread that draws.
+
+**The fix is the same shape in every case: the call moves to the worker that was
+already going to do the work.** The rename's collision check now happens beside
+the rename it exists to explain. The archive destination is chosen inside the
+job rather than being handed to it, which also shortens both signatures — there
+was never a reason for the caller to pick the name.
+
+Two of them needed somewhere to put the answer. Creating the plugins folder ends
+in navigating to it, and saving a server ends in opening it, so there is now one
+channel for *a worker decided the pane should go here* — because navigating
+before the folder exists lists a folder that is not there yet.
+
+The connect dialog is the one with a wrinkle worth stating: it stays open until
+the save is known to have worked. The typed password exists nowhere else, and a
+dialog that closes on submit and reports the failure somewhere else has thrown
+away the thing the user would need to try again.
+
+**A bug fell out of it.** `forget_server` was writing back the copy of
+`sites.json` held in the UI. `connect::save` deliberately re-reads the file
+first, and the comment there says why: the loader thread records SSH host keys
+into that same file, so writing a stale copy over the top silently un-learns
+one — and a forgotten host key is the check that exists to catch a swapped
+server, quietly turned off. Doing the removal on the worker made re-reading the
+natural thing to write, and it now does.
+
+One deliberate exception, in `NeutronApp::new`: `sites.json` is read
+synchronously there. That runs once, during construction, before there is a
+window to paint or a frame to drop.
+
+#### 17. Test Suite
 - Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`,
   `neutron-index`, `neutron-archive`, `neutron-plugin`) passing on Linux.
 - `neutron-plugin` is tested against **real child processes** — plugins that

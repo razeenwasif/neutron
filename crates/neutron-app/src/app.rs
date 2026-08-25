@@ -162,6 +162,13 @@ fn report(to: &crossbeam_channel::Sender<(crate::notice::Level, String)>, text: 
     let _ = to.send((crate::notice::Level::Error, text));
 }
 
+/// The same, for a receipt rather than a failure. Clears itself after a few
+/// seconds; see `notice.rs` for why the two are not the same thing.
+fn report_info(to: &crossbeam_channel::Sender<(crate::notice::Level, String)>, text: String) {
+    tracing::info!("{text}");
+    let _ = to.send((crate::notice::Level::Info, text));
+}
+
 /// A remote file being fetched so it can be opened.
 struct DownloadJob {
     /// "Fetching notes.txt", for the status bar.
@@ -170,6 +177,31 @@ struct DownloadJob {
     bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     done: crossbeam_channel::Receiver<Result<PathBuf, String>>,
+}
+
+/// Where a piece of work on `sites.json` came from.
+///
+/// Only the connect dialog needs the answer routed back to it: the typed
+/// password exists nowhere but that dialog, so a failed save has to leave it
+/// open rather than closing it and losing what was typed.
+enum SitesOrigin {
+    /// Work that has already said what it did. Only the sidebar is waiting.
+    Background,
+    /// **Reload saved servers**, which owes the user a receipt saying how many
+    /// there turned out to be — a reload that says nothing is one you run
+    /// twice because you cannot tell whether it ran.
+    Requested,
+    /// The dialog's save, and whether it worked.
+    Dialog(Result<(), String>),
+}
+
+/// What a worker did to `sites.json`, and what the UI should do about it.
+struct SitesReply {
+    /// The file as it now reads. Re-read on the worker rather than trusting a
+    /// copy held here: the loader records SSH host keys into that same file,
+    /// so the disk is the truth.
+    sites: Result<neutron_remote::Sites, String>,
+    origin: SitesOrigin,
 }
 
 /// Incremental result from the sidebar scan.
@@ -226,6 +258,16 @@ pub struct NeutronApp {
     /// apartment thread, because only the shell knows and asking blocks.
     open_as_tx: crossbeam_channel::Sender<(TabId, PathBuf, bool)>,
     open_as_rx: crossbeam_channel::Receiver<(TabId, PathBuf, bool)>,
+    /// Somewhere a worker decided the pane should go, once it had done the
+    /// filesystem work needed to know that. Navigating before the work is
+    /// finished would list a folder that does not exist yet.
+    goto_tx: crossbeam_channel::Sender<(TabId, NodeId)>,
+    goto_rx: crossbeam_channel::Receiver<(TabId, NodeId)>,
+    /// `sites.json` as a worker last read it. Every change to that file is a
+    /// write to `%APPDATA%` and a call into Credential Manager, neither of
+    /// which belongs on the thread that paints.
+    sites_tx: crossbeam_channel::Sender<SitesReply>,
+    sites_rx: crossbeam_channel::Receiver<SitesReply>,
 
     /// The one line that says what just happened. See [`crate::notice`].
     notices: crate::notice::Notices,
@@ -380,6 +422,8 @@ impl NeutronApp {
         let (notice_tx, notice_rx) = crossbeam_channel::unbounded();
         let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
         let (open_as_tx, open_as_rx) = crossbeam_channel::unbounded();
+        let (goto_tx, goto_rx) = crossbeam_channel::unbounded();
+        let (sites_tx, sites_rx) = crossbeam_channel::unbounded();
         let (drive_tx, drive_rx) = crossbeam_channel::unbounded();
         let (menu_tx, menu_rx) = crossbeam_channel::unbounded();
         let (clip_fail_tx, clip_fail_rx) = crossbeam_channel::unbounded();
@@ -444,6 +488,10 @@ impl NeutronApp {
             refresh_rx,
             open_as_tx,
             open_as_rx,
+            goto_tx,
+            goto_rx,
+            sites_tx,
+            sites_rx,
             drive_state,
             drive_tx,
             drive_rx,
@@ -698,7 +746,7 @@ impl NeutronApp {
                 self.connect.error = None;
             }
             Action::SubmitConnect => self.submit_connect(),
-            Action::ReloadSites => self.reload_sites(),
+            Action::ReloadSites => self.refresh_sites(SitesOrigin::Requested),
             Action::DismissNotice => self.notices.dismiss(),
             Action::OpenTerminal => self.open_terminal(),
             Action::NewWindow => self.new_window(),
@@ -1096,6 +1144,51 @@ impl NeutronApp {
         });
     }
 
+    /// Applies whatever a worker made of `sites.json`.
+    fn drain_sites(&mut self) {
+        while let Ok(reply) = self.sites_rx.try_recv() {
+            match reply.sites {
+                Ok(sites) => {
+                    self.sites = sites;
+                    self.sites_error = None;
+                }
+                Err(e) => {
+                    self.sites_error = Some(e.clone());
+                    self.notices.error(format!("sites.json: {e}"));
+                }
+            }
+            // The loader holds the connections, so it has to hear about this
+            // too — a site whose host or port changed must not keep answering
+            // from the session opened against the old one.
+            self.loader.reload_sites();
+
+            match reply.origin {
+                SitesOrigin::Background => {}
+                SitesOrigin::Requested => {
+                    let count = self.sites.sites.len();
+                    self.notices.info(match count {
+                        0 => "No servers saved".to_owned(),
+                        1 => "1 server saved".to_owned(),
+                        n => format!("{n} servers saved"),
+                    });
+                }
+                SitesOrigin::Dialog(Ok(())) => self.connect.close(),
+                // Kept open: the password is only in the dialog, and closing it
+                // would make the user type it again to find out what went
+                // wrong.
+                SitesOrigin::Dialog(Err(reason)) => self.connect.error = Some(reason),
+            }
+        }
+    }
+
+    /// Applies navigations a worker asked for once its work was done.
+    fn drain_goto(&mut self) {
+        let wanted: Vec<_> = self.goto_rx.try_iter().collect();
+        for (tab, id) in wanted {
+            self.navigate(tab, id);
+        }
+    }
+
     /// Applies decisions made on an apartment thread about how to open a file.
     fn drain_open_as(&mut self) {
         let decisions: Vec<_> = self.open_as_rx.try_iter().collect();
@@ -1233,11 +1326,6 @@ impl NeutronApp {
         // only in the case of a non-ASCII letter is the same rename, and
         // refusing it would be a bug nobody could work around.
         let same_file_different_case = text.to_lowercase() == edit.original.to_lowercase();
-        if !same_file_different_case && dir.join(&text).exists() {
-            self.notices
-                .error(format!("{text} is already here — pick another name"));
-            return;
-        }
 
         let owner = self.hwnd.unwrap_or(0);
         let wake = self.ctx.clone();
@@ -1247,10 +1335,21 @@ impl NeutronApp {
         tracing::info!(from = %from.display(), to = %text, "rename");
         let notices = self.notice_tx.clone();
         self.sta.submit(move || {
-            if let Err(e) = neutron_shell::fileops::rename(&from, &text, owner) {
-                report(&notices, format!("Could not rename to {text:?}: {e}"));
+            // The collision check runs here, not before the submit. It is a
+            // `stat`, and a stat is the blocking call the paint thread must
+            // never make — on a sleeping drive or a disconnected share it is the
+            // stall this architecture exists to refuse.
+            if !same_file_different_case && dir.join(&text).exists() {
+                report(
+                    &notices,
+                    format!("{text} is already here — pick another name"),
+                );
+            } else {
+                if let Err(e) = neutron_shell::fileops::rename(&from, &text, owner) {
+                    report(&notices, format!("Could not rename to {text:?}: {e}"));
+                }
+                let _ = done.send(tab);
             }
-            let _ = done.send(tab);
             wake.request_repaint();
         });
     }
@@ -1797,6 +1896,8 @@ impl eframe::App for NeutronApp {
         self.drain_loads(&ctx);
         self.drain_refreshes();
         self.drain_open_as();
+        self.drain_goto();
+        self.drain_sites();
         while let Ok(state) = self.drive_rx.try_recv() {
             self.drive_state = state;
         }
@@ -2345,31 +2446,48 @@ impl NeutronApp {
         };
         let name = site.display().to_owned();
 
-        // The password goes first. If writing the file fails afterwards the
-        // site is still listed and can be re-entered; if the order were
-        // reversed, a failed clear would leave a credential belonging to
-        // nothing, which nothing would ever offer to remove again.
-        if let Err(e) = neutron_remote::forget_password(&site) {
-            // Not fatal to the removal — a site saved without a password has
-            // nothing to clear, and Credential Manager reports that the same
-            // way as a real failure.
-            tracing::warn!("could not clear the password for {id}: {e}");
-        }
+        let sites_tx = self.sites_tx.clone();
+        let notices = self.notice_tx.clone();
+        let wake = self.ctx.clone();
+        self.sta.submit(move || {
+            // The password goes first. If the file write fails afterwards the
+            // site is still listed and can be re-entered; reversed, a failed
+            // clear would leave a credential belonging to nothing, which
+            // nothing would ever offer to remove again.
+            if let Err(e) = neutron_remote::forget_password(&site) {
+                // Not fatal to the removal — a site saved without a password
+                // has nothing to clear, and Credential Manager reports that the
+                // same way as a real failure.
+                tracing::warn!("could not clear the password for {}: {e}", site.id);
+            }
 
-        self.sites.sites.retain(|s| s.id != id);
-        if let Err(e) = neutron_remote::site::save(&self.sites) {
-            self.notices
-                .error(format!("Could not update sites.json: {e}"));
-            // Re-read, so what is on screen matches what is on disk rather
-            // than the removal that did not happen.
-            self.reload_sites();
-            return;
-        }
+            // Re-read before writing, for the reason `connect::save` does it:
+            // the loader records SSH host keys into this same file, and writing
+            // a copy held in the UI over the top would silently un-learn one.
+            match neutron_remote::site::load() {
+                Ok(mut on_disk) => {
+                    on_disk.sites.retain(|s| s.id != site.id);
+                    match neutron_remote::site::save(&on_disk) {
+                        Ok(_) => report_info(
+                            &notices,
+                            format!("Forgot {name} and its saved password"),
+                        ),
+                        Err(e) => {
+                            report(&notices, format!("Could not update sites.json: {e}"))
+                        }
+                    }
+                }
+                Err(e) => report(&notices, format!("Could not read sites.json: {e}")),
+            }
 
-        // The loader holds this site's connection; it has to hear about it.
-        self.loader.reload_sites();
-        self.notices
-            .info(format!("Forgot {name} and its saved password"));
+            // Sent whatever happened, so what is on screen is what is on disk
+            // rather than the removal that may not have taken.
+            let _ = sites_tx.send(SitesReply {
+                sites: neutron_remote::site::load(),
+                origin: SitesOrigin::Background,
+            });
+            wake.request_repaint();
+        });
     }
 
     /// Recomputes the finder's rows for the current mode and needle.
@@ -2597,7 +2715,10 @@ impl NeutronApp {
             C::SignOutDrive => Some(Action::SignOutDrive),
 
             C::ReloadPlugins => Some(Action::ReloadPlugins),
-            C::OpenPluginsFolder => self.plugins_folder().map(NodeId::Path).map(Action::Navigate),
+            C::OpenPluginsFolder => {
+                self.open_plugins_folder();
+                None
+            }
 
             C::GoHome => known_folder("Home").map(Action::Navigate),
             C::GoDesktop => known_folder("Desktop").map(Action::Navigate),
@@ -2850,14 +2971,9 @@ impl NeutronApp {
             return;
         };
 
-        let Some(destination) = neutron_archive::destination_for(&archive, |p| p.exists()) else {
-            return;
-        };
         let _ = dir;
-
         self.start_archive_job(crate::archive_ops::extract(
             archive,
-            destination,
             format,
             self.ctx.clone(),
         ));
@@ -2869,21 +2985,7 @@ impl NeutronApp {
             return;
         };
 
-        let name = neutron_archive::create::suggested_name(&paths, &dir);
-        // Numbered rather than overwriting: zipping the same folder twice
-        // should not silently replace the first archive.
-        let output = neutron_core::naming::next_available(
-            name.trim_end_matches(".zip"),
-            |candidate| dir.join(format!("{candidate}.zip")).exists(),
-        );
-        let output = dir.join(format!("{output}.zip"));
-
-        self.start_archive_job(crate::archive_ops::compress(
-            paths,
-            dir,
-            output,
-            self.ctx.clone(),
-        ));
+        self.start_archive_job(crate::archive_ops::compress(paths, dir, self.ctx.clone()));
     }
 
     fn start_archive_job(&mut self, job: crate::archive_ops::ArchiveJob) {
@@ -2938,13 +3040,32 @@ impl NeutronApp {
     /// Created rather than reported missing, because the only reason to ask for
     /// it is to put a plugin in it, and "the folder does not exist" is not a
     /// useful answer to that.
-    fn plugins_folder(&mut self) -> Option<PathBuf> {
-        let dir = neutron_plugin::discover::plugins_dir()?;
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.notices.error(format!("Could not open the plugins folder: {e}"));
-            return None;
-        }
-        Some(dir)
+    /// Creating it is a write, so it happens on a worker and the pane follows
+    /// once the folder is there. `%APPDATA%` is an ordinary local directory for
+    /// most people and a redirected network share for some, and this code
+    /// cannot tell which it is looking at.
+    fn open_plugins_folder(&mut self) {
+        let Some(dir) = neutron_plugin::discover::plugins_dir() else {
+            self.notices
+                .error("There is no %APPDATA% to keep plugins in");
+            return;
+        };
+        let Some(tab) = self.workspace.active_tab_id() else {
+            return;
+        };
+
+        let goto = self.goto_tx.clone();
+        let notices = self.notice_tx.clone();
+        let wake = self.ctx.clone();
+        self.sta.submit(move || {
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    let _ = goto.send((tab, NodeId::Path(dir)));
+                }
+                Err(e) => report(&notices, format!("Could not open the plugins folder: {e}")),
+            }
+            wake.request_repaint();
+        });
     }
 
     /// Runs a plugin command against the focused tab.
@@ -3108,44 +3229,55 @@ impl NeutronApp {
             }
         };
 
-        if let Err(reason) = crate::connect::save(&site, self.connect.password()) {
-            self.connect.error = Some(reason);
-            return;
-        }
-
-        self.connect.close();
-        // Re-read rather than pushing the new site onto the in-memory list:
-        // the file is the truth, and this is also how the sidebar picks up an
-        // edit made by hand.
-        self.reload_sites();
-
+        // Writing the site is a write to `%APPDATA%` and a call into
+        // Credential Manager, so it happens on a worker. The dialog stays open
+        // until the reply arrives — it is the only place the password exists,
+        // and closing it before the save is known to have worked would lose it.
+        let password = self.connect.password().to_owned();
+        let tab = self.workspace.active_tab_id();
         let start = site.start_path();
+        let target = NodeId::remote(site.id.as_str(), start.as_str());
+
         self.notices.info(format!("Connecting to {}…", site.address()));
-        if let Some(tab) = self.workspace.active_tab_id() {
-            self.navigate(tab, NodeId::remote(site.id.as_str(), start.as_str()));
-        }
+
+        let sites_tx = self.sites_tx.clone();
+        let goto = self.goto_tx.clone();
+        let wake = self.ctx.clone();
+        self.sta.submit(move || {
+            let result = crate::connect::save(&site, &password);
+            let ok = result.is_ok();
+            // Re-read rather than pushing the new site onto a list held in the
+            // UI: the file is the truth, and this is also how the sidebar picks
+            // up an edit made by hand.
+            let sites = neutron_remote::site::load();
+            let _ = sites_tx.send(SitesReply {
+                sites,
+                origin: SitesOrigin::Dialog(result),
+            });
+            if ok {
+                if let Some(tab) = tab {
+                    let _ = goto.send((tab, target));
+                }
+            }
+            wake.request_repaint();
+        });
     }
 
-    /// Re-reads `sites.json`, here and on the loader thread.
-    fn reload_sites(&mut self) {
-        match neutron_remote::site::load() {
-            Ok(sites) => {
-                let count = sites.sites.len();
-                self.sites = sites;
-                self.sites_error = None;
-                self.notices.info(match count {
-                    0 => "No servers saved".to_owned(),
-                    1 => "1 server saved".to_owned(),
-                    n => format!("{n} servers saved"),
-                });
-            }
-            Err(e) => {
-                self.sites_error = Some(e.clone());
-                self.notices.error(format!("sites.json: {e}"));
-            }
-        }
-        // The loader holds the connections, so it has to hear about this too.
-        self.loader.reload_sites();
+    /// Re-reads `sites.json` on a worker, and applies it when it arrives.
+    ///
+    /// Reading it here would be a read of `%APPDATA%`, which is an ordinary
+    /// local directory for most people and a redirected network share for some
+    /// — and this code cannot tell which it is looking at.
+    fn refresh_sites(&mut self, origin: SitesOrigin) {
+        let sites_tx = self.sites_tx.clone();
+        let wake = self.ctx.clone();
+        self.sta.submit(move || {
+            let _ = sites_tx.send(SitesReply {
+                sites: neutron_remote::site::load(),
+                origin,
+            });
+            wake.request_repaint();
+        });
     }
 
     /// Fetches a remote file into the cache, then opens it with the shell.

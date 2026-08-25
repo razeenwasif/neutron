@@ -110,6 +110,15 @@ depend on `windows` at all, so they *cannot* accidentally perform a shell call.
 Everything that can block lives behind `Namespace` or `CloudProvider`, whose
 implementations are documented as worker-thread-only.
 
+Neither of those catches a bare `std::fs` call in `neutron-app`, and an audit
+found six — a `stat` to check a rename collision, two more choosing a
+non-colliding archive name (one of them in a loop up to 9,998 times), and three
+writes to `%APPDATA%` and Credential Manager. Every one is instant on a local
+SSD, which is precisely why each survived being written by someone who knew the
+rule. They are all on workers now, but the honest summary is that this rule has
+no compiler behind it in the crate where it matters most, and holding it means
+looking.
+
 ---
 
 ## Shell integration
