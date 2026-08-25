@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use neutron_core::places::Place;
+use neutron_core::namespace::CloudProviderId;
 use neutron_core::{Axis, EntryList, GroupId, NodeId, SelectMode, SortColumn};
 use neutron_ui::file_list::{self, FileListAction};
 use neutron_ui::theme::{self, GUTTER, Palette, ThemeMode};
@@ -127,6 +128,8 @@ enum Action {
     StartIndexer,
     /// Begin the Google Drive consent flow.
     ConnectDrive,
+    SignOutDrive,
+    ForgetServer,
     MoveCursor { delta: isize, extend: bool },
     /// One tile left or right. Ignored outside the grid.
     MoveWithinRow { delta: isize, extend: bool },
@@ -645,9 +648,13 @@ impl NeutronApp {
                 }
             }
 
-            Action::DragOut => self.drag_out(),
+            Action::DragOut => {
+                if !self.refuse_without_a_path("drag files out of") {
+                    self.drag_out();
+                }
+            }
             Action::BeginRename => {
-                if !self.refuse_on_remote("rename") {
+                if !self.refuse_without_a_path("rename anything in") {
                     self.begin_rename(ctx);
                 }
             }
@@ -661,18 +668,18 @@ impl NeutronApp {
                 self.close_rename(ctx);
             }
             Action::NewFolder => {
-                if !self.refuse_on_remote("create folders") {
+                if !self.refuse_without_a_path("create folders in") {
                     self.new_folder();
                 }
             }
             Action::RefreshIndex => self.index.refresh_index(),
             Action::ExtractSelection => {
-                if !self.refuse_on_remote("extract on") {
+                if !self.refuse_without_a_path("extract archives in") {
                     self.extract_selection();
                 }
             }
             Action::CompressSelection => {
-                if !self.refuse_on_remote("compress on") {
+                if !self.refuse_without_a_path("compress anything in") {
                     self.compress_selection();
                 }
             }
@@ -721,12 +728,12 @@ impl NeutronApp {
             }
 
             Action::Clip { cut } => {
-                if !self.refuse_on_remote(if cut { "cut from" } else { "copy from" }) {
+                if !self.refuse_without_a_path(if cut { "cut from" } else { "copy from" }) {
                     self.clip_selection(cut);
                 }
             }
             Action::Paste => {
-                if !self.refuse_on_remote("paste into") {
+                if !self.refuse_without_a_path("paste into") {
                     self.paste();
                 }
             }
@@ -801,7 +808,7 @@ impl NeutronApp {
             }
 
             Action::Delete { permanent } => {
-                if !self.refuse_on_remote("delete from") {
+                if !self.refuse_without_a_path("delete from") {
                     self.delete_selection(permanent);
                 }
             }
@@ -822,7 +829,7 @@ impl NeutronApp {
             Action::ContextMenu { idx, pos } => self.context_menu(idx, pos),
 
             Action::DropFiles { group, paths, copy } => {
-                if !self.refuse_on_remote("copy files into") {
+                if !self.refuse_without_a_path("copy files into") {
                     self.drop_files(group, paths, copy);
                 }
             }
@@ -844,6 +851,8 @@ impl NeutronApp {
             Action::StartIndexer => self.index.start_helper(),
 
             Action::ConnectDrive => self.connect_drive(),
+            Action::SignOutDrive => self.sign_out_drive(),
+            Action::ForgetServer => self.forget_server(),
 
             Action::FocusFilter => {
                 if let Some(group) = self.workspace.focused_group().map(|g| g.id) {
@@ -988,6 +997,42 @@ impl NeutronApp {
         let kind = t.list.kind(idx);
         let name = t.list.name(idx).to_owned();
 
+        // A cloud listing's target is the provider's own object id. It has to
+        // be read *before* the generic target branch below, which treats a
+        // non-path target as a shell parsing name — so a Drive folder id went
+        // to `SHParseDisplayName`, which is why no folder inside Drive would
+        // open and why activating a Drive file navigated to nothing. Present
+        // since M7; there was never a cloud branch here at all.
+        if let NodeId::Cloud { provider, .. } = t.location() {
+            let provider = *provider;
+            // Every cloud row carries one. A listing without targets is a bug
+            // in the provider, not something to guess a path from.
+            let Some((target, _)) = t.list.target(idx) else {
+                self.notices
+                    .error(format!("{name} has no id Neutron can open"));
+                return;
+            };
+            let target = target.to_owned();
+            if kind.is_container() {
+                // The name travels with the id: it is what titles the tab, and
+                // asking the provider for it later would be an API call on the
+                // paint thread.
+                self.navigate(tab, NodeId::cloud(provider, target, name));
+            } else {
+                match provider {
+                    CloudProviderId::GoogleDrive => self.start_drive_download(target, name),
+                    // OneDrive syncs to a real directory, so it is a `Path`
+                    // node and never reaches here. Named rather than
+                    // wildcarded so that changing it is a compile error, not a
+                    // OneDrive file quietly fetched through the Drive API.
+                    CloudProviderId::OneDrive => self
+                        .notices
+                        .error(format!("Neutron cannot open {name} from OneDrive this way")),
+                }
+            }
+            return;
+        }
+
         // A shell listing tells us where each row leads, because its children
         // cannot be addressed by joining a name to the parent — "This PC"
         // contains `C:\`, and a Control Panel item has no path at all.
@@ -1108,11 +1153,6 @@ impl NeutronApp {
         let Some(tab) = self.workspace.tabs.get(&tab_id) else {
             return;
         };
-        // A location with no path — This PC, a shell folder, Drive — has
-        // nothing this could rename.
-        if tab.location().as_path().is_none() {
-            return;
-        }
         // The cursor rather than the selection: renaming is a single-file
         // operation, and with several selected the cursor is the one the user
         // last touched.
@@ -1551,6 +1591,10 @@ impl NeutronApp {
                     .and_then(|t| t.location().as_path())
                     .map(|p| p.to_path_buf())
                 else {
+                    // The folder's own menu comes from a shell view object, and
+                    // there is no path to bind one to here. Silence read as a
+                    // right-click the application had dropped.
+                    self.refuse_without_a_path("show a menu for");
                     return;
                 };
                 (tab_id, dir, Vec::new())
@@ -2231,6 +2275,103 @@ impl NeutronApp {
         });
     }
 
+    /// Forgets the Google Drive credential.
+    ///
+    /// The counterpart to [`Self::connect_drive`]. `sign_out` has existed in
+    /// `neutron-cloud` since M7 with nothing calling it, so the only way to
+    /// revoke a Drive connection was to delete the entry from Credential
+    /// Manager by hand — a credential the application would store and would not
+    /// let go of.
+    fn sign_out_drive(&mut self) {
+        use neutron_cloud::google::DriveState;
+        if !matches!(self.drive_state, DriveState::SignedIn) {
+            // The palette's entries are static, so this one is offered whether
+            // or not Drive is connected. Saying so beats doing nothing.
+            self.notices.info("Google Drive is not connected");
+            return;
+        }
+
+        // Optimistic, and deliberately so: the sidebar changes on this frame.
+        // A failure below replaces this with the reason.
+        self.drive_state = DriveState::SignedOut;
+        // The loader caches an access token that outlives the credential by
+        // most of an hour. Told here rather than after the worker answers,
+        // because a listing must not succeed once the user has disconnected.
+        self.loader.sign_out_drive();
+
+        let wake = self.ctx.clone();
+        let done = self.drive_tx.clone();
+        let notices = self.notice_tx.clone();
+        self.sta.submit(move || {
+            let drive = neutron_cloud::google::GoogleDrive::new();
+            if let Err(e) = drive.sign_out() {
+                tracing::error!("Google Drive sign-out failed: {e}");
+                report(&notices, format!("Could not disconnect Google Drive: {e}"));
+                let _ = done.send(DriveState::Error(e.to_string()));
+            } else {
+                report(&notices, "Google Drive disconnected".to_owned());
+                let _ = done.send(DriveState::SignedOut);
+            }
+            wake.request_repaint();
+        });
+    }
+
+    /// Removes the focused tab's server from `sites.json`, password and all.
+    ///
+    /// The counterpart to **Connect to a server**. Until this existed a saved
+    /// server could only be removed by editing the file by hand, and
+    /// `forget_password` — which is what takes the password out of Credential
+    /// Manager — had no callers at all, so the password outlived every other
+    /// trace of the site.
+    ///
+    /// Scoped to the focused tab rather than offering a list, because
+    /// navigating to a server is already the unambiguous way to say which one,
+    /// and a palette row cannot ask a follow-up question.
+    fn forget_server(&mut self) {
+        let Some(id) = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.location().as_remote())
+            .map(|(site, _)| site.to_owned())
+        else {
+            self.notices
+                .info("Open a server first — this forgets the one you are looking at");
+            return;
+        };
+
+        let Some(site) = self.sites.get(&id).cloned() else {
+            self.notices.error(format!("{id} is no longer saved"));
+            return;
+        };
+        let name = site.display().to_owned();
+
+        // The password goes first. If writing the file fails afterwards the
+        // site is still listed and can be re-entered; if the order were
+        // reversed, a failed clear would leave a credential belonging to
+        // nothing, which nothing would ever offer to remove again.
+        if let Err(e) = neutron_remote::forget_password(&site) {
+            // Not fatal to the removal — a site saved without a password has
+            // nothing to clear, and Credential Manager reports that the same
+            // way as a real failure.
+            tracing::warn!("could not clear the password for {id}: {e}");
+        }
+
+        self.sites.sites.retain(|s| s.id != id);
+        if let Err(e) = neutron_remote::site::save(&self.sites) {
+            self.notices
+                .error(format!("Could not update sites.json: {e}"));
+            // Re-read, so what is on screen matches what is on disk rather
+            // than the removal that did not happen.
+            self.reload_sites();
+            return;
+        }
+
+        // The loader holds this site's connection; it has to hear about it.
+        self.loader.reload_sites();
+        self.notices
+            .info(format!("Forgot {name} and its saved password"));
+    }
+
     /// Recomputes the finder's rows for the current mode and needle.
     ///
     /// Commands are matched here and now — a few dozen entries, so a round trip
@@ -2451,6 +2592,9 @@ impl NeutronApp {
 
             C::ConnectServer => Some(Action::OpenConnect),
             C::ReloadSites => Some(Action::ReloadSites),
+            C::ForgetServer => Some(Action::ForgetServer),
+
+            C::SignOutDrive => Some(Action::SignOutDrive),
 
             C::ReloadPlugins => Some(Action::ReloadPlugins),
             C::OpenPluginsFolder => self.plugins_folder().map(NodeId::Path).map(Action::Navigate),
@@ -2819,10 +2963,7 @@ impl NeutronApp {
             .and_then(|t| t.location().as_path())
             .map(Path::to_path_buf)
         else {
-            // A shell location with no filesystem path — This PC, Network.
-            // There is nothing to hand a plugin.
-            self.notices
-                .info("This pane has no folder a plugin can act on");
+            self.refuse_without_a_path("run plugins in");
             return;
         };
 
@@ -2904,7 +3045,7 @@ impl NeutronApp {
 
     /// Opens a second Neutron window on the focused tab's folder.
     fn new_window(&mut self) {
-        let Some(dir) = self.focused_folder("open a window on") else {
+        let Some(dir) = self.focused_folder("open a window in") else {
             return;
         };
         let notices = self.notice_tx.clone();
@@ -2919,35 +3060,42 @@ impl NeutronApp {
     ///
     /// "This PC", a server and a Drive folder are all real places with no path
     /// a process can be started in, and both callers need exactly that answer.
-    fn focused_folder(&mut self, verb: &str) -> Option<PathBuf> {
-        let folder = self
-            .workspace
-            .active_tab()
-            .and_then(|t| t.location().as_path())
-            .map(Path::to_path_buf);
-        if folder.is_none() {
-            self.notices
-                .info(format!("There is no folder here to {verb}"));
+    fn focused_folder(&mut self, what: &str) -> Option<PathBuf> {
+        let location = self.workspace.active_tab()?.location().clone();
+        if let Some(path) = location.as_path() {
+            return Some(path.to_path_buf());
         }
-        folder
+        let place = crate::place::pathless(&location, &self.sites)?;
+        self.notices.info(crate::place::cannot(what, &place));
+        None
     }
 
-    /// Refuses an operation that would write to a server, and says so.
+    /// Refuses an operation that needs a filesystem path, and says where the
+    /// pane is pointing instead.
     ///
-    /// Nothing here writes to a remote server yet. Every one of these
-    /// operations reaches for a local path the tab does not have, so without
-    /// this they are silent no-ops — the user presses Delete on a remote file
-    /// and nothing at all happens, which reads as a bug in the key handling
-    /// rather than as a missing feature.
-    fn refuse_on_remote(&mut self, what: &str) -> bool {
-        let remote = self
+    /// Every operation guarded by this reaches for `location().as_path()` and
+    /// finds nothing in a shell folder, a cloud folder or a server. Without
+    /// this they are silent no-ops — the user presses Delete and nothing at all
+    /// happens, which reads as a bug in the key handling rather than as a
+    /// missing feature.
+    ///
+    /// This used to check only for a server, so a zip and a Drive folder — the
+    /// other two pathless cases — went on failing silently, which is the exact
+    /// thing `notice.rs` exists to end. See [`crate::place`] for why the
+    /// sentence differs between them.
+    fn refuse_without_a_path(&mut self, what: &str) -> bool {
+        let Some(place) = self
             .workspace
             .active_tab()
-            .is_some_and(|t| matches!(t.location(), NodeId::Remote { .. }));
-        if remote {
-            self.notices.info(format!("Neutron cannot {what} a server yet"));
-        }
-        remote
+            .and_then(|t| crate::place::pathless(t.location(), &self.sites))
+        else {
+            return false;
+        };
+        // Information, not an error: nothing failed. The user asked for
+        // something Neutron does not do here, and a receipt that clears itself
+        // is the right weight for that.
+        self.notices.info(crate::place::cannot(what, &place));
+        true
     }
 
     /// Saves the dialog's server, then opens it in the focused tab.
@@ -3049,6 +3197,69 @@ impl NeutronApp {
                     },
                 );
                 let _ = tx.send(outcome.map(|_| target));
+                wake.request_repaint();
+            });
+
+        match spawned {
+            Ok(_) => {
+                self.notices.dismiss_info();
+                self.download = Some(DownloadJob {
+                    label: format!("Fetching {name}"),
+                    bytes,
+                    cancel,
+                    done: rx,
+                });
+            }
+            Err(e) => self.notices.error(format!("Could not start the download: {e}")),
+        }
+    }
+
+    /// Fetches a Drive object into the cache, then opens it with the shell.
+    ///
+    /// Shares [`DownloadJob`] with the server download — same progress, same
+    /// Stop, same "opened a local copy" receipt — because from the user's side
+    /// it is the same thing happening.
+    ///
+    /// The metadata request comes first and on the worker. Which of the three
+    /// ways to fetch an object applies depends on its MIME type, and the
+    /// listing deliberately does not keep that: it is one field the row never
+    /// renders, and one request before a transfer costs nothing next to the
+    /// transfer.
+    fn start_drive_download(&mut self, file_id: String, name: String) {
+        if self.download.is_some() {
+            self.notices.info("Already fetching a file — wait for it to finish");
+            return;
+        }
+
+        let Some(cache) = crate::cloud::cache_dir() else {
+            self.notices.error("There is no temp directory to fetch into");
+            return;
+        };
+
+        let bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        let worker_bytes = std::sync::Arc::clone(&bytes);
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let wake = self.ctx.clone();
+
+        let spawned = std::thread::Builder::new()
+            .name("neutron-drive-download".into())
+            .spawn(move || {
+                let outcome = crate::cloud::fetch(
+                    &file_id,
+                    &cache,
+                    &mut |done| {
+                        worker_bytes.store(done, std::sync::atomic::Ordering::Relaxed);
+                        if worker_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            neutron_cloud::drive::Continue::Stop
+                        } else {
+                            neutron_cloud::drive::Continue::Yes
+                        }
+                    },
+                );
+                let _ = tx.send(outcome);
                 wake.request_repaint();
             });
 
@@ -3528,10 +3739,11 @@ impl NeutronApp {
                     DriveState::SignedIn => {
                         let place = neutron_core::places::Place {
                             name: "Google Drive".to_owned(),
-                            id: NodeId::Cloud {
-                                provider: neutron_core::namespace::CloudProviderId::GoogleDrive,
-                                id: neutron_cloud::drive::ROOT_ID.into(),
-                            },
+                            id: NodeId::cloud(
+                                CloudProviderId::GoogleDrive,
+                                neutron_cloud::drive::ROOT_ID,
+                                "Google Drive",
+                            ),
                             kind: neutron_core::places::PlaceKind::Cloud,
                             capacity: None,
                         };

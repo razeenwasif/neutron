@@ -254,9 +254,137 @@ up on.
   Worth stating plainly against a project whose pitch includes a single ~15 MB
   binary. Nothing is loaded until a server is opened, so start-up and idle
   memory are unaffected.
+  - **Since revised down to 18.8 MiB** by pinning `russh` to `ring` (section 14),
+    which took a second complete crypto library out of the binary. Measured on
+    the current tree, same `lto = "fat"` profile. Not an A/B against the
+    previous commit, because the previous commit *cannot be built on this
+    machine* — which is the finding that led to the change.
 - The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
 
-#### 14. Test Suite
+
+#### 14. Three Things That Were Not Finished
+
+Found by reading the tree against what the documentation claimed, rather than by
+using the application — which is why they had survived. None of them showed up
+as a failing test, because in each case the test that would have failed did not
+exist.
+
+**The build needed NASM, and nobody knew.** `russh` was declared at default
+features, and its default crypto backend is `aws-lc-rs` — whose `aws-lc-sys` is
+C and hand-written assembly that will not build for the MSVC target unless NASM
+is on `PATH`. So a clean checkout on a machine with the documented prerequisites
+(rustup, VS Build Tools, the Windows SDK) failed to compile.
+
+That is exactly the dependency `russh` was chosen to avoid, three lines under
+the comment saying so. `suppaftp` right above it had been pinned to
+`rustls-ring` deliberately; `russh` had not, and its default pulled the C
+library in through the back door. It also meant the binary linked **two**
+complete crypto libraries, since `ring` was already there via rustls.
+
+Pinned to `ring`. `russh` implements the same cipher set on either backend —
+the gating in its `cipher` module is symmetric — so this is one crypto library
+instead of two, not a reduction in what can be negotiated. `aws-lc-rs`,
+`aws-lc-sys`, `cmake`, `fs_extra` and `dunce` left the lockfile with it, so the
+build no longer needs CMake either.
+
+**Silent refusals in two of the four namespaces.** Section 12 above ends eleven
+silent failures. It ended them for *servers*: the guard tested
+`matches!(location, NodeId::Remote { .. })`, and a shell folder and a Drive
+folder are the other two locations with no filesystem path. So `F2` inside a
+zip, `Delete` in This PC, `Ctrl+V` in Google Drive — every one of them reached
+for a path, found none, and returned. The same bug the section was written to
+fix, one namespace over.
+
+The guard now tests for the absence of a path rather than for one variant, and
+three more operations that were never guarded at all joined it: dragging out,
+right-clicking empty space, and running a plugin. Two of those had grown their
+own private wording for the same condition, which is the "one surface, not
+three" problem from section 12 recurring inside the fix for section 12.
+
+The sentence names the place, and distinguishes two answers that are not the
+same. A server and a Drive folder are places Neutron *will* write to, so the
+refusal ends in "yet" and promises something. Control Panel is not — there is no
+folder to create in it — so it gets a flat statement. A promise about something
+that is not coming is worse than no promise.
+
+**Two features were written and never reachable.** `GoogleDrive::sign_out` and
+`neutron_remote::forget_password` both existed, both worked, and both had zero
+call sites. The consequence in each case was a credential the application would
+store and would not let go of: no way to disconnect Drive, and no way to remove
+a saved server without hand-editing `sites.json` and leaving its password in
+Credential Manager for good.
+
+Both are palette commands now. Disconnecting Drive needed more than the call —
+the loader thread holds a `GoogleDrive` with a cached *access* token good for
+most of an hour, so clearing the refresh token alone would have left Drive
+folders listing happily after the user disconnected. It is told through the same
+channel that carries `ReloadSites`.
+
+Neither was findable by a compiler. `dead_code` does not fire on a `pub` item in
+a library crate, so an unreachable feature in `neutron-cloud` looks exactly like
+one the binary has not got round to using. Worth knowing about as a class: the
+warning that would have caught this does not exist.
+
+#### 15. Google Drive: Browsing Past The Root
+
+Drive browsing had never worked below the top folder, since M7. `activate` has a
+branch for shell targets, one for remote paths and one for local paths, and
+there was no cloud branch at all — so a Drive listing's target, which is an
+object id, fell through to the branch that treats a non-path target as a shell
+parsing name. A Drive folder id was being handed to `SHParseDisplayName`.
+
+Four things had to be true before it worked:
+
+- **A folder had to be able to say what it was.** `NodeId::Cloud` carried
+  `{provider, id}` and `display_name` matched on the provider, so every folder
+  in Drive at every depth was titled "Google Drive". It now carries a name, for
+  the same reason `Shell` carries a display name: the id is opaque, and
+  resolving it would be an API call on the paint thread.
+- **A file had to go somewhere.** Activating one downloads it, reusing the
+  server download's job — same progress, same Stop, same *opened a local copy*
+  receipt, because from the user's side it is the same thing happening. The
+  README had claimed downloads since M7; this is the first build where that is
+  true.
+- **A Google Doc has no bytes.** It is a server-side object, and `alt=media` on
+  one fails. Docs, Sheets and Slides export to `docx` / `xlsx` / `pptx` rather
+  than to PDF, because a spreadsheet exported as PDF is a picture of a
+  spreadsheet and the reason to pull a Sheet out of Drive is usually to work on
+  it. A Form, a Site and a Map have no export at all and are refused by name:
+  Drive answers an export request for those with an *error document* and HTTP
+  403, so a client that streamed before checking the status would save that
+  document under the file's own name. The status is checked before the first
+  byte is written.
+- **A Drive name is not a filename.** Drive names are not paths, so Drive barely
+  restricts them: `Q3/Q4 forecast`, `..`, `notes.txt:hidden` and a name with a
+  newline in it are all names the API will hand back, and joining one onto a
+  directory writes outside it. Zip Slip with a third transport, after the
+  archive extractor and the FTP listing.
+
+  Unlike those two, refusing is the wrong answer here. A slash in a Drive name
+  is ordinary and legal, and refusing would leave a real file unopenable. So the
+  name is rewritten into something that is certainly one safe component, and the
+  result is then handed to the same rejector the listing side uses — as a proof
+  rather than a second opinion. Eleven tests cover traversal, the ADS colon,
+  `..`, control characters, device names, trailing dots (Windows strips them
+  silently, so `evil. ` and `evil` are one file) and a 5,000-character name.
+
+**Up still does not work inside Drive, deliberately.** For a shell folder the
+parent is merely unresolvable without COM. For Drive it is not well defined: an
+object can sit in several folders at once — which is the first thing `drive.rs`
+says about the format — so "the" parent has more than one answer, and picking
+one would send Up somewhere the user never came from. Back walks the trail that
+actually happened, and the Up button greys out, exactly as it does in This PC.
+
+Two smaller things found while writing it. The file branch was calling the Drive
+downloader for any cloud provider; `OneDrive` is unreachable there today because
+it syncs to a real directory and is a `Path` node, but a wildcard would have
+fetched a OneDrive file through the Drive API the day that changed, so the match
+is exhaustive. And Drive's API errors nest — `{"error":{"code":403,"message":…}}`
+— where OAuth's are flat, so every one of them was collapsing to a bare
+"HTTP 403" and discarding the message. The useful failures all live in that
+message: an export over Drive's 10MB cap, an exhausted quota, sharing revoked.
+
+#### 16. Test Suite
 - Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`,
   `neutron-index`, `neutron-archive`, `neutron-plugin`) passing on Linux.
 - `neutron-plugin` is tested against **real child processes** — plugins that
@@ -269,5 +397,11 @@ up on.
   particular — a server presenting a *different host key* than the one recorded
   is the case host key checking exists for, and no real server can be asked to
   do that on demand.
-- Full suite on the Windows target: 592 tests, clippy clean. The FTP and SFTP
-  suites run there too — the fake servers are ordinary std sockets.
+- `neutron-app` is tested for the two things that are easy to get wrong and
+  invisible when they are: what a location is *called* when an operation cannot
+  run there (`place.rs`), and turning a name the provider chose into a local
+  filename (`cloud.rs`). The second is the security-relevant one — its cases are
+  traversal, the NTFS stream colon, bare dots, control characters, device names,
+  trailing dots and a 5,000-character name.
+- Full suite on the Windows target: **623 tests**, clippy clean. The FTP and
+  SFTP suites run there too — the fake servers are ordinary std sockets.

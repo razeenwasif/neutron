@@ -21,6 +21,7 @@
 mod app;
 mod archive_ops;
 mod bench;
+mod cloud;
 mod commands;
 mod connect;
 mod finder;
@@ -31,6 +32,7 @@ mod loader;
 mod notice;
 mod preview;
 mod panes;
+mod place;
 mod remote;
 mod plugins;
 mod sidebar;

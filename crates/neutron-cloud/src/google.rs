@@ -140,6 +140,104 @@ impl GoogleDrive {
         Ok(token)
     }
 
+    /// Reads one object's metadata: the fields a download needs to decide what
+    /// it is doing.
+    ///
+    /// **Worker thread only.**
+    pub fn stat(&self, file_id: &str) -> Result<drive::DriveFile, String> {
+        let token = self.access_token().map_err(|e| e.to_string())?;
+        let response = self
+            .client
+            .get(format!(
+                "https://www.googleapis.com/drive/v3/files/{}",
+                drive::urlencode(file_id)
+            ))
+            .bearer_auth(&token)
+            .query(&[
+                ("fields", "id,name,mimeType,size,trashed,shortcutDetails/targetId"),
+                ("supportsAllDrives", "true"),
+            ])
+            .send()
+            .map_err(|e| format!("could not reach Drive: {e}"))?;
+
+        let status = response.status();
+        let body = response.text().map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(drive::describe_api_error(&body, status.as_u16()));
+        }
+        serde_json::from_str(&body).map_err(|e| format!("Drive metadata: {e}"))
+    }
+
+    /// Streams one object's bytes into `sink`, reporting progress.
+    ///
+    /// **Worker thread only** — this blocks for as long as the transfer takes.
+    ///
+    /// Streamed rather than buffered: `response.bytes()` would hold the whole
+    /// file in memory before a byte reached the disk, which for the video
+    /// someone keeps in Drive is hundreds of megabytes to save a few lines.
+    pub fn download(
+        &self,
+        file_id: &str,
+        fetch: &drive::Fetch,
+        sink: &mut dyn std::io::Write,
+        on_progress: &mut dyn FnMut(u64) -> drive::Continue,
+    ) -> Result<u64, String> {
+        let token = self.access_token().map_err(|e| e.to_string())?;
+
+        let request = match fetch {
+            drive::Fetch::Impossible => {
+                return Err("Drive cannot produce a file from this".to_owned());
+            }
+            drive::Fetch::Bytes => self
+                .client
+                .get(format!(
+                    "https://www.googleapis.com/drive/v3/files/{}",
+                    drive::urlencode(file_id)
+                ))
+                .query(&[("alt", "media"), ("supportsAllDrives", "true")]),
+            drive::Fetch::Export { mime, .. } => self
+                .client
+                .get(format!(
+                    "https://www.googleapis.com/drive/v3/files/{}/export",
+                    drive::urlencode(file_id)
+                ))
+                .query(&[("mimeType", *mime)]),
+        };
+
+        let mut response = request
+            .bearer_auth(&token)
+            .send()
+            .map_err(|e| format!("could not reach Drive: {e}"))?;
+
+        // Checked before a single byte is written. A failed export answers with
+        // an error document and HTTP 403, and a client that streams first would
+        // save that document under the file's own name — a "download" that
+        // produces a plausible-looking file containing an error message is
+        // worse than one that fails.
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().unwrap_or_default();
+            return Err(drive::describe_api_error(&body, status));
+        }
+
+        let mut total = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = std::io::Read::read(&mut response, &mut buffer)
+                .map_err(|e| format!("transfer failed: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            sink.write_all(&buffer[..read])
+                .map_err(|e| format!("could not write the file: {e}"))?;
+            total += read as u64;
+            if on_progress(total) == drive::Continue::Stop {
+                return Err("stopped".to_owned());
+            }
+        }
+        Ok(total)
+    }
+
     /// Lists one Drive folder, following pagination to the end.
     ///
     /// **Worker thread only.**
@@ -193,7 +291,7 @@ impl GoogleDrive {
         let body = response.text().map_err(|e| AuthError::Http(e.to_string()))?;
 
         if !status.is_success() {
-            return Err(AuthError::Provider(flow::describe_token_error(
+            return Err(AuthError::Provider(drive::describe_api_error(
                 &body,
                 status.as_u16(),
             )));

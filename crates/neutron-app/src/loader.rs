@@ -49,6 +49,8 @@ struct Request {
 enum Job {
     Load(Request),
     ReloadSites,
+    /// Drop the Drive client, so signing out takes effect here too.
+    SignOutDrive,
 }
 
 /// A finished load, ready to display.
@@ -133,6 +135,16 @@ impl Loader {
         let _ = self.requests.send(Job::ReloadSites);
     }
 
+    /// Tells the worker to forget the Drive client it has been reusing.
+    ///
+    /// Signing out clears the refresh token, but this worker holds a cached
+    /// *access* token that stays valid for the best part of an hour. Without
+    /// this, a Drive folder would go on listing happily after the user
+    /// disconnected — which is the one thing "Disconnect" must not do.
+    pub fn sign_out_drive(&self) {
+        let _ = self.requests.send(Job::SignOutDrive);
+    }
+
     /// Drops a closed tab's bookkeeping.
     pub fn forget(&mut self, tab: TabId) {
         self.generations.lock().remove(&tab);
@@ -166,7 +178,7 @@ fn worker(
     let shell = neutron_shell::shell_ns::ShellNamespace;
     // One provider for the thread's life: it caches the access token, and a
     // fresh one per request would refresh on every listing.
-    let drive = neutron_cloud::google::GoogleDrive::new();
+    let mut drive = neutron_cloud::google::GoogleDrive::new();
     // Connections to saved servers, opened on demand and kept for the thread's
     // life. See `crate::remote` for why they live here and not in the app.
     let mut sessions = crate::remote::Sessions::load();
@@ -176,6 +188,13 @@ fn worker(
             Job::Load(req) => req,
             Job::ReloadSites => {
                 sessions.reload();
+                continue;
+            }
+            Job::SignOutDrive => {
+                // Replaced rather than asked to sign out: the stored
+                // credential is already gone by the time this arrives, and the
+                // only thing left is the access token cached in this client.
+                drive = neutron_cloud::google::GoogleDrive::new();
                 continue;
             }
         };

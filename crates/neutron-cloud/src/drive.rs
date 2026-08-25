@@ -163,6 +163,26 @@ fn escape_query(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+/// Percent-encodes a value being interpolated into a URL *path* segment.
+///
+/// Drive ids are opaque strings from the API and in practice are alphanumeric
+/// with `-` and `_`. This exists for the same reason [`escape_query`] does: the
+/// id reaches a structured string from outside, and an id containing `/` or `?`
+/// would silently address a different endpoint. Unreserved characters are
+/// passed through, everything else is escaped.
+pub fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Parses an RFC 3339 timestamp to Unix milliseconds.
 ///
 /// Hand-rolled rather than pulling in a date library: Drive emits exactly one
@@ -362,5 +382,226 @@ mod tests {
         let page: FileList = serde_json::from_str(r#"{}"#).expect("parses");
         assert!(page.files.is_empty());
         assert!(page.next_page_token.is_none());
+    }
+}
+
+/// Whether a transfer should keep going. Checked between chunks so a download
+/// the user has stopped does not run to completion in the background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Continue {
+    Yes,
+    Stop,
+}
+
+/// How a Drive object's bytes are obtained.
+///
+/// Ordinary uploads have bytes and are fetched with `alt=media`. A Google Doc,
+/// Sheet or Slide **has none** — it is a server-side object, and the only way
+/// to get a file out of it is to ask Drive to render one, which means choosing
+/// a format the user did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetch {
+    /// `files/{id}?alt=media`.
+    Bytes,
+    /// `files/{id}/export?mimeType=…`, saved with `extension` appended.
+    Export { mime: &'static str, extension: &'static str },
+    /// A native format with no sensible export — a Form, a Site, a Map.
+    /// Refused with a sentence rather than downloading an error page.
+    Impossible,
+}
+
+/// Chooses how to fetch an object of `mime_type`.
+///
+/// The export targets are the Office formats rather than PDF: a spreadsheet
+/// downloaded as PDF is a picture of a spreadsheet, and the whole reason to
+/// pull a Sheet out of Drive is usually to work on it. A Drawing has no Office
+/// equivalent and becomes a PNG.
+///
+/// Note that Drive caps an export at 10MB and answers a larger one with an
+/// error, which surfaces as a failed download rather than a truncated file.
+pub fn fetch_for(mime_type: &str) -> Fetch {
+    match mime_type {
+        "application/vnd.google-apps.document" => Fetch::Export {
+            mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            extension: ".docx",
+        },
+        "application/vnd.google-apps.spreadsheet" => Fetch::Export {
+            mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            extension: ".xlsx",
+        },
+        "application/vnd.google-apps.presentation" => Fetch::Export {
+            mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            extension: ".pptx",
+        },
+        "application/vnd.google-apps.drawing" => Fetch::Export {
+            mime: "image/png",
+            extension: ".png",
+        },
+        "application/vnd.google-apps.script" => Fetch::Export {
+            mime: "application/vnd.google-apps.script+json",
+            extension: ".json",
+        },
+        // A Form, a Site, a Map, a shortcut that resolved to nothing. Drive
+        // exports none of these, and asking produces an error document that
+        // would be saved as though it were the file.
+        other if other.starts_with("application/vnd.google-apps.") => Fetch::Impossible,
+        _ => Fetch::Bytes,
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+
+    #[test]
+    fn an_uploaded_file_is_fetched_as_bytes() {
+        assert_eq!(fetch_for("image/png"), Fetch::Bytes);
+        assert_eq!(fetch_for("application/pdf"), Fetch::Bytes);
+        // Empty is what Drive gives when the field is missing. Treating it as
+        // an ordinary file is right: `alt=media` on something with no bytes
+        // fails with a message, which is better than refusing a real file.
+        assert_eq!(fetch_for(""), Fetch::Bytes);
+    }
+
+    #[test]
+    fn a_doc_exports_to_an_editable_format_not_a_pdf() {
+        let Fetch::Export { mime, extension } =
+            fetch_for("application/vnd.google-apps.document")
+        else {
+            panic!("a Doc must export");
+        };
+        assert!(mime.contains("wordprocessingml"), "{mime}");
+        assert_eq!(extension, ".docx");
+    }
+
+    #[test]
+    fn a_sheet_exports_to_a_spreadsheet() {
+        let Fetch::Export { extension, .. } =
+            fetch_for("application/vnd.google-apps.spreadsheet")
+        else {
+            panic!("a Sheet must export");
+        };
+        assert_eq!(extension, ".xlsx");
+    }
+
+    /// The case that must not silently produce a file: Drive answers an export
+    /// request for these with an error document, which a client that does not
+    /// check would write out under the file's own name.
+    #[test]
+    fn a_form_is_refused_rather_than_exported() {
+        assert_eq!(fetch_for("application/vnd.google-apps.form"), Fetch::Impossible);
+        assert_eq!(fetch_for("application/vnd.google-apps.site"), Fetch::Impossible);
+    }
+
+    /// A folder is never downloaded, but `fetch_for` must not claim it is
+    /// exportable if it is ever asked.
+    #[test]
+    fn a_folder_is_not_exportable() {
+        assert_eq!(fetch_for(FOLDER_MIME), Fetch::Impossible);
+    }
+}
+
+#[cfg(test)]
+mod urlencode_tests {
+    use super::*;
+
+    #[test]
+    fn an_ordinary_drive_id_is_unchanged() {
+        let id = "1AbC-dEfGh_iJkLmNoPqRsTuVwXyZ0123456789";
+        assert_eq!(urlencode(id), id);
+    }
+
+    /// The reason this function exists: a value carrying path structure must
+    /// not be able to address a different endpoint.
+    #[test]
+    fn separators_and_query_characters_are_escaped() {
+        assert_eq!(urlencode("a/b"), "a%2Fb");
+        assert_eq!(urlencode("a?alt=media"), "a%3Falt%3Dmedia");
+        assert_eq!(urlencode("../../files"), "..%2F..%2Ffiles");
+    }
+
+    #[test]
+    fn non_ascii_is_escaped_per_utf8_byte() {
+        assert_eq!(urlencode("é"), "%C3%A9");
+    }
+}
+
+/// Explains a failed Drive API call.
+///
+/// The Drive API and the OAuth token endpoint do not share an error shape. A
+/// token error is flat — `{"error":"invalid_grant", …}` — while an API error
+/// nests: `{"error":{"code":403,"message":"…"}}`. Handing the second to
+/// [`crate::flow::describe_token_error`] fails to deserialize and falls through
+/// to a bare "HTTP 403", which throws away the one part the user needs. The
+/// interesting failures here all live in that message: an export over Drive's
+/// 10MB limit, a daily quota, a file whose owner revoked sharing.
+pub fn describe_api_error(body: &str, status: u16) -> String {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        error: Option<Inner>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Inner {
+        message: Option<String>,
+    }
+
+    if let Ok(Envelope { error: Some(inner) }) = serde_json::from_str::<Envelope>(body) {
+        if let Some(message) = inner.message.filter(|m| !m.trim().is_empty()) {
+            return message;
+        }
+    }
+    // Not a Drive-shaped error. It may still be a token-shaped one — an expired
+    // credential surfaces on an API call, not only at the token endpoint.
+    crate::flow::describe_token_error(body, status)
+}
+
+#[cfg(test)]
+mod api_error_tests {
+    use super::*;
+
+    #[test]
+    fn the_message_is_what_comes_back() {
+        let body = r#"{"error":{"code":403,"message":"This file is too large to be exported.","errors":[]}}"#;
+        assert_eq!(
+            describe_api_error(body, 403),
+            "This file is too large to be exported."
+        );
+    }
+
+    #[test]
+    fn a_not_found_reads_as_itself() {
+        let body = r#"{"error":{"code":404,"message":"File not found: abc123."}}"#;
+        assert_eq!(describe_api_error(body, 404), "File not found: abc123.");
+    }
+
+    /// An expired credential can surface on an API call rather than at the
+    /// token endpoint, and it has the flat shape. It must not be lost.
+    #[test]
+    fn a_token_shaped_error_still_falls_through() {
+        let body = r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
+        assert!(
+            describe_api_error(body, 401).contains("sign in again"),
+            "{}",
+            describe_api_error(body, 401)
+        );
+    }
+
+    /// Google sometimes answers with an HTML error page — from a proxy, or a
+    /// 502. There is nothing to parse and the status is all there is.
+    #[test]
+    fn an_unparseable_body_reports_the_status() {
+        assert_eq!(describe_api_error("<html>502</html>", 502), "HTTP 502");
+        assert_eq!(describe_api_error("", 500), "HTTP 500");
+    }
+
+    /// An envelope with no message must not report an empty string, which
+    /// would reach the status bar as a blank error.
+    #[test]
+    fn an_empty_message_falls_back_rather_than_showing_nothing() {
+        assert_eq!(describe_api_error(r#"{"error":{"code":500}}"#, 500), "HTTP 500");
+        assert_eq!(
+            describe_api_error(r#"{"error":{"message":"   "}}"#, 500),
+            "HTTP 500"
+        );
     }
 }

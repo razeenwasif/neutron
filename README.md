@@ -2,14 +2,21 @@
 
 A faster Windows file explorer. Rust, `egui`/`wgpu`, single binary.
 
-**Status: M6 complete** — tabs and arbitrarily nested split panes over a
-virtualized listing, with sortable columns, keyboard navigation, a live sidebar
-of drives, known folders, OneDrive and WSL distributions, and a layout that
-survives restart. Real shell icons, native right-click menus, Recycle Bin
-deletes, and drag-and-drop from other applications. Everything-style search over
-3.3M files across every NTFS volume, a scoped fuzzy finder, and a command
-palette. This PC, Network, Control Panel, the Recycle Bin and the inside of a
-zip all browse like folders. A 100k-entry folder opens in 88ms and scrolls at 0.14ms per frame.
+**Status: M7 complete, plus everything since.** Tabs and arbitrarily nested
+split panes over a virtualized listing, with sortable columns, keyboard
+navigation, a live sidebar of drives, known folders, OneDrive and WSL
+distributions, and a layout that survives restart. Real shell icons, a
+themed right-click menu built from the real shell one, Recycle Bin deletes, and
+drag-and-drop in *and* out. Everything-style search over 3.3M files across every
+NTFS volume, a scoped fuzzy finder, and a command palette. This PC, Network,
+Control Panel, the Recycle Bin and the inside of a zip all browse like folders.
+
+Since M7: cut/copy/paste, rename, new folders and rubber-band selection; a grid
+view; a preview pane; listings that update themselves; zip and tar archives;
+plugins as separate processes; FTP, FTPS and SFTP servers; Google Drive over the
+API; and one status line that says when any of it fails.
+
+A 100k-entry folder opens in ~92ms and scrolls at 0.23ms per frame.
 
 ---
 
@@ -76,6 +83,9 @@ crates/
   neutron-shell/    Win32 + COM: enumeration, icons, context menus
   neutron-index/    NTFS journal indexing, query engine, wire protocol
   neutron-cloud/    OneDrive and Google Drive providers
+  neutron-archive/  zip and tar: extract, compress         ← no Win32, tests on Linux
+  neutron-plugin/   manifests, child processes, protocol   ← no Win32, tests on Linux
+  neutron-remote/   FTP, FTPS and SFTP clients
   neutron-indexer/  elevated helper process                (bin: neutron-indexer)
 xtask/              build driver (Linux-side only)
 assets/             app icon (SVG source, .ico, raw RGBA)
@@ -136,11 +146,11 @@ apartment thread* and tracks the menu there — which also gives
 `IContextMenu2/3::HandleMenuMsg` somewhere to be forwarded from, so owner-drawn
 third-party items keep their icons, without subclassing winit's window.
 
-**Not yet:** dragging *out* of Neutron into another application. That needs
-`DoDragDrop` with our own `IDataObject`, and `DoDragDrop` is modal on the thread
-holding the mouse capture — the UI thread. Doing it properly means an
-asynchronous data object rather than blocking a frame, which is its own design
-rather than a loose end to tie off here.
+**Dragging out** was the last piece and needed its own answer. `DoDragDrop` is
+modal on the thread holding the mouse capture, so it runs on the STA pool with
+the input queues joined — the window keeps painting for the whole drag. The data
+object comes from `SHCreateDataObject` rather than being hand-rolled, so every
+format a drop target might ask for is answered.
 
 ---
 
@@ -250,9 +260,50 @@ addressed by id rather than path (a file can live in several folders), names are
 not unique within a folder, and native Google formats have no bytes to download
 without an export format.
 
+Each of the three shows up somewhere visible:
+
+**Folders are navigated by id.** A Drive folder id is not a path and not a shell
+parsing name, so opening one is its own branch — and the folder's *name* travels
+with the id, because an id says nothing about which folder it is and resolving
+one would be an API call on the paint thread.
+
+**Opening a file fetches a copy** to `%TEMP%\Neutron\GoogleDrive\` and opens
+that, the same way a file on a server does, with the same progress and Stop in
+the status bar. The status line says **opened a local copy**, because editing it
+does not write back — the scope is read-only and there is nowhere for the edit
+to go.
+
+**A Google Doc has no bytes at all.** Docs, Sheets and Slides are exported to
+`docx`, `xlsx` and `pptx` rather than to PDF: a spreadsheet exported as PDF is a
+picture of a spreadsheet, and the reason to pull a Sheet out of Drive is usually
+to work on it. A Form, a Site or a Map has no export, and is refused by name —
+Drive answers an export request for those with an error *document*, which a
+client that streamed before checking the status would save under the file's own
+name.
+
+**A Drive name is not a filename**, and this is the part that needed care. Drive
+names are not paths, so Drive barely restricts them: `Q3/Q4 forecast`, `..`,
+`notes.txt:hidden` and a name containing a newline are all names the API will
+hand back, and joining one onto a directory writes outside it. Refusing them —
+which is the right answer for an FTP listing, where a server sending such a name
+is misbehaving — would be wrong here, because a slash in a Drive name is
+ordinary and the file would simply become unopenable. So the name is rewritten
+into one certainly-safe component, and the result is then put through the same
+rejector the listing side uses, as a proof rather than a second opinion.
+
+**Up does not work inside Drive, on purpose.** A Drive object can sit in several
+folders at once, so "the" parent of a folder is a question with more than one
+answer, and picking one would send Up somewhere you never came from. The button
+greys out, as it does in This PC; Back walks the trail that actually happened.
+
+**Disconnect Google Drive** in the palette clears the stored credential and
+drops the cached token, so a Drive folder stops listing the moment you
+disconnect rather than most of an hour later.
+
 > If you install Google Drive for Desktop, Drive becomes a drive letter and a
 > shell namespace extension — which M6 already handles, for free. This path
-> exists for machines without it.
+> exists for machines without it, and is the one that can reach a file the
+> local client has not synced.
 
 ---
 
@@ -269,6 +320,14 @@ folder, paste, delete, drop, drag, clipboard, open, context menu — ended in a
 log line and nothing on screen, so a rename that failed looked exactly like a
 file manager that had ignored the keystroke. A tool that fails silently is one
 you check with a second tool afterwards, and then you are using the second one.
+
+The same applies to something Neutron cannot do *here*. Four kinds of place can
+be open in a pane and only one of them — a real folder — has a filesystem path,
+so pressing `F2` inside a zip or `Delete` in Google Drive reaches for a path
+that does not exist. Each of those now says which place it is looking at, and
+distinguishes two answers that are not the same: a server and a Drive folder are
+places Neutron *will* write to, so the sentence ends in "yet"; Control Panel is
+not, so it does not get a promise about something that is not coming.
 
 ---
 
@@ -295,7 +354,12 @@ listed name carrying path structure is refused and the folder opens without it.
 Opening a remote file fetches a copy to `%TEMP%` and opens that; editing it does
 not write back, and the status bar says so. Nothing writes to a server yet —
 rename, delete, paste and new folder all refuse with a sentence.
-`docs/servers.md` has the manifest reference and the rest.
+
+**Forget this server** in the palette removes the one you are looking at, and
+takes its password out of Credential Manager with it. Until that existed a saved
+server could only be removed by editing `sites.json` by hand, which left the
+password behind — a credential the application would store and would not let go
+of. `docs/servers.md` has the manifest reference and the rest.
 
 ---
 
@@ -376,9 +440,15 @@ do not.
 | `Alt+←` `Alt+→` | Back / forward |
 | *type a name* | Jump to it; repeat a letter to cycle matches |
 | `Ctrl+A` | Select all |
+| *press and drag* | Rubber-band select (hold `Ctrl` to add) |
+| `Ctrl+C` `Ctrl+X` `Ctrl+V` | Copy / cut / paste, through the real Windows clipboard |
+| `F2` | Rename in place, with the stem selected |
+| `Ctrl+Shift+N` | New folder, ready to be named |
 | `Ctrl+N` | Open a second window here |
 | ``Ctrl+` `` | Open a terminal here — see `docs/terminal.md` |
 | `Ctrl+H` | Show hidden files |
+| `Ctrl+Shift+L` | Switch between the list and the grid |
+| `Alt+P` | Show the preview pane |
 | `Ctrl+F` | Filter the current listing (`Esc` clears it) |
 | `Ctrl+Shift+F` | Search every volume (arrows move, `Enter` opens, `Esc` closes) |
 | `Ctrl+P` | Fuzzy-find a file in this folder and below |
@@ -386,7 +456,7 @@ do not.
 | *double-click a `.zip`* | Browse inside it, as Explorer does |
 | `Delete` | Send the selection to the Recycle Bin |
 | `Shift+Delete` | Delete permanently (the shell still confirms) |
-| *right-click* | Native shell context menu |
+| *right-click* | The shell's own menu, drawn in Neutron's glass |
 | `F5`, `Ctrl+R` | Refresh |
 | `Esc` | Clear selection |
 | `Ctrl+D` | Toggle dark/light theme |
@@ -395,8 +465,8 @@ The filter narrows the listing already in memory — a case-insensitive substrin
 over names, applied without touching the disk, so it stays instant while typing
 even in a 100k-entry directory. It clears on navigation, because a filter
 describing the folder you left would silently empty the one you entered. Fuzzy
-matching across the whole index is a different thing and arrives with the finder
-overlay at M5.
+matching across the whole index is a different thing, and lives in the finder
+overlay above.
 
 ### Tabs and panes
 
@@ -443,15 +513,21 @@ neutron --bench <path> [runs]      headless enumerate + sort timing
 
 ## Design
 
-**Cards on a lit ground.** The sidebar and each pane are rounded cards with a
-soft shadow and real margin from the window edge. Between and around them the
-**ground** shows through, carrying a pale lavender wash and three static
-coloured lights whose overlap gives the window a prismatic cast. Cards are ~88%
-opaque, so that cast tints them — and tints them differently in different parts
-of the window, which is what stops them reading as flat white cutouts.
+**Glass on a lit ground.** Three layers. At the bottom a near-black deep violet
+ground with an overhead light. Above it two large, slowly drifting colour fields
+— a vibrant purple and an electric indigo — each close to window-sized, so what
+you see is the gradient where they overlap rather than a recognisable circle.
+Their loops are 41s and 57s and share no common factor, so the pair never
+settles into a visible repeat. On top of both, the sidebar and each pane are
+translucent glass cards with a top-edge highlight, a darker bottom edge so the
+panel has thickness, and the moving fields refracting underneath.
 
-Depth comes from elevation, not from ruled borders. Light is the default; dark
-is `Ctrl+D`.
+The dark card fill is *lighter* than the ground, not darker. At this
+transparency a near-ground fill composites to the same colour and the card's
+edge disappears in the unlit corners.
+
+Depth comes from elevation, not from ruled borders. **Dark is the default**;
+light is `Ctrl+D`.
 
 **Colour is scarce, except on the ground.** Every surface that carries content
 is near-neutral. The accent appears in roughly three places — the selected row,
@@ -461,9 +537,13 @@ signal: if everything is purple, purple stops meaning "this is selected". The
 ground is exempt precisely because no text ever lands on it, so colour there
 costs nothing in legibility.
 
-**The lights do not move.** An earlier version drifted them on a timer, which
-forced a repaint every 33 ms purely for decoration and held the process at ~9%
-of a core while nobody was touching it. Static, the app measures 0.3% idle.
+**The drifting is paid for, and the bill is known.** A moving ground needs a
+continuous repaint, which is the one piece of this program that costs something
+for decoration alone: **17.7%** of a core at 60fps, **8.4%** at 30fps — the
+current setting — against **0.3%** for a static ground. Since the loops are 41
+and 57 seconds long the lower rate is visually identical, and an unfocused
+window drops further. It is a deliberate trade rather than an oversight, which
+is why the number is written down.
 
 **Navigation lives in the pane, not in a toolbar.** Back/forward/up, the
 breadcrumb, the location title and the filter field are all inside each pane's
@@ -487,13 +567,17 @@ See [`docs/perf.md`](docs/perf.md) for measured numbers.
 
 | Metric | Target | Actual |
 |---|---:|---:|
-| Enumerate + sort 100k entries | <200 ms | **88 ms** |
-| Frame time p99 while scrolling | <8 ms | **0.40 ms** |
+| Enumerate + sort 100k entries | <200 ms | **~92 ms** |
+| Frame time p99 while scrolling | <8 ms | **0.23 ms** |
 | Index 3.3M files, all volumes | <10 s | **2.6 s** (warm cache) |
 | Search, incremental keystroke | <1 ms | **0.003 ms** |
 | Search, first character | <1 ms | 6–9 ms ❌ |
-| Cold start | <100 ms | ~1040 ms ❌ |
-| Idle memory | <60 MB | ~280 MB ❌ |
+| Cold start | <100 ms | 374 ms ❌ |
+| Idle memory | <60 MB | 310 MB ❌ |
+| Binary size | ~15 MB | 18.8 MiB ❌ |
+
+These track [`docs/perf.md`](docs/perf.md), which is the measurement of record;
+an earlier version of this table had drifted from it.
 
 Cold start and idle memory share one cause — GPU device creation, which costs
 the best part of a second and a few hundred megabytes before any of our code
@@ -502,3 +586,7 @@ threshold where a keystroke feels delayed, but the target says <1ms and is not
 met. Closing it means an n-gram or suffix structure over the name arena, which
 is real memory for a latency nobody can perceive. That file records the
 measurements, the causes, and the options.
+
+The binary misses its target because of the server clients — `russh`, `rustls`,
+`tokio` and `suppaftp` are most of the gap. Nothing is loaded until a server is
+opened, so start-up and idle memory are unaffected by it.

@@ -50,6 +50,12 @@ pub enum NodeId {
     Cloud {
         provider: CloudProviderId,
         id: Arc<str>,
+        /// What to show in the tab and breadcrumb, carried for the same reason
+        /// `Shell` carries one: the id is opaque. A Drive folder id says
+        /// nothing about which folder it is, and resolving it would mean an
+        /// API call on the paint thread. Without this every folder in Drive
+        /// was titled "Google Drive", including all of its subfolders.
+        name: Arc<str>,
     },
 
     /// A directory on a saved FTP, FTPS or SFTP server.
@@ -109,6 +115,19 @@ impl NodeId {
         }
     }
 
+    /// A location inside a cloud provider.
+    pub fn cloud(
+        provider: CloudProviderId,
+        id: impl Into<Arc<str>>,
+        name: impl Into<Arc<str>>,
+    ) -> Self {
+        NodeId::Cloud {
+            provider,
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
     /// A shell namespace location.
     pub fn shell(parsing: impl Into<Arc<str>>, display: impl Into<Arc<str>>) -> Self {
         NodeId::Shell {
@@ -134,10 +153,7 @@ impl NodeId {
                 // A drive root has no file_name; show the root itself.
                 .unwrap_or_else(|| p.to_string_lossy().into_owned()),
             NodeId::Shell { display, .. } => display.to_string(),
-            NodeId::Cloud { provider, .. } => match provider {
-                CloudProviderId::GoogleDrive => "Google Drive".to_owned(),
-                CloudProviderId::OneDrive => "OneDrive".to_owned(),
-            },
+            NodeId::Cloud { name, .. } => name.to_string(),
             // The last segment, or the site's id at the root — a tab titled
             // "/" says nothing about which server it is on.
             NodeId::Remote { site, path } => match path.rsplit('/').next() {
@@ -164,8 +180,14 @@ impl NodeId {
                     Some(cut) => Some(NodeId::remote(site.clone(), &trimmed[..cut])),
                 }
             }
-            // Shell and cloud parents need their backend to resolve, so they
-            // are not derivable here.
+            // A shell parent needs COM to walk, which cannot happen while
+            // painting.
+            //
+            // A cloud parent is not merely unresolvable here — for Drive it is
+            // not well defined. An object can sit in several folders at once,
+            // so "the" parent of a Drive folder is a question with more than
+            // one answer, and picking one would send Up somewhere the user did
+            // not come from. Back walks the trail that actually happened.
             _ => None,
         }
     }
@@ -176,7 +198,7 @@ impl fmt::Display for NodeId {
         match self {
             NodeId::Path(p) => write!(f, "{}", p.display()),
             NodeId::Shell { parsing, .. } => write!(f, "{parsing}"),
-            NodeId::Cloud { provider, id } => write!(f, "<{provider:?}:{id}>"),
+            NodeId::Cloud { provider, id, .. } => write!(f, "<{provider:?}:{id}>"),
             NodeId::Remote { site, path } => write!(f, "{site}:{path}"),
         }
     }

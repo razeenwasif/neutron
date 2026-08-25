@@ -56,6 +56,9 @@ pub enum CommandId {
 
     ConnectServer,
     ReloadSites,
+    ForgetServer,
+
+    SignOutDrive,
 
     OpenTerminal,
     NewWindow,
@@ -176,6 +179,23 @@ pub const ALL: &[CommandDef] = &[
     CommandDef {
         id: CommandId::ReloadSites,
         title: "Reload saved servers",
+        hint: "",
+    },
+    // The other half of "Connect to a server". Without it a saved server can
+    // only be removed by hand-editing `sites.json`, and its password stays in
+    // Credential Manager for good — a credential you cannot revoke from the
+    // application that stored it.
+    CommandDef {
+        id: CommandId::ForgetServer,
+        title: "Forget this server",
+        hint: "",
+    },
+
+    // Likewise the other half of "Connect Google Drive" in the sidebar. The
+    // sign-out existed in `neutron-cloud` from the start and nothing called it.
+    CommandDef {
+        id: CommandId::SignOutDrive,
+        title: "Disconnect Google Drive",
         hint: "",
     },
 ];
