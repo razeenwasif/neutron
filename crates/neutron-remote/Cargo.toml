@@ -23,7 +23,20 @@ suppaftp = { version = "10", features = ["rustls-ring"] }
 # alternative is libssh2 through a C build, and this project cross-compiles
 # from WSL to the MSVC toolchain, where every C dependency is a new way for the
 # build to break.
-russh = "0.63"
+#
+# Which is also why the crypto backend is pinned. `russh`'s default features
+# select `aws-lc-rs`, and its `aws-lc-sys` is C plus hand-written assembly that
+# refuses to build for the MSVC target unless NASM is on PATH — the C
+# dependency this crate was chosen to avoid, arriving through the back door.
+# `ring` is already linked here through rustls (reqwest for Drive, suppaftp for
+# FTPS), and `russh` implements the same cipher set on either backend, so this
+# is one crypto library in the binary instead of two rather than a reduction in
+# what can be negotiated.
+russh = { version = "0.63", default-features = false, features = [
+    "flate2",
+    "ring",
+    "rsa",
+] }
 russh-sftp = "2.4"
 # Only ever a current-thread runtime driving one connection. russh is async and
 # there is no sync client worth using; this keeps that contained to one thread.
