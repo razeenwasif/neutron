@@ -306,6 +306,9 @@ pub fn placeholder_row(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph, why:
     response.on_hover_text(why);
 }
 
+// As in `preview.rs`: what is below is drawing, and these tests are about the
+// choices above them.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;

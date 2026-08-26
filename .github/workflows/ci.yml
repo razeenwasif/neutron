@@ -1,0 +1,133 @@
+# What has to be true of every commit.
+#
+# The Windows job is the one that matters most: `neutron.exe` is an MSVC-target
+# binary and half the tree is Win32, so a green Linux build proves little on its
+# own.
+#
+# The Linux job is not merely the fast one. `neutron-plugin`'s integration
+# tests are `#![cfg(unix)]` and run ZERO tests on Windows, so the suite that
+# drives real child processes is executed there and nowhere else.
+#
+# Deliberately absent: `cargo fmt --check`. This tree is hand-formatted and does
+# not match rustfmt's output, so that check would fail on every commit and be
+# switched off within a week — which is worse than not having it.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # So a run can be asked for without inventing a commit.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a failed test is the difference between a re-run and a fix.
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows:
+    name: Windows (the shipped target)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The check that exists because of a real break.
+      #
+      # `russh` at default features selects `aws-lc-rs`, whose `aws-lc-sys` is C
+      # and hand-written assembly that will not build for the MSVC target unless
+      # NASM is on PATH — so a clean checkout stopped compiling, and nothing
+      # said so for weeks.
+      #
+      # This asserts the dependency is absent rather than asserting the build
+      # works without NASM, on purpose: a runner image that happens to ship NASM
+      # would make the second check pass while the machine of anyone without it
+      # still failed. The tree is the thing to pin.
+      - name: The crypto backend must stay pure Rust
+        shell: pwsh
+        run: |
+          cargo tree --invert aws-lc-rs --edges normal 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "aws-lc-rs is back in the dependency tree. It needs NASM to build for MSVC; pin russh to the ring backend instead."
+            exit 1
+          }
+          Write-Host "aws-lc-rs is absent, as it should be."
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # Includes the FTP and SFTP suites, which stand up real servers on real
+      # sockets — they need no network access, only a loopback interface.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  linux:
+    name: Linux (and the plugin tests, which only run here)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The crates that do not depend on `windows`, which is why they can run
+      # here at all — they cannot perform a shell call, and that is a property
+      # worth having a machine confirm rather than trusting.
+      #
+      # `neutron-plugin` is here for a stronger reason than speed.
+      # `tests/plugins.rs` is `#![cfg(unix)]`, so on Windows it runs ZERO tests:
+      # the whole suite that drives real child processes which hang, crash,
+      # print nonsense, never read their input or print forever is skipped on
+      # the shipped target. This job is the only place it executes.
+      #
+      # `neutron-app` is absent because it pulls `eframe`, and a headless
+      # runner has no reason to build a renderer.
+      - name: Test the crates that do not need Win32
+        run: >
+          cargo test
+          -p neutron-core
+          -p neutron-ui
+          -p neutron-fuzzy
+          -p neutron-archive
+          -p neutron-plugin
+
+      - name: Clippy
+        run: >
+          cargo clippy
+          -p neutron-core
+          -p neutron-ui
+          -p neutron-fuzzy
+          -p neutron-archive
+          -p neutron-plugin
+          --all-targets -- -D warnings
+
+  # The version in Cargo.toml is a promise, and an unenforced one drifts: a
+  # let-else or an edition-2024 pattern compiles fine on the toolchain it was
+  # written with and fails for whoever took the project at its word.
+  # Verified against 1.85 locally before this job was written, so a red run
+  # here means a dependency raised its own floor, not that the job is
+  # aspirational.
+  msrv:
+    name: Builds on the stated minimum Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo check
+          -p neutron-core
+          -p neutron-fuzzy

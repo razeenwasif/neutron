@@ -180,7 +180,7 @@ fn modification_times_survive_a_round_trip() {
         .unwrap();
 
     let archive = root.join("out.zip");
-    create::zip(&[file.clone()], &source, &archive, |_| Continue::Yes).unwrap();
+    create::zip(std::slice::from_ref(&file), &source, &archive, |_| Continue::Yes).unwrap();
 
     let destination = root.join("back");
     extract(&archive, &destination, Format::Zip, |_| Continue::Yes).unwrap();

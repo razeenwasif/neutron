@@ -505,6 +505,10 @@ Not changed: `IPreviewHandler` is still absent, for the reasons in section 7.
   hang, crash, print nonsense, never read their input, print forever, or emit
   one endless line. Those are the cases a mock cannot check, because the failure
   being guarded against is the pipe and the process.
+  - **These run on Linux only.** The file is `#![cfg(unix)]`, so on Windows it
+    reports zero tests and the suite is silently skipped. Until section 19 it
+    was running nowhere at all, which is worth stating beside a claim about
+    what is tested.
 - `neutron-remote` is tested against **real servers over real sockets**, both
   written in the test files: an FTP server that can be told to lie, and an SSH
   server built from `russh`'s own server side. The second exists for one test in
@@ -517,5 +521,57 @@ Not changed: `IPreviewHandler` is still absent, for the reasons in section 7.
   filename (`cloud.rs`). The second is the security-relevant one — its cases are
   traversal, the NTFS stream colon, bare dots, control characters, device names,
   trailing dots and a 5,000-character name.
-- Full suite on the Windows target: **629 tests**, clippy clean. The FTP and
-  SFTP suites run there too — the fake servers are ordinary std sockets.
+- Full suite on the Windows target: **629 tests**, and clippy clean under
+  `--all-targets -- -D warnings`, which is what CI runs. The FTP and SFTP
+  suites run there — the fake servers are ordinary std sockets — but the
+  plugin suite does not; see above.
+
+#### 19. Continuous Integration
+
+There was none. Section 14's first item — a clean checkout that would not
+compile, because `russh` pulled in a C library needing NASM — sat in the tree
+undetected, and a `windows-latest` runner doing nothing more than
+`cargo build` would have said so the day it landed. That is the argument for
+this, and it is the whole argument.
+
+Three jobs, each earning its place:
+
+**Windows**, because that is what ships. `neutron.exe` is an MSVC-target binary
+and half the tree is Win32, so a green Linux build proves little on its own.
+Build, the full test suite, and clippy at `-D warnings`.
+
+**Linux**, and *not* merely because it is fast. `neutron-plugin`'s integration
+tests are `#![cfg(unix)]`, so on Windows they run **zero tests** — the suite
+that drives real child processes which hang, crash, print nonsense, never read
+their input or print forever is skipped entirely on the shipped target. It has
+been running nowhere at all. This job is the only place it executes, which
+makes it load-bearing rather than a convenience.
+
+**The stated minimum Rust.** `rust-version = "1.85"` is a promise to anyone who
+takes the project at its word, and an unenforced one drifts — a pattern
+compiles fine on the toolchain it was written with and fails for them. Checked
+against a real 1.85 toolchain before the job was written, so a red run there
+means a dependency raised its own floor rather than that the job was
+aspirational.
+
+**One check is specifically a regression guard.** It asserts `aws-lc-rs` is
+absent from the dependency tree, rather than asserting that the build works
+without NASM. The second would be the obvious test and is the wrong one: a
+runner image that happens to ship NASM would pass it while the machine of
+anyone without NASM still failed. The dependency is the thing to pin, not its
+symptom.
+
+**Deliberately absent: `cargo fmt --check`.** This tree is hand-formatted and
+does not match rustfmt's output — 126 diffs in `neutron-app` alone. A check that
+fails on every commit gets switched off within a week, and a switched-off check
+is worse than an absent one because it looks like coverage.
+
+**The ten warnings.** `-D warnings` needs a green baseline, and
+`--all-targets` had ten it had never been run against: two `clone`s that wanted
+`slice::from_ref`, four compile-time assertions that wanted `const` blocks, one
+`Default` field reassignment, and two files whose tests sit above their drawing
+half. The first seven are now fixed. The last two carry a targeted `allow` with
+a reason, because those tests are about what a preview *is* and belong beside
+that code rather than after several hundred lines of egui calls they say nothing
+about. "Clippy clean" was true of the default invocation and is now true of the
+one CI runs.

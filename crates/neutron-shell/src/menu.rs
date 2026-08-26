@@ -589,14 +589,14 @@ mod tests {
     fn command_ids_never_collide_with_dismissal() {
         // TrackPopupMenuEx reports 0 for "dismissed". A command allocated id 0
         // would be silently swallowed every time it was picked.
-        assert!(CMD_FIRST > 0);
-        assert!(CMD_LAST > CMD_FIRST);
+        const { assert!(CMD_FIRST > 0) };
+        const { assert!(CMD_LAST > CMD_FIRST) };
     }
 
     #[test]
     fn submenus_are_not_followed_forever() {
         // A handler that hands back a menu containing itself would otherwise
         // recurse until the stack ran out.
-        assert!(MAX_DEPTH > 0 && MAX_DEPTH < 16);
+        const { assert!(MAX_DEPTH > 0 && MAX_DEPTH < 16) };
     }
 }

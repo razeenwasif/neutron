@@ -594,7 +594,7 @@ mod tests {
     fn a_short_pane_spends_its_height_on_rows() {
         // Four-way vertical splits leave very little height, and a 40pt
         // heading there would cost most of the visible listing.
-        assert!(TITLE_MIN_PANE_HEIGHT > NAV_ROW + TITLE_ROW * 2.0);
+        const { assert!(TITLE_MIN_PANE_HEIGHT > NAV_ROW + TITLE_ROW * 2.0) };
     }
 
     #[test]

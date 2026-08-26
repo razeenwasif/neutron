@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn pasting_a_folder_into_itself_is_refused() {
         let src = PathBuf::from(r"C:\work");
-        assert!(!can_paste_into(&[src.clone()], Path::new(r"C:\work")));
+        assert!(!can_paste_into(std::slice::from_ref(&src), Path::new(r"C:\work")));
     }
 
     #[test]

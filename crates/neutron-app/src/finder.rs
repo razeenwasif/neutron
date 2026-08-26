@@ -589,8 +589,10 @@ mod tests {
 
     #[test]
     fn an_empty_list_pins_the_cursor() {
-        let mut f = Finder::default();
-        f.cursor = 5;
+        let mut f = Finder {
+            cursor: 5,
+            ..Default::default()
+        };
         f.move_cursor(1);
         assert_eq!(f.cursor, 0);
         assert!(f.rows.is_empty());

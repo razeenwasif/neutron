@@ -628,6 +628,11 @@ pub fn decode_text(bytes: &[u8]) -> Option<String> {
     }
 }
 
+// The drawing half of this module follows the tests rather than preceding
+// them, because these tests are about what a preview *is* — decoding, capping,
+// what counts as text — and belong beside that half rather than after several
+// hundred lines of egui calls they say nothing about.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
