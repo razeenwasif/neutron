@@ -50,15 +50,20 @@ jobs:
       # works without NASM, on purpose: a runner image that happens to ship NASM
       # would make the second check pass while the machine of anyone without it
       # still failed. The tree is the thing to pin.
+      #
+      # bash rather than pwsh: `cargo tree` exits non-zero when the package is
+      # not found, which is the success case here, and pwsh carried that through
+      # to the step's own exit code — the guard printed the right answer and
+      # failed the job anyway. `if cmd; then` has no such subtlety, and it is
+      # the same script that can be run locally to check both outcomes.
       - name: The crypto backend must stay pure Rust
-        shell: pwsh
+        shell: bash
         run: |
-          cargo tree --invert aws-lc-rs --edges normal 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Error "aws-lc-rs is back in the dependency tree. It needs NASM to build for MSVC; pin russh to the ring backend instead."
+          if cargo tree --invert aws-lc-rs --edges normal >/dev/null 2>&1; then
+            echo "::error::aws-lc-rs is back in the dependency tree. It needs NASM to build for the MSVC target; pin russh to the ring backend instead."
             exit 1
-          }
-          Write-Host "aws-lc-rs is absent, as it should be."
+          fi
+          echo "aws-lc-rs is absent, as it should be."
 
       - name: Build
         run: cargo build --workspace --all-targets
