@@ -457,7 +457,7 @@ do not.
 | ``Ctrl+` `` | Open a terminal here — see `docs/terminal.md` |
 | `Ctrl+H` | Show hidden files |
 | `Ctrl+Shift+L` | Switch between the list and the grid |
-| `Alt+P` | Show the preview pane |
+| `Alt+P` | Show the preview pane — works on servers and in Drive too |
 | `Ctrl+F` | Filter the current listing (`Esc` clears it) |
 | `Ctrl+Shift+F` | Search every volume (arrows move, `Enter` opens, `Esc` closes) |
 | `Ctrl+P` | Fuzzy-find a file in this folder and below |

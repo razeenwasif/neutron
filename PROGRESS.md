@@ -85,7 +85,8 @@
 #### 7. Preview Pane
 - `Alt+P` (or the command palette) opens a right-hand pane showing what the
   cursor row actually contains: images, text, and a card of facts for anything
-  else. Its visibility is remembered across sessions.
+  else. Its visibility is remembered across sessions. It worked only in a real
+  folder until section 17.
 - Reading and decoding happen on a worker; the pane only ever receives finished
   bytes. Requests are debounced at 120ms and carry a generation, so holding Down
   through a folder of photographs reads almost nothing and never shows a late
@@ -440,7 +441,64 @@ One deliberate exception, in `NeutronApp::new`: `sites.json` is read
 synchronously there. That runs once, during construction, before there is a
 window to paint or a frame to drop.
 
-#### 17. Test Suite
+
+#### 17. The Preview Pane Everywhere Else
+
+The pane worked in a folder and nowhere else. Inside a zip, on a server and in
+Drive it went blank — not "no preview", not a reason, just an empty rectangle
+under the file's name, which is the failure mode section 12 exists to end.
+
+The cause was one line: the pane asked the tab for `as_path()`, and three of the
+four kinds of location a pane can be showing do not have one.
+
+The header was never the problem. It is built from the entry list — name, kind,
+size, modified — and has worked in every namespace all along. What was missing
+was the body, so the fix is about *where the bytes come from*, which is now a
+`Source` rather than a `PathBuf`.
+
+**Servers and Drive are fetched.** Both already had exactly the right shape of
+API: a download that writes into any sink and asks a callback between chunks
+whether to keep going. So a preview reads into memory instead of a file, and the
+callback is where both limits live.
+
+- **The size is checked against the listing before anything is fetched.** The
+  cheapest round trip is the one not made, and a 400MB video does not need a
+  connection opened to know it is not going to be previewed. The cap is 2MB: a
+  preview is a glance, and this one costs bandwidth.
+- **And checked again during the transfer**, because the size came from the
+  server's own listing and a server that understated it would otherwise pull an
+  unbounded file into memory.
+- **A superseded preview stops mid-transfer.** The generation check already
+  abandoned queued work before it started; a network fetch can outlive the
+  selection it was made for, so the same check runs between chunks. Arrowing
+  past a file stops its download rather than finishing it into a buffer nobody
+  will read.
+
+**One connection, kept.** The first version opened one per preview, which for
+SFTP is a full key exchange every time the cursor rests on a different row. The
+worker now holds one and reuses it, with the same single-retry rule `Sessions`
+uses — servers close idle connections, and retrying more than once against one
+that is rate-limiting logins is how an account gets locked. It is its own
+connection rather than the listing's, because FTP carries one command at a time
+and previewing over the listing connection would make every folder wait behind
+whatever the cursor last touched. It is dropped as soon as the cursor leaves
+that server, rather than held open against a server nobody is looking at.
+
+**A Google Doc is refused without fetching it.** Docs, Sheets and Slides have no
+bytes; they export to `docx`, which this pane cannot render either — so
+fetching one would spend a round trip to arrive at the same answer. The listing
+cannot tell a Doc from an empty file, since both report zero bytes, so the MIME
+type is read first and settles both that question and the real size.
+
+**The shell namespace says so instead.** Inside a zip the bytes exist only
+through the shell's own extraction, and a Control Panel entry is not a file at
+all. There is now a sentence rather than a blank pane. That is the whole
+improvement there, and it is the right one: extracting an archive member to
+answer "is this the file I meant" is more than the question is worth.
+
+Not changed: `IPreviewHandler` is still absent, for the reasons in section 7.
+
+#### 18. Test Suite
 - Pure-logic unit tests (`neutron-core`, `neutron-ui`, `neutron-fuzzy`,
   `neutron-index`, `neutron-archive`, `neutron-plugin`) passing on Linux.
 - `neutron-plugin` is tested against **real child processes** — plugins that
@@ -459,5 +517,5 @@ window to paint or a frame to drop.
   filename (`cloud.rs`). The second is the security-relevant one — its cases are
   traversal, the NTFS stream colon, bare dots, control characters, device names,
   trailing dots and a 5,000-character name.
-- Full suite on the Windows target: **623 tests**, clippy clean. The FTP and
+- Full suite on the Windows target: **629 tests**, clippy clean. The FTP and
   SFTP suites run there too — the fake servers are ordinary std sockets.

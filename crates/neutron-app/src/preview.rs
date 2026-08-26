@@ -53,12 +53,45 @@ const MAX_TEXT_BYTES: u64 = 256 * 1024;
 /// before anything is read.
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Most that is pulled over a network connection for a preview.
+///
+/// A local read costs a seek. A remote one costs bandwidth and, for FTP, a
+/// login — transfers open their own connection, because FTP cannot interleave a
+/// listing with a download. So the size is checked against the listing *before*
+/// anything is fetched, and a file over this says so instead. Under it, a
+/// preview is worth one round trip; over it, the pane would be spending a
+/// minute on a file nobody asked to open.
+const MAX_REMOTE_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Longest edge kept when decoding.
 ///
 /// A 6000×4000 photograph is 96 MB as RGBA, and the pane is a few hundred
 /// pixels wide. Downscaling on the worker means that never reaches the UI
 /// thread, the GPU, or a texture that has to be freed later.
 const MAX_IMAGE_EDGE: u32 = 1024;
+
+/// Where the bytes for a preview come from.
+///
+/// Not a `PathBuf`. Three of the four kinds of location a pane can be showing
+/// have no filesystem path, and the pane used to reach for one, find nothing
+/// and go blank in all three — inside a zip, on a server, and in Drive.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    /// A file on this machine.
+    Local(PathBuf),
+    /// A file on a saved server. Carries the whole site because a preview
+    /// opens its own connection rather than waiting behind the listing's.
+    Remote {
+        site: Box<neutron_remote::Site>,
+        path: String,
+        name: String,
+    },
+    /// A Drive object, addressed by id like everything else in Drive.
+    Drive { id: String },
+    /// A shell namespace item — the inside of a zip, a Control Panel entry.
+    /// The bytes exist only through COM, if they exist at all.
+    Shell,
+}
 
 /// What the pane has to show.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,15 +118,18 @@ pub enum Preview {
     Opaque,
     /// Too big to be worth reading for a preview.
     TooLarge,
+    /// There are no bytes to reach from here. Said rather than left blank: an
+    /// empty pane is indistinguishable from one that is broken.
+    Unreachable(String),
     Unreadable(String),
 }
 
 /// What the pane is showing, and what it is waiting for.
 pub struct PreviewState {
     pub open: bool,
-    /// The file the current content belongs to. Compared on arrival so a late
-    /// answer for a file the user has moved off is discarded.
-    pub showing: Option<PathBuf>,
+    /// What the current content belongs to. Compared on arrival so a late
+    /// answer for something the user has moved off is discarded.
+    pub showing: Option<Source>,
     pub content: Preview,
     /// Uploaded from `content` when it is an image, and dropped when it is not,
     /// so a texture never outlives the preview that produced it.
@@ -113,18 +149,21 @@ impl Default for PreviewState {
 
 struct Request {
     generation: u64,
-    path: PathBuf,
+    source: Source,
+    /// What the listing says the file is. Checked against the network cap
+    /// before anything is fetched, so an oversized file costs no round trip.
+    size: u64,
     is_dir: bool,
 }
 
 /// Background reader for the preview pane.
 pub struct PreviewLoader {
     requests: Sender<Request>,
-    results: Receiver<(u64, PathBuf, Preview)>,
+    results: Receiver<(u64, Source, Preview)>,
     newest: Arc<Mutex<u64>>,
     next_generation: u64,
     /// The request waiting out the debounce, if any.
-    pending: Option<(PathBuf, bool, Instant)>,
+    pending: Option<(Source, u64, bool, Instant)>,
 }
 
 impl PreviewLoader {
@@ -148,18 +187,18 @@ impl PreviewLoader {
         }
     }
 
-    /// Asks for `path`, after the debounce.
+    /// Asks for `source`, after the debounce.
     ///
-    /// Repeating the same path is free, so this can be called every frame with
-    /// whatever the cursor is on.
-    pub fn request(&mut self, path: &Path, is_dir: bool, showing: Option<&PathBuf>) {
-        if showing.is_some_and(|s| s == path) {
+    /// Repeating the same source is free, so this can be called every frame
+    /// with whatever the cursor is on.
+    pub fn request(&mut self, source: Source, size: u64, is_dir: bool, showing: Option<&Source>) {
+        if showing.is_some_and(|s| *s == source) {
             return;
         }
-        if self.pending.as_ref().is_some_and(|(p, _, _)| p == path) {
+        if self.pending.as_ref().is_some_and(|(s, _, _, _)| *s == source) {
             return;
         }
-        self.pending = Some((path.to_path_buf(), is_dir, Instant::now()));
+        self.pending = Some((source, size, is_dir, Instant::now()));
     }
 
     /// Cancels anything pending and in flight.
@@ -173,30 +212,31 @@ impl PreviewLoader {
 
     /// Sends the debounced request once it has waited long enough.
     pub fn tick(&mut self) {
-        let Some((path, is_dir, asked)) = self.pending.as_ref() else {
+        let Some((source, size, is_dir, asked)) = self.pending.as_ref() else {
             return;
         };
         if asked.elapsed() < DEBOUNCE {
             return;
         }
-        let (path, is_dir) = (path.clone(), *is_dir);
+        let (source, size, is_dir) = (source.clone(), *size, *is_dir);
         self.pending = None;
 
         self.next_generation += 1;
         *self.newest.lock() = self.next_generation;
         let _ = self.requests.send(Request {
             generation: self.next_generation,
-            path,
+            source,
+            size,
             is_dir,
         });
     }
 
     /// The newest finished preview, if one has arrived.
-    pub fn poll(&self) -> Option<(PathBuf, Preview)> {
+    pub fn poll(&self) -> Option<(Source, Preview)> {
         let mut latest = None;
-        while let Ok((generation, path, preview)) = self.results.try_recv() {
+        while let Ok((generation, source, preview)) = self.results.try_recv() {
             if generation == *self.newest.lock() {
-                latest = Some((path, preview));
+                latest = Some((source, preview));
             }
         }
         latest
@@ -211,10 +251,17 @@ impl PreviewLoader {
 
 fn worker(
     requests: Receiver<Request>,
-    results: Sender<(u64, PathBuf, Preview)>,
+    results: Sender<(u64, Source, Preview)>,
     newest: Arc<Mutex<u64>>,
     ctx: egui::Context,
 ) {
+    // One client for the thread's life, like the loader's. It caches an access
+    // token, and a fresh one per preview would re-authenticate on every
+    // keystroke that lands on a Drive file.
+    let drive = neutron_cloud::google::GoogleDrive::new();
+    // One server connection, reused between previews. See `PreviewConn`.
+    let mut conn: Option<PreviewConn> = None;
+
     while let Ok(request) = requests.recv() {
         // Before opening anything: the user may have moved on while this sat
         // in the queue, and opening the file is the expensive part.
@@ -222,17 +269,207 @@ fn worker(
             continue;
         }
 
-        let preview = read(&request.path, request.is_dir);
+        // Checked *during* a transfer as well as before it. A local read is
+        // over in microseconds, but a remote one can outlive the selection it
+        // was made for, and there is no reason to keep pulling a file the user
+        // has already arrowed past.
+        let generation = request.generation;
+        let still_wanted = || generation == *newest.lock();
+
+        // Anything but a server means the cursor has left one, so the held
+        // connection is dropped rather than kept open against a server nobody
+        // is looking at — some of them permit very few at a time.
+        if !matches!(request.source, Source::Remote { .. }) {
+            conn = None;
+        }
+
+        let preview = match &request.source {
+            Source::Local(path) => read(path, request.is_dir),
+            Source::Remote { site, path, name } => read_remote(
+                &mut conn,
+                site,
+                path,
+                name,
+                request.size,
+                request.is_dir,
+                &still_wanted,
+            ),
+            Source::Drive { id } => read_drive(&drive, id, request.is_dir, &still_wanted),
+            // A drive letter under This PC, a Control Panel applet, an entry
+            // inside a zip. The first two are not files; the third is, but its
+            // bytes exist only through the shell's own extraction.
+            Source::Shell if request.is_dir => Preview::Opaque,
+            Source::Shell => Preview::Unreachable(
+                "No preview here — these contents are only reachable through the shell"
+                    .to_owned(),
+            ),
+        };
 
         if request.generation != *newest.lock() {
             continue;
         }
         if results
-            .send((request.generation, request.path, preview))
+            .send((request.generation, request.source, preview))
             .is_ok()
         {
             ctx.request_repaint();
         }
+    }
+}
+
+/// One connection kept between previews.
+///
+/// Its own, not the listing's: FTP carries one command at a time, so previewing
+/// over the listing connection would make every folder wait behind whatever the
+/// cursor last touched. Kept rather than opened per file, because the
+/// alternative is a login — for SFTP a full key exchange — every time the
+/// cursor rests on a different row.
+struct PreviewConn {
+    site: String,
+    transport: Box<dyn neutron_remote::Transport>,
+}
+
+/// Fetches enough of a file on a server to show it.
+fn read_remote(
+    held: &mut Option<PreviewConn>,
+    site: &neutron_remote::Site,
+    path: &str,
+    name: &str,
+    size: u64,
+    is_dir: bool,
+    still_wanted: &dyn Fn() -> bool,
+) -> Preview {
+    if is_dir {
+        return Preview::Opaque;
+    }
+    // Answered from the listing, before a connection is opened. The cheapest
+    // round trip is the one not made.
+    if size > MAX_REMOTE_BYTES {
+        return Preview::TooLarge;
+    }
+
+    // A connection to a different server is no use here. Dropped rather than
+    // kept in a map: previews follow one cursor, so there is only ever one
+    // server being looked at.
+    if held.as_ref().is_some_and(|c| c.site != site.id) {
+        *held = None;
+    }
+
+    // Exactly one retry, and only after a failure on a connection that was
+    // already open. Servers close idle connections and the failure looks like
+    // an ordinary error on the next command; retrying more than once against
+    // one that is rate-limiting logins is how an account gets locked.
+    for attempt in 0..2 {
+        let reused = held.is_some();
+        if held.is_none() {
+            match neutron_remote::connect(site) {
+                Ok(transport) => {
+                    *held = Some(PreviewConn {
+                        site: site.id.clone(),
+                        transport,
+                    })
+                }
+                Err(e) => return Preview::Unreadable(e.to_string()),
+            }
+        }
+        let conn = held.as_mut().expect("just connected");
+
+        let mut bytes: Vec<u8> = Vec::new();
+        let outcome = conn.transport.download(path, &mut bytes, &mut |done| {
+            // The size came from the server's own listing, and a server that
+            // understated it would otherwise pull an unbounded file into
+            // memory.
+            if done > MAX_REMOTE_BYTES || !still_wanted() {
+                neutron_remote::Continue::Stop
+            } else {
+                neutron_remote::Continue::Yes
+            }
+        });
+
+        match outcome {
+            Ok(_) => return from_bytes(name, bytes, size),
+            // Stopped because the cursor moved. The answer is about to be
+            // discarded anyway, and saying "unreadable" would be a lie about
+            // the file. The connection is still good.
+            Err(neutron_remote::RemoteError::Cancelled) => return Preview::Nothing,
+            Err(e) => {
+                *held = None;
+                // A fresh connection that failed has nothing to retry with.
+                if !reused || attempt == 1 {
+                    return Preview::Unreadable(e.to_string());
+                }
+            }
+        }
+    }
+    unreachable!("the loop returns on every path")
+}
+
+/// Fetches enough of a Drive object to show it.
+fn read_drive(
+    drive: &neutron_cloud::google::GoogleDrive,
+    id: &str,
+    is_dir: bool,
+    still_wanted: &dyn Fn() -> bool,
+) -> Preview {
+    use neutron_cloud::drive::{Continue, Fetch};
+
+    if is_dir {
+        return Preview::Opaque;
+    }
+
+    // The listing's size is 0 for a Google Doc, which is not the same as an
+    // empty file, and its MIME type is the only thing that says which. One
+    // small request settles both, and it is cheap next to the transfer it
+    // decides whether to make.
+    let file = match drive.stat(id) {
+        Ok(f) => f,
+        Err(e) => return Preview::Unreadable(e),
+    };
+
+    if !matches!(neutron_cloud::drive::fetch_for(&file.mime_type), Fetch::Bytes) {
+        // A Doc exports to .docx, which this pane cannot render either, so
+        // fetching one would spend a round trip to arrive at the same answer.
+        return Preview::Unreachable(
+            "Google documents have no preview — open it to see it".to_owned(),
+        );
+    }
+
+    let size = file.size.as_deref().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    if size > MAX_REMOTE_BYTES {
+        return Preview::TooLarge;
+    }
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let outcome = drive.download(id, &Fetch::Bytes, &mut bytes, &mut |done| {
+        if done > MAX_REMOTE_BYTES || !still_wanted() {
+            Continue::Stop
+        } else {
+            Continue::Yes
+        }
+    });
+
+    match outcome {
+        Ok(_) => from_bytes(&file.name, bytes, size),
+        Err(e) if e == "stopped" => Preview::Nothing,
+        Err(e) => Preview::Unreadable(e),
+    }
+}
+
+/// Decides what bytes already in memory are, and renders them.
+///
+/// `name` decides only whether to *try* the image decoder; `total` is the
+/// file's real length, so text cut short can say that it was.
+fn from_bytes(name: &str, bytes: Vec<u8>, total: u64) -> Preview {
+    if looks_like_image(Path::new(name)) {
+        return decode_image_bytes(&bytes);
+    }
+    let shown = bytes.len().min(MAX_TEXT_BYTES as usize);
+    match decode_text(&bytes[..shown]) {
+        Some(text) => Preview::Text {
+            truncated: total > shown as u64,
+            text,
+        },
+        None => Preview::Opaque,
     }
 }
 
@@ -275,11 +512,28 @@ fn looks_like_image(path: &Path) -> bool {
 fn decode_image(path: &Path) -> Preview {
     use image::ImageReader;
 
-    let reader = match ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
-        Ok(r) => r,
-        Err(e) => return Preview::Unreadable(e.to_string()),
-    };
+    // Streamed from the file rather than read into a buffer first: the decoder
+    // reads what it needs, and a 60 MB photograph never exists twice.
+    match ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
+        Ok(reader) => finish_image(reader),
+        Err(e) => Preview::Unreadable(e.to_string()),
+    }
+}
 
+/// The same, for bytes already in memory — which is how anything fetched over a
+/// connection arrives.
+fn decode_image_bytes(bytes: &[u8]) -> Preview {
+    use image::ImageReader;
+
+    match ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format() {
+        Ok(reader) => finish_image(reader),
+        Err(e) => Preview::Unreadable(e.to_string()),
+    }
+}
+
+fn finish_image<R: std::io::BufRead + std::io::Seek>(
+    mut reader: image::ImageReader<R>,
+) -> Preview {
     // A decoder is a parser fed untrusted input, and an image header can claim
     // any dimensions it likes. Without a limit a forty-byte file can ask for a
     // sixteen-gigabyte allocation.
@@ -287,8 +541,6 @@ fn decode_image(path: &Path) -> Preview {
     limits.max_image_width = Some(20_000);
     limits.max_image_height = Some(20_000);
     limits.max_alloc = Some(256 * 1024 * 1024);
-
-    let mut reader = reader;
     reader.limits(limits);
 
     let decoded = match reader.decode() {
@@ -380,6 +632,70 @@ pub fn decode_text(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Bytes fetched over a connection take a different route into the pane
+    /// than a local file, and this is where the two rejoin.
+    #[test]
+    fn fetched_text_is_shown_as_text() {
+        let Preview::Text { text, truncated } =
+            from_bytes("notes.txt", b"host = example\nport = 22\n".to_vec(), 25)
+        else {
+            panic!("a config file is text");
+        };
+        assert!(text.starts_with("host = example"));
+        assert!(!truncated);
+    }
+
+    /// A remote transfer is stopped at the cap, so what arrives can be less
+    /// than the file. The pane says so rather than implying the file is short.
+    #[test]
+    fn a_partial_fetch_is_marked_truncated() {
+        let Preview::Text { truncated, .. } =
+            from_bytes("big.log", b"first page".to_vec(), 900_000)
+        else {
+            panic!("a log is text");
+        };
+        assert!(truncated);
+    }
+
+    /// Text longer than the cap is cut at it, whatever the transport handed
+    /// over — a server is free to send more than it was asked for.
+    #[test]
+    fn more_bytes_than_the_cap_are_cut_to_it() {
+        let huge = vec![b'a'; (MAX_TEXT_BYTES as usize) + 5_000];
+        let total = huge.len() as u64;
+        let Preview::Text { text, truncated } = from_bytes("big.txt", huge, total) else {
+            panic!("still text");
+        };
+        assert_eq!(text.len(), MAX_TEXT_BYTES as usize);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn fetched_binary_is_opaque_rather_than_garbled_text() {
+        assert_eq!(from_bytes("app.exe", vec![0x4d, 0x5a, 0x90, 0x00, 0x03], 5), Preview::Opaque);
+    }
+
+    /// The extension decides whether to *try* the image decoder, and a file
+    /// that is not really an image must fail as unreadable rather than being
+    /// shown as text with an image's name.
+    #[test]
+    fn something_named_like_an_image_but_isnt_says_so() {
+        let preview = from_bytes("photo.png", b"this is not a png".to_vec(), 17);
+        assert!(
+            matches!(preview, Preview::Unreadable(_)),
+            "{preview:?}"
+        );
+    }
+
+    /// An empty file is not a failure, and not binary.
+    #[test]
+    fn nothing_fetched_is_empty_text_not_an_error() {
+        assert_eq!(
+            from_bytes("empty.txt", Vec::new(), 0),
+            Preview::Text { text: String::new(), truncated: false }
+        );
+    }
+
     #[test]
     fn plain_text_is_text() {
         assert_eq!(decode_text(b"hello\nworld").as_deref(), Some("hello\nworld"));
@@ -465,6 +781,7 @@ pub fn show(
         Preview::Opaque if subject.is_dir => empty(ui, p, "Folder"),
         Preview::Opaque => empty(ui, p, "No preview for this kind of file"),
         Preview::TooLarge => empty(ui, p, "Too large to preview"),
+        Preview::Unreachable(why) => empty(ui, p, why),
         Preview::Unreadable(why) => {
             ui.colored_label(p.danger, "Could not be read");
             ui.label(egui::RichText::new(why).color(p.text_faint).size(11.0));

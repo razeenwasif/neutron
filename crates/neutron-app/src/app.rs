@@ -3681,13 +3681,41 @@ impl NeutronApp {
         // selected there is no single thing to preview, and the cursor is the
         // one the user last touched.
         let wanted = self.workspace.active_tab().and_then(|tab| {
-            let dir = tab.location().as_path()?;
             let idx = tab.selection.cursor().filter(|&i| i < tab.list.len())?;
-            Some((dir.join(tab.list.name(idx)), tab.list.kind(idx).is_container()))
+            let name = tab.list.name(idx);
+            let source = match tab.location() {
+                NodeId::Path(dir) => crate::preview::Source::Local(dir.join(name)),
+                // A server's rows are addressed by joining a name to a POSIX
+                // path. The name went through `safe_name` on the way into the
+                // listing, and joining is checked again here.
+                NodeId::Remote { site, path } => {
+                    let full = neutron_remote::path::join(path, name).ok()?;
+                    let saved = self.sites.get(site)?;
+                    crate::preview::Source::Remote {
+                        site: Box::new(saved.clone()),
+                        path: full,
+                        name: name.to_owned(),
+                    }
+                }
+                // Addressed by id, like everything else in Drive. A shortcut
+                // resolves to its target, so previewing one shows what it
+                // points at — which is what opening it would do.
+                NodeId::Cloud { .. } => {
+                    let (id, _) = tab.list.target(idx)?;
+                    crate::preview::Source::Drive { id: id.to_owned() }
+                }
+                NodeId::Shell { .. } => crate::preview::Source::Shell,
+            };
+            Some((source, tab.list.size(idx), tab.list.kind(idx).is_container()))
         });
 
         match &wanted {
-            Some((path, is_dir)) => self.previews.request(path, *is_dir, self.preview.showing.as_ref()),
+            Some((source, size, is_dir)) => self.previews.request(
+                source.clone(),
+                *size,
+                *is_dir,
+                self.preview.showing.as_ref(),
+            ),
             None => {
                 if self.preview.showing.is_some() {
                     self.previews.clear();
@@ -3700,7 +3728,7 @@ impl NeutronApp {
 
         self.previews.tick();
 
-        if let Some((path, content)) = self.previews.poll() {
+        if let Some((source, content)) = self.previews.poll() {
             self.preview.texture = match &content {
                 crate::preview::Preview::Image {
                     rgba,
@@ -3720,9 +3748,9 @@ impl NeutronApp {
                 }
                 _ => None,
             };
-            self.preview.showing = Some(path);
+            self.preview.showing = Some(source);
             self.preview.content = content;
-        } else if self.previews.busy() && self.preview.showing != wanted.as_ref().map(|(p, _)| p.clone()) {
+        } else if self.previews.busy() && self.preview.showing != wanted.as_ref().map(|(s, _, _)| s.clone()) {
             // Something is on its way for a different file. Say so rather than
             // leaving the previous file's contents under the new name.
             self.preview.content = crate::preview::Preview::Loading;
