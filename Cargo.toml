@@ -12,11 +12,25 @@ members = [
     "crates/neutron-plugin",
     "crates/neutron-remote",
     "crates/neutron-indexer",
+    "xtask",
 ]
 
-# No `default-members`. It existed to keep `xtask` — a build driver for a WSL
-# host that no longer exists — out of ordinary builds. Every remaining member
-# ships, so the two lists were identical.
+# `xtask` is the project's task runner, not part of the shipped application, so
+# it is excluded from a plain `cargo build`. `cargo xtask ...` still resolves it
+# by name, and `--workspace` still builds and lints it.
+default-members = [
+    "crates/neutron-app",
+    "crates/neutron-core",
+    "crates/neutron-ui",
+    "crates/neutron-fuzzy",
+    "crates/neutron-index",
+    "crates/neutron-shell",
+    "crates/neutron-cloud",
+    "crates/neutron-archive",
+    "crates/neutron-plugin",
+    "crates/neutron-remote",
+    "crates/neutron-indexer",
+]
 
 [workspace.package]
 version = "0.1.0"

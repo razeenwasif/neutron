@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# No dependencies, on purpose. A task runner that needs a dependency tree is a
+# thing to maintain rather than a thing to use, and everything here is a process
+# spawn and a file copy.
+[dependencies]

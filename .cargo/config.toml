@@ -1,0 +1,3 @@
+# `cargo xtask <command>` runs the project's own tasks. See xtask/src/main.rs.
+[alias]
+xtask = "run --quiet --package xtask --"

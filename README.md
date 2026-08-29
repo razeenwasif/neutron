@@ -56,8 +56,29 @@ one dependency that has already broken a clean checkout once.
 > Earlier versions of this file described building from a WSL shell through a
 > `cargo xtask` wrapper, which mapped the WSL share to a drive letter because
 > much of the MSVC toolchain refuses UNC working directories. That setup is
-> gone, and so is the wrapper. If you go back to developing on a WSL
+> gone, and so is the wrapper. `xtask` is back, but as a task runner rather
+> than a build driver — see below. If you go back to developing on a WSL
 > filesystem, the UNC problem is real and that is what you will be solving.
+
+### Installing it
+
+```powershell
+cargo xtask install      # build, then copy into %LOCALAPPDATA%\Programs\Neutron
+cargo xtask uninstall    # remove that folder
+cargo xtask where        # print the paths, and what is currently installed
+```
+
+Its own folder rather than loose files in `Programs`, so uninstalling is one
+directory rather than a list that has to stay in step with what was copied.
+
+Both executables are copied, and that is not incidental: `neutron.exe` looks for
+`neutron-indexer.exe` *beside itself* and refuses to raise a UAC prompt for a
+file that is not there. Installing the main binary alone gives you a program
+whose search is permanently broken and which only says so when you use it.
+
+Windows holds an executable open while it runs, so installing over a copy you
+have open fails. It says which file and why, rather than passing on the bare
+"the process cannot access the file".
 
 ### Fast inner loop
 
@@ -96,6 +117,7 @@ crates/
   neutron-plugin/   manifests, child processes, protocol   ← no Win32, tests on Linux
   neutron-remote/   FTP, FTPS and SFTP clients
   neutron-indexer/  elevated helper process                (bin: neutron-indexer)
+xtask/              project tasks: install, uninstall, where
 assets/             app icon (SVG source, .ico, raw RGBA)
 scripts/            benchmark directory generator
 .github/workflows/  CI: Windows, Linux, and the stated minimum Rust
