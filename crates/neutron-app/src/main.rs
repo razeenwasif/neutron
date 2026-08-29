@@ -122,12 +122,21 @@ fn main() -> eframe::Result<()> {
 ///
 /// Stored as raw RGBA rather than PNG so no image decoder is needed at startup;
 /// 16KB of pixels costs less than a decode dependency, and nothing has to
-/// happen before the first frame. Regenerate with:
+/// happen before the first frame.
 ///
-/// ```text
-/// convert -background none assets/icon.svg -resize 64x64 -depth 8 \
-///     RGBA:assets/icon_64.rgba
-/// ```
+/// # Regenerating
+///
+/// Both this and `icon.ico` are rendered from signed distance fields rather
+/// than rasterised from `assets/icon.svg`, for two reasons: no SVG rasteriser
+/// is among the build requirements, and rendering each `.ico` size from the
+/// geometry beats downscaling one bitmap — 16px is where an icon fails, and it
+/// fails first at the corners.
+///
+/// These instructions used to read `convert -background none …`. On Windows
+/// that is not ImageMagick. `C:\Windows\System32\convert.exe` converts a FAT
+/// volume to NTFS, and a bare `convert` resolves to it — so the documented way
+/// to rebuild the icon named a filesystem tool. `assets/icon.svg` carries the
+/// same unit-square geometry the generator draws.
 fn app_icon() -> egui::IconData {
     const RGBA: &[u8] = include_bytes!("../../../assets/icon_64.rgba");
     const SIZE: u32 = 64;
