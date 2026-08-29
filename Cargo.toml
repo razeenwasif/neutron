@@ -12,26 +12,11 @@ members = [
     "crates/neutron-plugin",
     "crates/neutron-remote",
     "crates/neutron-indexer",
-    "xtask",
 ]
 
-# xtask is a Linux-side build driver, not part of the shipped application, and
-# compiling it with the Windows toolchain is pure waste. Excluding it here means
-# the Windows build touches only the crates that actually ship, while
-# `cargo xtask ...` still resolves it by name on the Linux side.
-default-members = [
-    "crates/neutron-app",
-    "crates/neutron-core",
-    "crates/neutron-ui",
-    "crates/neutron-fuzzy",
-    "crates/neutron-index",
-    "crates/neutron-shell",
-    "crates/neutron-cloud",
-    "crates/neutron-archive",
-    "crates/neutron-plugin",
-    "crates/neutron-remote",
-    "crates/neutron-indexer",
-]
+# No `default-members`. It existed to keep `xtask` — a build driver for a WSL
+# host that no longer exists — out of ordinary builds. Every remaining member
+# ships, so the two lists were identical.
 
 [workspace.package]
 version = "0.1.0"

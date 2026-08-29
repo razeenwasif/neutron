@@ -7,7 +7,7 @@
 //! Run it with:
 //!
 //! ```text
-//! cargo xtask test -- --release -- --ignored --nocapture scan_throughput
+//! cargo test --release -- --ignored --nocapture scan_throughput
 //! ```
 //!
 //! # Why synthetic names

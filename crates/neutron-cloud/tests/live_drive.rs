@@ -4,7 +4,7 @@
 //! machine will not have. Run deliberately, on a machine that has signed in:
 //!
 //! ```text
-//! cargo xtask test -p neutron-cloud -- --ignored --nocapture
+//! cargo test -p neutron-cloud -- --ignored --nocapture
 //! ```
 //!
 //! Its value is covering the one thing no unit test can: that the token

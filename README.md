@@ -35,40 +35,41 @@ A 100k-entry folder opens in 52ms and scrolls at 0.21ms per frame.
 
 ## Building
 
-The source lives on the WSL filesystem; the binary is built by the **Windows**
-toolchain. `cargo xtask` bridges the two — it maps the WSL share to a drive
-letter and points cargo at it, because much of the MSVC toolchain refuses UNC
-working directories outright.
+Windows, natively. There is nothing to bridge and no wrapper to go through:
 
-```bash
-cargo xtask build              # debug
-cargo xtask build -- --release
-cargo xtask run
-cargo xtask test
-cargo xtask where              # show detected paths, drive mapping, toolchain
+```powershell
+cargo build --release -p neutron-app
+cargo test --workspace
+cargo run -p neutron-app -- 'C:\some\folder'
 ```
 
-Requires, on the Windows side: `rustup` with `x86_64-pc-windows-msvc`, and
-Visual Studio Build Tools with the Windows SDK.
+Requires `rustup` with `x86_64-pc-windows-msvc`, and Visual Studio Build Tools
+with the Windows SDK. Nothing else — in particular **no NASM and no CMake**,
+which is deliberate and is checked by CI: the crypto backend is pinned to
+`ring`, and the C library that would otherwise arrive through `russh` is the
+one dependency that has already broken a clean checkout once.
 
-Overrides, if detection guesses wrong:
-
-| Variable | Purpose |
-|---|---|
-| `NEUTRON_WIN_CARGO` | Path to the Windows `cargo.exe` |
-| `NEUTRON_DRIVE` | Drive letter already mapped to the WSL share |
-| `NEUTRON_WIN_TARGET_DIR` | Build output directory (must be local NTFS) |
+> Earlier versions of this file described building from a WSL shell through a
+> `cargo xtask` wrapper, which mapped the WSL share to a drive letter because
+> much of the MSVC toolchain refuses UNC working directories. That setup is
+> gone, and so is the wrapper. If you go back to developing on a WSL
+> filesystem, the UNC problem is real and that is what you will be solving.
 
 ### Fast inner loop
 
-The pure-logic crates build and test natively on Linux, which is much quicker
-than a cross-build:
+The crates that do not depend on `windows` build and test anywhere, which is
+quicker than building the shell and the renderer:
 
 ```bash
-cargo test -p neutron-core -p neutron-ui -p neutron-fuzzy
+cargo test -p neutron-core -p neutron-ui -p neutron-fuzzy -p neutron-archive -p neutron-plugin
 ```
 
-`neutron-shell` and `neutron-index` are Windows-only and need `cargo xtask test`.
+`neutron-plugin`'s integration tests are the reason to run this on Linux rather
+than Windows: they drive real child processes and are `#![cfg(unix)]`, so on
+Windows they are skipped and report nothing. CI runs them on Linux for exactly
+that reason.
+
+`neutron-shell`, `neutron-index` and `neutron-app` are Windows-only.
 
 ---
 
@@ -87,9 +88,9 @@ crates/
   neutron-plugin/   manifests, child processes, protocol   ← no Win32, tests on Linux
   neutron-remote/   FTP, FTPS and SFTP clients
   neutron-indexer/  elevated helper process                (bin: neutron-indexer)
-xtask/              build driver (Linux-side only)
 assets/             app icon (SVG source, .ico, raw RGBA)
 scripts/            benchmark directory generator
+.github/workflows/  CI: Windows, Linux, and the stated minimum Rust
 docs/perf.md        measured performance baseline
 ```
 
