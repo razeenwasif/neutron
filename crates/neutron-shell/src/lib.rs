@@ -55,6 +55,11 @@ pub mod dragout;
 #[cfg_attr(not(windows), path = "pastekey_stub.rs")]
 pub mod pastekey;
 
+// Unlike its neighbours this needs no `_stub`: the Win32 half is already behind
+// a `cfg` inside the file, because the shared rectangle and its tests are
+// ordinary code worth compiling everywhere.
+pub mod snaplayout;
+
 #[cfg_attr(windows, path = "menu.rs")]
 #[cfg_attr(not(windows), path = "menu_stub.rs")]
 pub mod menu;

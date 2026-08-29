@@ -69,12 +69,40 @@ pub fn section(ui: &mut Ui, p: &Palette, label: &str) {
     ui.add_space(2.0);
 }
 
-/// One destination. Returns true when it was clicked.
-pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) -> bool {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), NAV_HEIGHT), Sense::click());
+/// What a click on a sidebar row asked for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RowHit {
+    None,
+    /// Go there.
+    Open,
+    /// Right-clicked, at this position.
+    Menu(egui::Pos2),
+}
+
+impl RowHit {
+    fn of(response: &egui::Response, rect: Rect) -> Self {
+        if response.clicked() {
+            RowHit::Open
+        } else if response.secondary_clicked() {
+            RowHit::Menu(
+                response
+                    .interact_pointer_pos()
+                    .unwrap_or_else(|| rect.center()),
+            )
+        } else {
+            RowHit::None
+        }
+    }
+}
+
+/// One destination.
+pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) -> RowHit {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), NAV_HEIGHT),
+        Sense::click(),
+    );
     if !ui.is_rect_visible(rect) {
-        return response.clicked();
+        return RowHit::of(&response, rect);
     }
 
     let selected = current == Some(&place.id);
@@ -142,7 +170,7 @@ pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) ->
             .on_hover_text(format!("{free} free of {total}"));
     }
 
-    response.clicked()
+    RowHit::of(&response, rect)
 }
 
 fn glyph_for(place: &Place) -> Glyph {

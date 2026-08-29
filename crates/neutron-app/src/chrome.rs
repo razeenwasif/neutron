@@ -34,19 +34,36 @@ const BUTTON: f32 = 44.0;
 const GRIP: f32 = 6.0;
 
 /// Draws the bar and applies whatever was pressed.
-pub fn show(ui: &mut Ui, p: &Palette, title: &str) {
+///
+/// `snap` is where the maximise button reports its own position, so Windows can
+/// offer the Snap Layouts flyout over it. See `neutron_shell::snaplayout`.
+pub fn show(
+    ui: &mut Ui,
+    p: &Palette,
+    title: &str,
+    snap: &neutron_shell::snaplayout::MaximiseButton,
+) {
     let bar = ui.available_rect_before_wrap();
 
     // --- the three buttons, right to left ---
     let mut x = bar.right();
-    for (i, kind) in [Button::Close, Button::Maximise, Button::Minimise]
-        .into_iter()
-        .enumerate()
-    {
+    for kind in [Button::Close, Button::Maximise, Button::Minimise] {
         let rect = Rect::from_min_max(pos2(x - BUTTON, bar.top()), pos2(x, bar.bottom()));
         x -= BUTTON;
-        let _ = i;
-        button(ui, p, rect, kind);
+
+        if kind == Button::Maximise {
+            // Physical pixels from the client origin, which is the only frame
+            // of reference `WM_NCHITTEST` can be compared in.
+            let scale = ui.ctx().pixels_per_point();
+            snap.set(
+                (rect.left() * scale).round() as i32,
+                (rect.top() * scale).round() as i32,
+                (rect.right() * scale).round() as i32,
+                (rect.bottom() * scale).round() as i32,
+            );
+        }
+
+        button(ui, p, rect, kind, snap);
     }
 
     // --- everything left of them drags the window ---
@@ -78,9 +95,20 @@ enum Button {
     Close,
 }
 
-fn button(ui: &mut Ui, p: &Palette, rect: Rect, kind: Button) {
+fn button(
+    ui: &mut Ui,
+    p: &Palette,
+    rect: Rect,
+    kind: Button,
+    snap: &neutron_shell::snaplayout::MaximiseButton,
+) {
     let response = ui.allocate_rect(rect, Sense::click());
-    let hovered = response.hovered();
+    // Once the maximise button claims `HTMAXBUTTON`, Windows treats the pointer
+    // as being over a non-client area and egui stops seeing it at all. The
+    // window procedure reports hover instead, or the button would never light
+    // up under the cursor.
+    let hovered = response.hovered()
+        || (kind == Button::Maximise && snap.is_hovered());
 
     if hovered {
         let fill = match kind {

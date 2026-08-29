@@ -129,6 +129,8 @@ enum Action {
     /// Begin the Google Drive consent flow.
     ConnectDrive,
     TogglePin,
+    /// Right-clicked a sidebar row: open Neutron's own menu for that place.
+    SidebarMenu(NodeId, egui::Pos2),
     SignOutDrive,
     ForgetServer,
     MoveCursor { delta: isize, extend: bool },
@@ -165,8 +167,11 @@ enum Action {
 /// `plugins::MENU_ID_BASE` upward. That is what stops one of ours being handed
 /// to `IContextMenu::InvokeCommand`, where it would invoke an unrelated verb.
 const MENU_ID_PIN: u32 = 0x0800_0001;
+const MENU_ID_NEW_TAB: u32 = 0x0800_0002;
 const _: () = assert!(MENU_ID_PIN > 0x7FFF);
+const _: () = assert!(MENU_ID_NEW_TAB > 0x7FFF);
 const _: () = assert!(MENU_ID_PIN < crate::plugins::MENU_ID_BASE);
+const _: () = assert!(MENU_ID_NEW_TAB < crate::plugins::MENU_ID_BASE);
 
 fn report(to: &crossbeam_channel::Sender<(crate::notice::Level, String)>, text: String) {
     tracing::warn!("{text}");
@@ -242,9 +247,14 @@ pub struct NeutronApp {
     /// Folders pinned to Quick access. Read once at start-up and kept here;
     /// the file is only rewritten when one is added or removed.
     pins: crate::pins::Pins,
-    /// The folder the open context menu's pin row would act on, decided when
-    /// the menu was built.
+    /// What the open menu's Neutron-owned rows act on, decided when the menu
+    /// was built rather than when a row is chosen: by then the selection may
+    /// have moved.
     pin_target: Option<PathBuf>,
+    tab_target: Option<NodeId>,
+    /// Where the maximise button is, shared with the window procedure so
+    /// Windows can offer Snap Layouts over it.
+    snap: std::sync::Arc<neutron_shell::snaplayout::MaximiseButton>,
     cloud: Vec<Place>,
     wsl: Vec<Place>,
     shell_roots: Vec<Place>,
@@ -462,9 +472,16 @@ impl NeutronApp {
         // clipboard holds files rather than text, which is the only case that
         // matters here. A window subclass sees the key first.
         let (paste_tx, paste_rx) = crossbeam_channel::unbounded();
+        let snap: std::sync::Arc<neutron_shell::snaplayout::MaximiseButton> =
+            std::sync::Arc::new(Default::default());
         if let Some(h) = hwnd {
             if let Err(e) = neutron_shell::pastekey::watch(h, paste_tx) {
                 tracing::warn!("{e}; Ctrl+V will not work");
+            }
+            // Not fatal: without it the window still maximises from its own
+            // button, and only the hover flyout is missing.
+            if let Err(e) = neutron_shell::snaplayout::watch(h, snap.clone()) {
+                tracing::warn!("{e}; Snap Layouts will not appear");
             }
         }
         let drive_state = neutron_cloud::google::GoogleDrive::new().state();
@@ -500,6 +517,8 @@ impl NeutronApp {
             known_folders: Vec::new(),
             pins,
             pin_target: None,
+            tab_target: None,
+            snap,
             cloud: Vec::new(),
             wsl: Vec::new(),
             shell_roots: Vec::new(),
@@ -930,6 +949,7 @@ impl NeutronApp {
 
             Action::ConnectDrive => self.connect_drive(),
             Action::TogglePin => self.toggle_pin(),
+            Action::SidebarMenu(id, at) => self.sidebar_menu(id, at),
             Action::SignOutDrive => self.sign_out_drive(),
             Action::ForgetServer => self.forget_server(),
 
@@ -1818,14 +1838,17 @@ impl NeutronApp {
         // A plugin row's id means nothing to the shell — handing it to
         // `InvokeCommand` would invoke an unrelated verb. So the apartment
         // thread is told the menu was dismissed, and the command runs here.
-        // Ours, like a plugin's, means nothing to the shell.
+        // Ours, like a plugin's, mean nothing to the shell.
         let pin = (answer == Some(MENU_ID_PIN))
             .then(|| self.pin_target.take())
             .flatten();
+        let new_tab = (answer == Some(MENU_ID_NEW_TAB))
+            .then(|| self.tab_target.take())
+            .flatten();
 
         let plugin = answer.and_then(|id| self.plugins.menu_choice(id));
-        let for_shell = match (&pin, &plugin) {
-            (None, None) => answer,
+        let for_shell = match (&pin, &new_tab, &plugin) {
+            (None, None, None) => answer,
             _ => None,
         };
 
@@ -1835,6 +1858,10 @@ impl NeutronApp {
 
         if let Some(dir) = pin {
             self.apply_pin(dir);
+        }
+
+        if let Some(id) = new_tab {
+            self.open_in_new_tab(id);
         }
 
         if let Some(reference) = plugin {
@@ -2454,6 +2481,72 @@ impl NeutronApp {
         all
     }
 
+
+
+
+    /// Opens `location` in a new tab of the focused pane.
+    ///
+    /// The sidebar's menu route. `Action::NewTab` deliberately opens at the
+    /// pane's *current* location — "new tab here" is what Ctrl+T means — so it
+    /// is the wrong thing to reuse when the point is to go somewhere else.
+    fn open_in_new_tab(&mut self, location: NodeId) {
+        let Some(group) = self.workspace.focused_group().map(|g| g.id) else {
+            return;
+        };
+        let view = self.workspace.view_for_new_tab();
+        let tab = self.workspace.open_tab(group, location.clone(), view);
+        self.workspace.focused = group;
+        self.reload(tab, location);
+    }
+
+    /// Neutron's own menu for a sidebar row.
+    ///
+    /// Not the shell's: a sidebar row is a destination rather than a file, and
+    /// half of them — the dashboard, a server, a Drive root — have no shell
+    /// item behind them at all. So this menu is built here and answered here,
+    /// and never reaches `IContextMenu`.
+    ///
+    /// It exists mostly for one thing. Pinned folders appear in this list, and
+    /// until now the only way to remove one was to navigate into it and use the
+    /// keystroke — which is backwards, because the sidebar is exactly where a
+    /// stale pin is noticed.
+    fn sidebar_menu(&mut self, id: NodeId, at: egui::Pos2) {
+        let mut items = Vec::new();
+
+        items.push(neutron_core::MenuItem {
+            id: MENU_ID_NEW_TAB,
+            label: "Open in a new tab".to_owned(),
+            enabled: true,
+            default: true,
+            ..Default::default()
+        });
+        self.tab_target = Some(id.clone());
+
+        // Only a place with a path can be pinned, for the reason in `pins.rs`:
+        // a pin has to survive a restart, and nothing else here can be reached
+        // from a string on disk without its provider being connected first.
+        self.pin_target = id.as_path().map(Path::to_path_buf);
+        if let Some(dir) = self.pin_target.clone() {
+            let pinned = self.pins.folders.contains(&dir);
+            items.push(neutron_core::MenuItem::separator());
+            items.push(neutron_core::MenuItem {
+                id: MENU_ID_PIN,
+                label: if pinned {
+                    "Unpin from Quick access".to_owned()
+                } else {
+                    "Pin to Quick access".to_owned()
+                },
+                accel: "Ctrl+Shift+D".to_owned(),
+                enabled: true,
+                ..Default::default()
+            });
+        }
+
+        // No reply sender: nothing on an apartment thread is waiting on this
+        // one, unlike a menu the shell produced.
+        self.menu = Some(neutron_ui::MenuState::new(items, at));
+        self.menu_reply = None;
+    }
 
     /// The pin row Neutron adds to the shell's menu, and the folder it acts on.
     ///
@@ -4054,7 +4147,7 @@ impl NeutronApp {
                         bottom: 0,
                     }),
             )
-            .show(ui, |ui| crate::chrome::show(ui, p, &title));
+            .show(ui, |ui| crate::chrome::show(ui, p, &title, &self.snap));
     }
 
     fn sidebar(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
@@ -4127,36 +4220,46 @@ impl NeutronApp {
                     kind: neutron_core::places::PlaceKind::KnownFolder,
                     capacity: None,
                 };
-                if sidebar::row(ui, p, &dashboard, current) {
-                    actions.push(Action::Navigate(NodeId::Home));
+                match sidebar::row(ui, p, &dashboard, current) {
+                        sidebar::RowHit::Open => actions.push(Action::Navigate(NodeId::Home)),
+                        sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(dashboard.id.clone(), at)),
+                        sidebar::RowHit::None => {}
                 }
 
                 sidebar::section(ui, p, "Quick access");
                 for place in &self.known_folders {
-                    if sidebar::row(ui, p, place, current) {
-                        actions.push(Action::Navigate(place.id.clone()));
+                    match sidebar::row(ui, p, place, current) {
+                            sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
+                            sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
+                            sidebar::RowHit::None => {}
                     }
                 }
 
                 for place in self.pinned_places() {
-                    if sidebar::row(ui, p, &place, current) {
-                        actions.push(Action::Navigate(place.id.clone()));
+                    match sidebar::row(ui, p, &place, current) {
+                            sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
+                            sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
+                            sidebar::RowHit::None => {}
                     }
                 }
 
                 if !self.shell_roots.is_empty() {
                     sidebar::section(ui, p, "System");
                     for place in &self.shell_roots {
-                        if sidebar::row(ui, p, place, current) {
-                            actions.push(Action::Navigate(place.id.clone()));
+                        match sidebar::row(ui, p, place, current) {
+                                sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
+                                sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
+                                sidebar::RowHit::None => {}
                         }
                     }
                 }
 
                 sidebar::section(ui, p, "Cloud");
                 for place in &self.cloud {
-                    if sidebar::row(ui, p, place, current) {
-                        actions.push(Action::Navigate(place.id.clone()));
+                    match sidebar::row(ui, p, place, current) {
+                            sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
+                            sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
+                            sidebar::RowHit::None => {}
                     }
                 }
                 use neutron_cloud::google::DriveState;
@@ -4172,8 +4275,10 @@ impl NeutronApp {
                             kind: neutron_core::places::PlaceKind::Cloud,
                             capacity: None,
                         };
-                        if sidebar::row(ui, p, &place, current) {
-                            actions.push(Action::Navigate(place.id.clone()));
+                        match sidebar::row(ui, p, &place, current) {
+                                sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
+                                sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
+                                sidebar::RowHit::None => {}
                         }
                     }
                     DriveState::SignedOut => {
@@ -4221,8 +4326,10 @@ impl NeutronApp {
                         kind: neutron_core::places::PlaceKind::Server,
                         capacity: None,
                     };
-                    if sidebar::row(ui, p, &place, current) {
-                        actions.push(Action::Navigate(place.id.clone()));
+                    match sidebar::row(ui, p, &place, current) {
+                            sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
+                            sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
+                            sidebar::RowHit::None => {}
                     }
                 }
                 if let Some(reason) = &self.sites_error {
@@ -4244,16 +4351,20 @@ impl NeutronApp {
                 if !self.wsl.is_empty() {
                     sidebar::section(ui, p, "Linux");
                     for place in &self.wsl {
-                        if sidebar::row(ui, p, place, current) {
-                            actions.push(Action::Navigate(place.id.clone()));
+                        match sidebar::row(ui, p, place, current) {
+                                sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
+                                sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
+                                sidebar::RowHit::None => {}
                         }
                     }
                 }
 
                 sidebar::section(ui, p, "Drives");
                 for drive in &self.drives {
-                    if sidebar::row(ui, p, drive, current) {
-                        actions.push(Action::Navigate(drive.id.clone()));
+                    match sidebar::row(ui, p, drive, current) {
+                            sidebar::RowHit::Open => actions.push(Action::Navigate(drive.id.clone())),
+                            sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(drive.id.clone(), at)),
+                            sidebar::RowHit::None => {}
                     }
                 }
                 // Below the drives found so far, not above them: the slow
