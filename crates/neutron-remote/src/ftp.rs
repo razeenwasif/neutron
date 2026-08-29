@@ -134,6 +134,47 @@ impl Transport for FtpTransport {
             Stream::Tls(s) => download_on(s, path, sink, on_progress),
         }
     }
+    fn create_dir(&mut self, path: &str) -> Result<(), RemoteError> {
+        match &mut self.stream {
+            Stream::Plain(s) => simple(s, path, |s, p| s.mkdir(p)),
+            Stream::Tls(s) => simple(s, path, |s, p| s.mkdir(p)),
+        }
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), RemoteError> {
+        let (from, to) = (path::normalize(from), path::normalize(to));
+        match &mut self.stream {
+            Stream::Plain(s) => rename_on(s, &from, &to),
+            Stream::Tls(s) => rename_on(s, &from, &to),
+        }
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), RemoteError> {
+        match &mut self.stream {
+            Stream::Plain(s) => simple(s, path, |s, p| s.rm(p)),
+            Stream::Tls(s) => simple(s, path, |s, p| s.rm(p)),
+        }
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<(), RemoteError> {
+        match &mut self.stream {
+            Stream::Plain(s) => simple(s, path, |s, p| s.rmdir(p)),
+            Stream::Tls(s) => simple(s, path, |s, p| s.rmdir(p)),
+        }
+    }
+
+    fn upload(
+        &mut self,
+        path: &str,
+        source: &mut dyn Read,
+        on_progress: &mut dyn FnMut(u64) -> Continue,
+    ) -> Result<u64, RemoteError> {
+        match &mut self.stream {
+            Stream::Plain(s) => upload_on(s, path, source, on_progress),
+            Stream::Tls(s) => upload_on(s, path, source, on_progress),
+        }
+    }
+
 }
 
 /// Logs in, switches to binary mode, and asks what the server can do.
@@ -209,6 +250,99 @@ fn list_on<T: TlsStream>(
     }
 
     Ok(entries)
+}
+
+
+/// One command that either works or reports the server's own words.
+///
+/// The three removals and the directory create are all this shape, and writing
+/// them out four times invites one of them to report a different path than the
+/// one it acted on.
+fn simple<T: TlsStream, F>(
+    stream: &mut ImplFtpStream<T>,
+    path: &str,
+    call: F,
+) -> Result<(), RemoteError>
+where
+    F: FnOnce(&mut ImplFtpStream<T>, &str) -> Result<(), suppaftp::FtpError>,
+{
+    let path = path::normalize(path);
+    call(stream, &path).map_err(|e| RemoteError::Server {
+        path,
+        reason: e.to_string(),
+    })
+}
+
+fn rename_on<T: TlsStream>(
+    stream: &mut ImplFtpStream<T>,
+    from: &str,
+    to: &str,
+) -> Result<(), RemoteError> {
+    stream.rename(from, to).map_err(|e| RemoteError::Server {
+        // The destination, not the source: a rename fails because of where it
+        // was going — a name already taken, a directory that is not writable —
+        // far more often than because of where it came from.
+        path: to.to_owned(),
+        reason: e.to_string(),
+    })
+}
+
+fn upload_on<T: TlsStream>(
+    stream: &mut ImplFtpStream<T>,
+    path: &str,
+    source: &mut dyn Read,
+    on_progress: &mut dyn FnMut(u64) -> Continue,
+) -> Result<u64, RemoteError> {
+    let path = path::normalize(path);
+
+    let mut data = stream.put_with_stream(&path).map_err(|e| RemoteError::Server {
+        path: path.clone(),
+        reason: e.to_string(),
+    })?;
+
+    let mut buffer = vec![0u8; CHUNK];
+    let mut total = 0u64;
+    let mut stopped = false;
+    let mut failure = None;
+
+    loop {
+        let read = match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                failure = Some(RemoteError::Io(e));
+                break;
+            }
+        };
+        if let Err(e) = data.write_all(&buffer[..read]) {
+            failure = Some(RemoteError::Io(e));
+            break;
+        }
+        total += read as u64;
+        if on_progress(total) == Continue::Stop {
+            stopped = true;
+            break;
+        }
+    }
+
+    // The data connection is finalised either way. Dropping it without
+    // `finalize_put_stream` leaves the control connection waiting for a
+    // response that never comes, and every later command on this session then
+    // reads the wrong reply — a transfer the user stopped would break the
+    // connection rather than just ending.
+    let finished = stream.finalize_put_stream(data);
+
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    if stopped {
+        return Err(RemoteError::Cancelled);
+    }
+    finished.map_err(|e| RemoteError::Server {
+        path,
+        reason: e.to_string(),
+    })?;
+    Ok(total)
 }
 
 fn download_on<T: TlsStream>(

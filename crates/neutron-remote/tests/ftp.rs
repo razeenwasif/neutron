@@ -30,6 +30,9 @@ struct Config {
     file: Vec<u8>,
     /// Whether `PASS` succeeds.
     password_ok: bool,
+    /// A verb the server answers `550` to, so the client's handling of a
+    /// refusal can be tested without a real permission problem.
+    refuse: Option<String>,
 }
 
 impl Default for Config {
@@ -39,6 +42,7 @@ impl Default for Config {
             listing: Vec::new(),
             file: Vec::new(),
             password_ok: true,
+            refuse: None,
         }
     }
 }
@@ -47,6 +51,8 @@ struct FakeFtp {
     addr: SocketAddr,
     /// Every command line the server received, in order.
     log: Arc<Mutex<Vec<String>>>,
+    /// Whatever `STOR` received, so an upload can be checked byte for byte.
+    stored: Arc<Mutex<Vec<u8>>>,
 }
 
 impl FakeFtp {
@@ -56,18 +62,24 @@ impl FakeFtp {
         let addr = listener.local_addr().expect("addr");
         let log = Arc::new(Mutex::new(Vec::new()));
 
+        let stored = Arc::new(Mutex::new(Vec::new()));
         let worker_log = Arc::clone(&log);
+        let worker_stored = Arc::clone(&stored);
         std::thread::spawn(move || {
             if let Ok((control, _)) = listener.accept() {
-                serve(control, config, worker_log);
+                serve(control, config, worker_log, worker_stored);
             }
         });
 
-        FakeFtp { addr, log }
+        FakeFtp { addr, log, stored }
     }
 
     fn commands(&self) -> Vec<String> {
         self.log.lock().clone()
+    }
+
+    fn stored(&self) -> Vec<u8> {
+        self.stored.lock().clone()
     }
 
     fn site(&self, username: &str) -> Site {
@@ -85,7 +97,12 @@ impl FakeFtp {
 }
 
 /// One client's whole session.
-fn serve(control: TcpStream, config: Config, log: Arc<Mutex<Vec<String>>>) {
+fn serve(
+    control: TcpStream,
+    config: Config,
+    log: Arc<Mutex<Vec<String>>>,
+    stored: Arc<Mutex<Vec<u8>>>,
+) {
     let mut writer = control.try_clone().expect("clone");
     let mut reader = BufReader::new(control);
 
@@ -115,6 +132,11 @@ fn serve(control: TcpStream, config: Config, log: Arc<Mutex<Vec<String>>>) {
             Some((verb, rest)) => (verb.to_ascii_uppercase(), rest.to_owned()),
             None => (line.to_ascii_uppercase(), String::new()),
         };
+
+        if config.refuse.as_deref() == Some(verb.as_str()) {
+            say(&mut writer, "550 Permission denied");
+            continue;
+        }
 
         match verb.as_str() {
             "USER" => say(&mut writer, "331 Password required"),
@@ -163,6 +185,13 @@ fn serve(control: TcpStream, config: Config, log: Arc<Mutex<Vec<String>>>) {
                 let _ = argument;
                 transfer(&mut writer, &mut pending_data, &config.file);
             }
+            // The write half. Answers are the ones a real server gives, because
+            // the client branches on the reply code.
+            "MKD" => say(&mut writer, "257 Directory created"),
+            "DELE" | "RMD" => say(&mut writer, "250 Deleted"),
+            "RNFR" => say(&mut writer, "350 Ready for destination"),
+            "RNTO" => say(&mut writer, "250 Rename successful"),
+            "STOR" => receive(&mut writer, &mut pending_data, &stored),
             "QUIT" => {
                 say(&mut writer, "221 Goodbye");
                 return;
@@ -170,6 +199,40 @@ fn serve(control: TcpStream, config: Config, log: Arc<Mutex<Vec<String>>>) {
             _ => say(&mut writer, "502 Command not implemented"),
         }
     }
+}
+
+/// Reads the pending data connection to its end, with the two responses a
+/// client expects around it.
+///
+/// The closing `226` is what `finalize_put_stream` waits for. A fake that
+/// skipped it would leave the client blocked and the test would hang rather
+/// than fail, so it is sent even when nothing arrived.
+fn receive(
+    control: &mut TcpStream,
+    pending: &mut Option<TcpListener>,
+    stored: &Mutex<Vec<u8>>,
+) {
+    let Some(listener) = pending.take() else {
+        let _ = control.write_all(b"425 Use PASV first
+");
+        return;
+    };
+    let _ = control.write_all(b"150 Opening data connection
+");
+
+    let mut sink = Vec::new();
+    if let Ok((mut data, _)) = listener.accept() {
+        use std::io::Read;
+        let _ = data.read_to_end(&mut sink);
+    }
+
+    // Stored *before* the completion reply, not after. The client returns as
+    // soon as it reads 226, so storing afterwards leaves a window in which the
+    // test can read an empty buffer — which it did, but only under load, which
+    // is the worst kind of flake to leave in a suite.
+    *stored.lock() = sink;
+    let _ = control.write_all(b"226 Transfer complete
+");
 }
 
 /// Sends `payload` over the pending data connection, with the two responses a
@@ -451,4 +514,129 @@ fn two_transfers_run_in_sequence_on_one_connection() {
         .download("/a.txt", &mut second, &mut |_| Continue::Yes)
         .expect("second download");
     assert_eq!(first, second);
+}
+
+// --- writing ---------------------------------------------------------------
+//
+// These act on someone else's machine and have no undo, so what is asserted is
+// the exact command and the exact path. A rename that sends the right verbs to
+// the wrong path is the failure that matters, and it is invisible from the
+// client's own return value.
+
+/// Anonymous, like the other tests here: a named user would need a password in
+/// Credential Manager, and none of this is about authentication.
+fn connect(server: &FakeFtp) -> Box<dyn neutron_remote::Transport> {
+    neutron_remote::connect(&server.site("")).expect("connect")
+}
+
+#[test]
+fn creating_a_directory_sends_mkd_with_the_full_path() {
+    let server = FakeFtp::start(Config::default());
+    let mut t = connect(&server);
+    t.create_dir("/pub/new folder").expect("mkd");
+    assert!(
+        server.commands().contains(&"MKD /pub/new folder".to_owned()),
+        "{:?}",
+        server.commands()
+    );
+}
+
+/// FTP renames in two commands, and a client that sent only one would leave the
+/// server waiting mid-sequence with the file untouched.
+#[test]
+fn a_rename_sends_rnfr_then_rnto_in_that_order() {
+    let server = FakeFtp::start(Config::default());
+    let mut t = connect(&server);
+    t.rename("/pub/old.txt", "/pub/new.txt").expect("rename");
+
+    let log = server.commands();
+    let from = log.iter().position(|c| c == "RNFR /pub/old.txt");
+    let to = log.iter().position(|c| c == "RNTO /pub/new.txt");
+    assert!(from.is_some() && to.is_some(), "{log:?}");
+    assert!(from < to, "RNTO must follow RNFR: {log:?}");
+}
+
+/// A file and a directory take different verbs. Sending DELE for a directory
+/// fails on a real server, so the two are not interchangeable.
+#[test]
+fn a_file_and_a_directory_are_removed_with_different_commands() {
+    let server = FakeFtp::start(Config::default());
+    let mut t = connect(&server);
+    t.remove_file("/pub/notes.txt").expect("dele");
+    t.remove_dir("/pub/empty").expect("rmd");
+
+    let log = server.commands();
+    assert!(log.contains(&"DELE /pub/notes.txt".to_owned()), "{log:?}");
+    assert!(log.contains(&"RMD /pub/empty".to_owned()), "{log:?}");
+}
+
+#[test]
+fn an_upload_arrives_byte_for_byte() {
+    let server = FakeFtp::start(Config::default());
+    let mut t = connect(&server);
+
+    // Includes a NUL and a high byte: an upload that went through ASCII mode
+    // would mangle these and still report success.
+    let payload: Vec<u8> = vec![0x00, 0x0D, 0x0A, 0xFF, b'h', b'i', 0x1A];
+    let mut source = std::io::Cursor::new(payload.clone());
+    let written = t
+        .upload("/pub/blob.bin", &mut source, &mut |_| {
+            neutron_remote::Continue::Yes
+        })
+        .expect("upload");
+
+    assert_eq!(written, payload.len() as u64);
+    assert_eq!(server.stored(), payload);
+    assert!(
+        server.commands().contains(&"STOR /pub/blob.bin".to_owned()),
+        "{:?}",
+        server.commands()
+    );
+}
+
+/// The reason `finalize_put_stream` is called even on a stopped transfer.
+///
+/// Dropping the data connection without it leaves the control connection
+/// waiting for a response nobody read, and every later command then reads the
+/// *previous* reply — so the session does not fail, it silently answers the
+/// wrong questions. This asserts the connection is still usable afterwards.
+#[test]
+fn a_stopped_upload_leaves_the_connection_usable() {
+    let server = FakeFtp::start(Config::default());
+    let mut t = connect(&server);
+
+    let big = vec![b'x'; 512 * 1024];
+    let mut source = std::io::Cursor::new(big);
+    let outcome = t.upload("/pub/big.bin", &mut source, &mut |_| {
+        neutron_remote::Continue::Stop
+    });
+    assert!(
+        matches!(outcome, Err(neutron_remote::RemoteError::Cancelled)),
+        "{outcome:?}"
+    );
+
+    // The next command has to work. If the control stream were out of step this
+    // would read the upload's leftover reply and fail, or hang.
+    t.create_dir("/pub/after").expect("the session survived the stop");
+    assert!(
+        server.commands().contains(&"MKD /pub/after".to_owned()),
+        "{:?}",
+        server.commands()
+    );
+}
+
+/// A refusal is the server's own words, not a generic failure. "Permission
+/// denied" is actionable; "could not delete" is not.
+#[test]
+fn a_refused_write_reports_what_the_server_said() {
+    let server = FakeFtp::start(Config {
+        refuse: Some("DELE".into()),
+        ..Config::default()
+    });
+    let mut t = connect(&server);
+
+    let error = t.remove_file("/pub/locked.txt").expect_err("should refuse");
+    let text = error.to_string();
+    assert!(text.contains("/pub/locked.txt"), "{text}");
+    assert!(text.contains("550") || text.contains("Permission"), "{text}");
 }

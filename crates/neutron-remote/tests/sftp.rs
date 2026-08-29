@@ -67,6 +67,10 @@ struct FakeSftp {
     addr: SocketAddr,
     /// What the client should see, so a test can assert on the recorded value.
     fingerprint: String,
+    /// Write requests the server received, as `"verb path"`.
+    writes: Arc<parking_lot::Mutex<Vec<String>>>,
+    /// Whatever `write` received, byte for byte.
+    written: Arc<parking_lot::Mutex<Vec<u8>>>,
 }
 
 impl FakeSftp {
@@ -82,6 +86,11 @@ impl FakeSftp {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let addr = listener.local_addr().expect("addr");
         listener.set_nonblocking(true).expect("nonblocking");
+
+        let writes: Arc<parking_lot::Mutex<Vec<String>>> = Arc::new(Default::default());
+        let written: Arc<parking_lot::Mutex<Vec<u8>>> = Arc::new(Default::default());
+        let server_writes = Arc::clone(&writes);
+        let server_written = Arc::clone(&written);
 
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -100,13 +109,29 @@ impl FakeSftp {
                 let mut server = Server {
                     items: Arc::new(items),
                     password_ok,
+                    writes: server_writes,
+                    written: server_written,
                 };
                 let running = server.run_on_socket(config, &listener);
                 let _ = running.await;
             });
         });
 
-        FakeSftp { addr, fingerprint }
+        FakeSftp {
+            addr,
+            fingerprint,
+            writes,
+            written,
+        }
+    }
+
+    /// Every write request the server received, as `"verb path"`.
+    fn writes(&self) -> Vec<String> {
+        self.writes.lock().clone()
+    }
+
+    fn written(&self) -> Vec<u8> {
+        self.written.lock().clone()
     }
 
     fn site(&self, fingerprint: Option<&str>) -> Site {
@@ -127,6 +152,8 @@ impl FakeSftp {
 struct Server {
     items: Arc<Vec<Item>>,
     password_ok: bool,
+    writes: Arc<parking_lot::Mutex<Vec<String>>>,
+    written: Arc<parking_lot::Mutex<Vec<u8>>>,
 }
 
 impl russh::server::Server for Server {
@@ -137,6 +164,8 @@ impl russh::server::Server for Server {
             channels: Arc::new(Mutex::new(HashMap::new())),
             items: Arc::clone(&self.items),
             password_ok: self.password_ok,
+            writes: Arc::clone(&self.writes),
+            written: Arc::clone(&self.written),
         }
     }
 }
@@ -145,6 +174,8 @@ struct SshSession {
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
     items: Arc<Vec<Item>>,
     password_ok: bool,
+    writes: Arc<parking_lot::Mutex<Vec<String>>>,
+    written: Arc<parking_lot::Mutex<Vec<u8>>>,
 }
 
 impl russh::server::Handler for SshSession {
@@ -191,6 +222,8 @@ impl russh::server::Handler for SshSession {
             channel.into_stream(),
             SftpHandler {
                 items: Arc::clone(&self.items),
+                writes: Arc::clone(&self.writes),
+                written: Arc::clone(&self.written),
                 read_dirs: HashSet::new(),
                 read_files: HashSet::new(),
             },
@@ -200,9 +233,16 @@ impl russh::server::Handler for SshSession {
     }
 }
 
-/// A read-only SFTP server over a flat list of items in `/`.
+/// An SFTP server over a flat list of items in `/`.
 struct SftpHandler {
     items: Arc<Vec<Item>>,
+    /// Every write request the server was asked to perform, as
+    /// `"verb path"`, in order. What a write test actually asserts is that the
+    /// right request reached the server with the right path — the client's own
+    /// return value cannot tell you that.
+    writes: Arc<parking_lot::Mutex<Vec<String>>>,
+    /// Whatever `write` received, so an upload can be checked byte for byte.
+    written: Arc<parking_lot::Mutex<Vec<u8>>>,
     /// Directory handles already drained, so the second `readdir` says EOF.
     read_dirs: HashSet<String>,
     /// File handles already drained, likewise.
@@ -213,6 +253,19 @@ impl SftpHandler {
     fn find(&self, path: &str) -> Option<&Item> {
         let name = path.trim_start_matches('/');
         self.items.iter().find(|i| i.name == name)
+    }
+
+    fn note(&self, verb: &str, path: &str) {
+        self.writes.lock().push(format!("{verb} {path}"));
+    }
+
+    fn ok(&self, id: u32) -> Status {
+        Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_owned(),
+            language_tag: "en-US".to_owned(),
+        }
     }
 }
 
@@ -267,13 +320,71 @@ impl russh_sftp::server::Handler for SftpHandler {
         })
     }
 
+
+    // --- the write half -----------------------------------------------------
+    //
+    // Each one records the request and succeeds. What these tests are for is
+    // the path: a client that sends the right verb to the wrong place has no
+    // way of noticing, because the server answers Ok either way.
+
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        self.note("mkdir", &path);
+        Ok(self.ok(id))
+    }
+
+    async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+        self.note("rmdir", &path);
+        Ok(self.ok(id))
+    }
+
+    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        self.note("remove", &filename);
+        Ok(self.ok(id))
+    }
+
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, Self::Error> {
+        self.note("rename", &format!("{oldpath} -> {newpath}"));
+        Ok(self.ok(id))
+    }
+
+    async fn write(
+        &mut self,
+        id: u32,
+        _handle: String,
+        _offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
+        self.written.lock().extend_from_slice(&data);
+        Ok(self.ok(id))
+    }
+
     async fn open(
         &mut self,
         id: u32,
         filename: String,
-        _flags: russh_sftp::protocol::OpenFlags,
+        flags: russh_sftp::protocol::OpenFlags,
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
+        // An upload opens a file that does not exist yet, which is exactly the
+        // case a read-only fake refuses. The flags are what distinguishes the
+        // two, and getting this wrong here would make every upload test fail
+        // for a reason that has nothing to do with the client.
+        if flags.contains(russh_sftp::protocol::OpenFlags::WRITE)
+            || flags.contains(russh_sftp::protocol::OpenFlags::CREATE)
+        {
+            self.note("open-write", &filename);
+            return Ok(Handle { id, handle: filename });
+        }
         match self.find(&filename) {
             Some(_) => {
                 self.read_files.remove(&filename);
@@ -503,4 +614,102 @@ fn one_connection_serves_several_operations() {
 
     assert_eq!(a, b"aaa");
     assert_eq!(b, b"bbbb");
+}
+
+// --- writing ---------------------------------------------------------------
+//
+// The server answers Ok to every one of these, which is the point: what a
+// client gets wrong is not the verb but the *path*, and its own return value
+// cannot tell you about that. Each test asserts what actually reached the
+// server.
+
+fn writer(server: &FakeSftp) -> neutron_remote::sftp::SftpTransport {
+    neutron_remote::sftp::SftpTransport::connect(&server.site(None), "hunter2")
+        .expect("should connect")
+}
+
+#[test]
+fn creating_a_directory_asks_for_the_full_path() {
+    let server = FakeSftp::start(key(), Vec::new(), true);
+    let mut t = writer(&server);
+    t.create_dir("/pub/new folder").expect("mkdir");
+    assert!(
+        server.writes().contains(&"mkdir /pub/new folder".to_owned()),
+        "{:?}",
+        server.writes()
+    );
+}
+
+/// A file and a directory take different requests over SFTP too, and sending
+/// `remove` for a directory fails on a real server.
+#[test]
+fn a_file_and_a_directory_are_removed_with_different_requests() {
+    let server = FakeSftp::start(key(), Vec::new(), true);
+    let mut t = writer(&server);
+    t.remove_file("/pub/notes.txt").expect("remove");
+    t.remove_dir("/pub/empty").expect("rmdir");
+
+    let w = server.writes();
+    assert!(w.contains(&"remove /pub/notes.txt".to_owned()), "{w:?}");
+    assert!(w.contains(&"rmdir /pub/empty".to_owned()), "{w:?}");
+}
+
+/// Both paths, in the right order. A rename that swapped them would move the
+/// destination onto the source and destroy the file it was meant to keep.
+#[test]
+fn a_rename_carries_both_paths_the_right_way_round() {
+    let server = FakeSftp::start(key(), Vec::new(), true);
+    let mut t = writer(&server);
+    t.rename("/pub/old.txt", "/pub/new.txt").expect("rename");
+    assert!(
+        server
+            .writes()
+            .contains(&"rename /pub/old.txt -> /pub/new.txt".to_owned()),
+        "{:?}",
+        server.writes()
+    );
+}
+
+#[test]
+fn an_upload_arrives_byte_for_byte() {
+    let server = FakeSftp::start(key(), Vec::new(), true);
+    let mut t = writer(&server);
+
+    // Larger than one chunk, so the loop runs more than once and an
+    // off-by-one in the offset would show up as a short or duplicated write.
+    let payload: Vec<u8> = (0..=255u8).cycle().take(200_000).collect();
+    let mut source = std::io::Cursor::new(payload.clone());
+    let written = t
+        .upload("/pub/blob.bin", &mut source, &mut |_| Continue::Yes)
+        .expect("upload");
+
+    assert_eq!(written, payload.len() as u64);
+    assert_eq!(server.written(), payload);
+}
+
+#[test]
+fn progress_is_reported_and_an_upload_can_be_stopped() {
+    let server = FakeSftp::start(key(), Vec::new(), true);
+    let mut t = writer(&server);
+
+    let payload = vec![b'x'; 300_000];
+    let mut source = std::io::Cursor::new(payload);
+    let mut seen = Vec::new();
+    let outcome = t.upload("/pub/big.bin", &mut source, &mut |done| {
+        seen.push(done);
+        // Stop after the first chunk: a cancel that only takes effect at the
+        // end is not a cancel.
+        Continue::Stop
+    });
+
+    assert!(
+        matches!(outcome, Err(neutron_remote::RemoteError::Cancelled)),
+        "{outcome:?}"
+    );
+    assert_eq!(seen.len(), 1, "the transfer kept going after Stop: {seen:?}");
+    assert!(seen[0] > 0, "progress reported nothing");
+    assert!(
+        server.written().len() < 300_000,
+        "a stopped upload sent the whole file"
+    );
 }

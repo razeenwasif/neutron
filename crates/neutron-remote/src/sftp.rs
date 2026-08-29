@@ -22,7 +22,7 @@
 //! cost is one extra thread-local executor per connection, which is nothing
 //! next to a TCP round trip.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -30,7 +30,7 @@ use neutron_core::entry::EntryKind;
 use russh::keys::PublicKeyOrCertificate;
 use russh::keys::HashAlg;
 use russh_sftp::client::SftpSession;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::hostkey::{self, Decision};
 use crate::path;
@@ -287,6 +287,98 @@ impl Transport for SftpTransport {
         }
 
         Ok(entries)
+    }
+
+
+    fn create_dir(&mut self, path: &str) -> Result<(), RemoteError> {
+        let path = path::normalize(path);
+        let address = self.address.clone();
+        self.runtime
+            .block_on(self.session.create_dir(path.clone()))
+            .map_err(|e| RemoteError::Server {
+                path,
+                reason: describe(&address, &e),
+            })
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), RemoteError> {
+        let (from, to) = (path::normalize(from), path::normalize(to));
+        let address = self.address.clone();
+        self.runtime
+            .block_on(self.session.rename(from, to.clone()))
+            .map_err(|e| RemoteError::Server {
+                // The destination: a rename fails because of where it was
+                // going far more often than because of where it came from.
+                path: to,
+                reason: describe(&address, &e),
+            })
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), RemoteError> {
+        let path = path::normalize(path);
+        let address = self.address.clone();
+        self.runtime
+            .block_on(self.session.remove_file(path.clone()))
+            .map_err(|e| RemoteError::Server {
+                path,
+                reason: describe(&address, &e),
+            })
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<(), RemoteError> {
+        let path = path::normalize(path);
+        let address = self.address.clone();
+        self.runtime
+            .block_on(self.session.remove_dir(path.clone()))
+            .map_err(|e| RemoteError::Server {
+                path,
+                reason: describe(&address, &e),
+            })
+    }
+
+    fn upload(
+        &mut self,
+        path: &str,
+        source: &mut dyn Read,
+        on_progress: &mut dyn FnMut(u64) -> Continue,
+    ) -> Result<u64, RemoteError> {
+        let path = path::normalize(path);
+        let address = self.address.clone();
+
+        // `create` truncates, which is what replacing a file means. Opening for
+        // append and hoping would leave the tail of whatever was there before
+        // stuck on the end of the new file.
+        let mut file = self
+            .runtime
+            .block_on(self.session.create(path.clone()))
+            .map_err(|e| RemoteError::Server {
+                path: path.clone(),
+                reason: describe(&address, &e),
+            })?;
+
+        let mut buffer = vec![0u8; CHUNK];
+        let mut total = 0u64;
+
+        loop {
+            let read = source.read(&mut buffer).map_err(RemoteError::Io)?;
+            if read == 0 {
+                break;
+            }
+            self.runtime
+                .block_on(file.write_all(&buffer[..read]))
+                .map_err(RemoteError::Io)?;
+            total += read as u64;
+            if on_progress(total) == Continue::Stop {
+                return Err(RemoteError::Cancelled);
+            }
+        }
+
+        // Flushed before success is reported, so a write error on the last
+        // buffer is not announced as a completed upload.
+        self.runtime
+            .block_on(file.flush())
+            .map_err(RemoteError::Io)?;
+        Ok(total)
     }
 
     fn download(

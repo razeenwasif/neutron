@@ -9,7 +9,7 @@
 //! Every method here blocks. They run on the loader thread or a job worker,
 //! never on the UI thread.
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 use neutron_core::entry::{Entry, EntryKind, attr};
 
@@ -112,6 +112,55 @@ pub trait Transport: Send {
         &mut self,
         path: &str,
         sink: &mut dyn Write,
+        on_progress: &mut dyn FnMut(u64) -> Continue,
+    ) -> Result<u64, RemoteError>;
+
+
+    // --- writing ------------------------------------------------------------
+    //
+    // Everything below acts on someone else's machine, where a mistake has no
+    // Recycle Bin behind it. Two rules hold across both implementations.
+    //
+    // **Paths are built, never concatenated by the caller.** Every one of these
+    // takes an absolute POSIX path that `crate::path::join` produced from a
+    // name already through `safe_name`, for the same reason a listing's names
+    // are checked: a name carrying `..` or a separator is how a write lands
+    // somewhere nobody asked for.
+    //
+    // **A directory is removed only when it is empty.** Neither protocol has a
+    // recursive delete, so a folder is a walk the caller has to do — and a walk
+    // that deletes is exactly where a bug is unrecoverable. Making the caller
+    // ask for each step keeps the decision where the confirmation is.
+
+    /// Creates one directory. Its parent must already exist.
+    fn create_dir(&mut self, path: &str) -> Result<(), RemoteError>;
+
+    /// Renames or moves an entry.
+    ///
+    /// Both paths are absolute. Servers differ on whether this can move across
+    /// directories and on whether it will overwrite; Neutron only ever renames
+    /// within one directory, and checks for a collision first.
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), RemoteError>;
+
+    /// Deletes one file. Permanent: there is no server-side bin.
+    fn remove_file(&mut self, path: &str) -> Result<(), RemoteError>;
+
+    /// Deletes one *empty* directory.
+    ///
+    /// A server that refuses because the directory is not empty says so in its
+    /// own words, which is the answer the user needs.
+    fn remove_dir(&mut self, path: &str) -> Result<(), RemoteError>;
+
+    /// Writes `source` to `path`, replacing whatever is there.
+    ///
+    /// `on_progress` receives the running byte count and may stop the transfer.
+    /// A stopped or failed upload leaves a partial file on the server, which
+    /// the caller is expected to remove — this layer cannot know whether the
+    /// file it was overwriting mattered.
+    fn upload(
+        &mut self,
+        path: &str,
+        source: &mut dyn Read,
         on_progress: &mut dyn FnMut(u64) -> Continue,
     ) -> Result<u64, RemoteError>;
 
