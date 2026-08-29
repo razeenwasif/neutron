@@ -27,7 +27,7 @@
 
 use egui::{Align2, Color32, Rect, Sense, Ui, pos2, vec2};
 use neutron_ui::icons::{self, Glyph};
-use neutron_ui::theme::{self, Palette, RADIUS_CARD, RADIUS_CONTROL};
+use neutron_ui::theme::{Palette, RADIUS_CARD, RADIUS_CONTROL};
 
 /// Which corpus the overlay is searching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +260,6 @@ pub fn show(ui: &mut Ui, p: &Palette, finder: &Finder) -> Option<FinderAction> {
         egui::Stroke::new(1.0, p.border_strong),
         egui::StrokeKind::Inside,
     );
-    theme::glass_highlight(&painter, card, egui::CornerRadius::same(RADIUS_CARD));
 
     let scrim = ui.interact(screen, ui.id().with("finder-scrim"), Sense::click());
 

@@ -22,12 +22,13 @@
 
 use egui::{Color32, CornerRadius, Stroke, Visuals, pos2};
 
-/// Dark glass is the default, matching Aero's depth-through-translucency philosophy.
+/// Light is the default. Both of the concepts this design came from are light,
+/// and a file manager is read far more than it is looked at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeMode {
     #[default]
-    Dark,
     Light,
+    Dark,
 }
 
 impl ThemeMode {
@@ -43,10 +44,11 @@ impl ThemeMode {
     }
 }
 
-/// A soft drifting coloured light on the ground behind the glass panels.
+/// A soft static coloured wash on the ground behind the cards.
 ///
 /// Position and radius are fractions of the window, so the arrangement holds
-/// at any size. Drifts slowly on 34s, 44s, and 52s animation cycles.
+/// at any size. Static: nothing here moves, which is why the ground costs one
+/// frame rather than a repaint forever.
 #[derive(Debug, Clone, Copy)]
 pub struct Orb {
     /// Base centre x, as a fraction of window width.
@@ -58,8 +60,6 @@ pub struct Orb {
     /// Colour at the centre. Its alpha sets the peak intensity; the edge fades
     /// to fully transparent.
     pub colour: Color32,
-    /// Loop duration in seconds for the drift animation.
-    pub period: f32,
 }
 
 /// Semantic colour tokens, named by role rather than appearance.
@@ -117,127 +117,129 @@ pub struct Palette {
 }
 
 impl Palette {
-    pub const DARK: Palette = Palette {
-        // Deep near-black violet ground.
-        ground: Color32::from_rgb(0x0C, 0x07, 0x14),
-        ground_deep: Color32::from_rgb(0x05, 0x02, 0x0A),
+    /// The light theme, and the default.
+    ///
+    /// # Opaque cards on a still ground
+    ///
+    /// Neutron used to draw translucent glass over two colour fields drifting
+    /// on 41- and 57-second loops. That is gone. A light palette is exactly
+    /// where a moving ground stops reading as depth and starts reading as a
+    /// smudge under the text, and the drift was the only continuous repaint in
+    /// the program — 1.69% of a core, forever, for decoration. The ground keeps
+    /// two *static* washes, which cost nothing and still stop the window
+    /// reading as a flat sheet.
+    ///
+    /// Cards are opaque, so a card is the same colour wherever it sits. That
+    /// is what makes a hairline border enough to separate it from the ground,
+    /// and it is why the contrast figures below are single numbers rather than
+    /// ranges.
+    pub const LIGHT: Palette = Palette {
+        ground: Color32::from_rgb(0xEE, 0xF0, 0xF4),
+        ground_deep: Color32::from_rgb(0xE6, 0xE9, 0xEF),
 
-        // Darker and more transparent than before: at 180 alpha over a lit orb
-        // the big pane came out visibly lighter than the sidebar beside it,
-        // because the pane covers the bright part of the ground and the sidebar
-        // does not. Taking the fill down and the transparency up lets both read
-        // as the same sheet of glass over different amounts of light — which is
-        // what glass does, and what a flat fill cannot fake.
-        // Lighter than the ground, not darker. While the cards were nearly
-        // opaque a near-ground fill read fine, but transparency exposes the
-        // problem: a panel whose fill matches what is behind it composites to
-        // the same colour and its edge disappears in the unlit corners. Glass
-        // over a dark ground catches light — it is the lighter thing.
-        card: Color32::from_rgba_unmultiplied_const(0x24, 0x1B, 0x38, 112),
-        card_hover: Color32::from_rgba_unmultiplied_const(0x35, 0x28, 0x50, 150),
-        // Popovers stay near-opaque. They cover content rather than sitting on
-        // the ground, and reading a menu through the listing underneath is
-        // atmosphere at the cost of the thing actually being used.
-        elevated: Color32::from_rgba_unmultiplied_const(0x14, 0x0D, 0x22, 244),
-        inset: Color32::from_rgba_unmultiplied_const(0x04, 0x02, 0x08, 150),
+        card: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+        card_hover: Color32::from_rgb(0xF5, 0xF6, 0xF9),
+        elevated: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+        inset: Color32::from_rgb(0xF2, 0xF3, 0xF7),
 
-        shadow: Color32::from_black_alpha(110),
+        // Barely there. Depth comes from the hairline and a whisper of shadow,
+        // not from a dark edge under every card.
+        shadow: Color32::from_black_alpha(18),
 
-        // Two large, soft colour fields rather than three tighter ones. At this
-        // radius each one spans most of the window, so what shows is the
-        // gradient where they overlap — no orb is identifiable as a circle,
-        // which is what "subtle" has to mean for something the panels sit on.
-        //
-        // Placed on opposite diagonals and drifting on periods that do not
-        // divide into each other, so the pair never settles into a visibly
-        // repeating pattern.
+        // Two static washes, well outside the window's centre so no circle is
+        // identifiable — what shows is the tint where they fall off.
         orbs: [
             Orb {
-                x: 0.12,
-                y: 0.06,
-                radius: 0.92,
-                colour: Color32::from_rgba_unmultiplied_const(0x93, 0x33, 0xEA, 150),
-                period: 41.0,
+                x: 0.14,
+                y: -0.06,
+                radius: 0.95,
+                colour: Color32::from_rgba_unmultiplied_const(0xA8, 0x8B, 0xF7, 26),
             },
             Orb {
-                x: 0.86,
-                y: 0.88,
-                radius: 0.85,
-                colour: Color32::from_rgba_unmultiplied_const(0x63, 0x66, 0xF1, 125),
-                period: 57.0,
+                x: 0.94,
+                y: 0.10,
+                radius: 0.88,
+                colour: Color32::from_rgba_unmultiplied_const(0x6E, 0xA8, 0xF0, 22),
             },
         ],
 
-        border: Color32::from_rgba_unmultiplied_const(0xD8, 0xB4, 0xFE, 28),
-        border_strong: Color32::from_rgba_unmultiplied_const(0xD8, 0xB4, 0xFE, 50),
+        border: Color32::from_rgb(0xE6, 0xE7, 0xEE),
+        border_strong: Color32::from_rgb(0xD8, 0xD9, 0xE3),
 
-        text: Color32::from_rgb(0xFB, 0xF7, 0xFF),
-        text_muted: Color32::from_rgb(0xB8, 0xAD, 0xCC),
-        text_faint: Color32::from_rgb(0x7C, 0x72, 0x90),
+        text: Color32::from_rgb(0x16, 0x16, 0x1D),
+        text_muted: Color32::from_rgb(0x6B, 0x6C, 0x7B),
+        // Deliberately darker than the 0x9A9BAB of the design draft, which
+        // measured 2.9:1 on white and would have been the one value in the
+        // palette below AA. Metadata is still quiet at this weight.
+        text_faint: Color32::from_rgb(0x77, 0x78, 0x88),
 
-        icon: Color32::from_rgb(0x9D, 0x93, 0xB0),
+        icon: Color32::from_rgb(0x6B, 0x6C, 0x7B),
 
-        accent: Color32::from_rgb(0xC0, 0x84, 0xFC),
-        accent_hover: Color32::from_rgb(0xD8, 0xB4, 0xFE),
-        accent_pressed: Color32::from_rgb(0xA8, 0x55, 0xF7),
+        accent: Color32::from_rgb(0x72, 0x50, 0xE6),
+        accent_hover: Color32::from_rgb(0x5F, 0x3D, 0xD6),
+        accent_pressed: Color32::from_rgb(0x4E, 0x2F, 0xBC),
 
-        selection: Color32::from_rgba_unmultiplied_const(0xC0, 0x84, 0xFC, 44),
-        hover: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 18),
+        // A tint, not a fill: the row keeps its own text colour and the left
+        // edge carries the accent.
+        selection: Color32::from_rgb(0xF0, 0xEC, 0xFE),
+        hover: Color32::from_rgba_unmultiplied_const(0x16, 0x16, 0x1D, 10),
 
-        success: Color32::from_rgb(0x34, 0xD3, 0x99),
-        warning: Color32::from_rgb(0xFB, 0xBF, 0x24),
-        danger: Color32::from_rgb(0xFB, 0x71, 0x85),
-        cloud: Color32::from_rgb(0xA7, 0x8B, 0xFA),
+        success: Color32::from_rgb(0x07, 0x84, 0x5C),
+        warning: Color32::from_rgb(0xA8, 0x5C, 0x12),
+        danger: Color32::from_rgb(0xC0, 0x35, 0x4C),
+        cloud: Color32::from_rgb(0x72, 0x50, 0xE6),
     };
 
-    pub const LIGHT: Palette = Palette {
-        ground: Color32::from_rgb(0xF4, 0xEE, 0xFC),
-        ground_deep: Color32::from_rgb(0xE9, 0xDE, 0xF8),
+    /// The same design language after dark: opaque cards, a still ground, one
+    /// accent. Not a separate look — the light theme with the values inverted
+    /// around the same structure, so a hairline still separates a card from the
+    /// ground and nothing moves.
+    pub const DARK: Palette = Palette {
+        ground: Color32::from_rgb(0x14, 0x15, 0x1A),
+        ground_deep: Color32::from_rgb(0x0E, 0x0F, 0x13),
 
-        card: Color32::from_rgba_unmultiplied_const(0xFC, 0xFA, 0xFF, 158),
-        card_hover: Color32::from_rgba_unmultiplied_const(0xF1, 0xEB, 0xFC, 190),
-        elevated: Color32::from_rgb(0xFC, 0xFA, 0xFF),
-        inset: Color32::from_rgb(0xEB, 0xE4, 0xF8),
+        card: Color32::from_rgb(0x1C, 0x1D, 0x24),
+        card_hover: Color32::from_rgb(0x24, 0x25, 0x2E),
+        elevated: Color32::from_rgb(0x24, 0x25, 0x2E),
+        inset: Color32::from_rgb(0x16, 0x17, 0x1D),
 
-        shadow: Color32::from_black_alpha(22),
+        shadow: Color32::from_black_alpha(90),
 
         orbs: [
             Orb {
-                x: 0.05,
-                y: -0.05,
+                x: 0.14,
+                y: -0.06,
                 radius: 0.95,
-                colour: Color32::from_rgba_unmultiplied_const(0xA8, 0x55, 0xF7, 84),
-                period: 41.0,
+                colour: Color32::from_rgba_unmultiplied_const(0x7C, 0x5C, 0xF0, 30),
             },
             Orb {
-                x: 0.92,
-                y: 0.92,
+                x: 0.94,
+                y: 0.10,
                 radius: 0.88,
-                colour: Color32::from_rgba_unmultiplied_const(0x81, 0x8C, 0xF8, 70),
-                period: 57.0,
+                colour: Color32::from_rgba_unmultiplied_const(0x3A, 0x6E, 0xB8, 24),
             },
         ],
 
-        border: Color32::from_rgba_unmultiplied_const(0x3B, 0x1E, 0x5A, 24),
-        border_strong: Color32::from_rgba_unmultiplied_const(0x3B, 0x1E, 0x5A, 48),
+        border: Color32::from_rgb(0x2C, 0x2D, 0x37),
+        border_strong: Color32::from_rgb(0x3C, 0x3D, 0x4A),
 
-        text: Color32::from_rgb(0x16, 0x10, 0x22),
-        text_muted: Color32::from_rgb(0x60, 0x55, 0x72),
-        text_faint: Color32::from_rgb(0x94, 0x89, 0xA6),
+        text: Color32::from_rgb(0xF2, 0xF2, 0xF6),
+        text_muted: Color32::from_rgb(0xA3, 0xA4, 0xB4),
+        text_faint: Color32::from_rgb(0x84, 0x85, 0x95),
 
-        icon: Color32::from_rgb(0x76, 0x6B, 0x88),
+        icon: Color32::from_rgb(0xA3, 0xA4, 0xB4),
 
-        accent: Color32::from_rgb(0x93, 0x33, 0xEA),
-        accent_hover: Color32::from_rgb(0x7E, 0x22, 0xCE),
-        accent_pressed: Color32::from_rgb(0x6B, 0x21, 0xA8),
+        accent: Color32::from_rgb(0xA4, 0x8C, 0xFF),
+        accent_hover: Color32::from_rgb(0xB9, 0xA7, 0xFF),
+        accent_pressed: Color32::from_rgb(0x8B, 0x6B, 0xF5),
 
-        selection: Color32::from_rgba_unmultiplied_const(0x93, 0x33, 0xEA, 40),
-        hover: Color32::from_rgba_unmultiplied_const(0x20, 0x10, 0x30, 14),
+        selection: Color32::from_rgb(0x2A, 0x25, 0x45),
+        hover: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 12),
 
-        success: Color32::from_rgb(0x05, 0x96, 0x69),
-        warning: Color32::from_rgb(0xD9, 0x77, 0x06),
-        danger: Color32::from_rgb(0xE1, 0x1D, 0x48),
-        cloud: Color32::from_rgb(0x7C, 0x3A, 0xED),
+        success: Color32::from_rgb(0x3D, 0xD6, 0xA0),
+        warning: Color32::from_rgb(0xF0, 0xB4, 0x3C),
+        danger: Color32::from_rgb(0xF4, 0x76, 0x8C),
+        cloud: Color32::from_rgb(0xA4, 0x8C, 0xFF),
     };
 
     pub const fn for_mode(mode: ThemeMode) -> Palette {
@@ -292,7 +294,7 @@ pub fn composite(fg: Color32, bg: Color32) -> Color32 {
 pub const ROW_HEIGHT: f32 = 36.0;
 pub const NAV_HEIGHT: f32 = 32.0;
 pub const GUTTER: f32 = 16.0;
-pub const RADIUS_CARD: u8 = 16;
+pub const RADIUS_CARD: u8 = 14;
 pub const RADIUS_CONTROL: u8 = 10;
 pub const RADIUS_SMALL: u8 = 8;
 
@@ -318,6 +320,11 @@ pub fn card(p: &Palette) -> egui::Frame {
 /// Draws an inset top-edge highlight stroke for glass panels and pills.
 ///
 /// Mirrors Aero's `--glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.08)`.
+/// A lit top edge, for a surface that is meant to look like a lit object.
+///
+/// Cards no longer use this. They are opaque, and a white highlight on a white
+/// card is a draw call that changes nothing. What is left is the brand mark,
+/// which is a gradient chip and does catch light.
 pub fn glass_highlight(painter: &egui::Painter, rect: egui::Rect, radius: egui::CornerRadius) {
     let r = radius.nw as f32;
 
@@ -565,24 +572,20 @@ mod tests {
         }
     }
 
+    /// Opaque, and that is the point. A card that changes colour with what is
+    /// behind it needs every contrast figure quoted as a range; an opaque one
+    /// has a single value, and a hairline is enough to separate it from the
+    /// ground. This replaces a test that asserted the opposite.
     #[test]
-    fn cards_are_translucent_glass() {
+    fn cards_are_opaque() {
         for (theme, p) in themes() {
-            assert!(
-                p.card.a() < 255,
-                "{theme}: an opaque card cannot pick up the ground's refraction"
+            assert_eq!(
+                p.card.a(),
+                255,
+                "{theme}: a translucent card puts the ground back inside every contrast check"
             );
-            // A low floor, and deliberately only a floor. This used to demand
-            // alpha >= 160 as a stand-in for "text is still readable" — but
-            // that is now measured directly against both extremes of the lit
-            // ground, so the proxy only blocked a legitimate design choice
-            // while claiming to protect something it never actually checked.
-            // What remains guards against a card that is not a surface at all.
-            assert!(
-                p.card.a() >= 80,
-                "{theme}: card alpha {} is not a surface, it is a tint",
-                p.card.a()
-            );
+            assert_eq!(p.elevated.a(), 255, "{theme}: popovers cover content");
+            assert_eq!(p.inset.a(), 255, "{theme}: an inset well is a surface");
         }
     }
 
@@ -606,8 +609,8 @@ mod tests {
     }
 
     #[test]
-    fn dark_is_the_default_theme() {
-        assert_eq!(ThemeMode::default(), ThemeMode::Dark);
+    fn light_is_the_default_theme() {
+        assert_eq!(ThemeMode::default(), ThemeMode::Light);
     }
 
     #[test]

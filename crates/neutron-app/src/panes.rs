@@ -100,7 +100,6 @@ fn draw_card(ui: &Ui, rect: Rect, p: &Palette, focused: bool) {
     ui.painter().add(shadow.as_shape(rect, radius));
 
     ui.painter().rect_filled(rect, radius, p.card);
-    theme::glass_highlight(ui.painter(), rect, radius);
 
     // One hairline, the same in both states. An accent ring plus a glow around
     // the focused pane put the loudest colour on screen around the largest

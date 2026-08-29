@@ -266,7 +266,6 @@ fn draw_panel(
                 Stroke::new(1.0, p.border_strong),
                 egui::StrokeKind::Inside,
             );
-            theme::glass_highlight(painter, rect, radius);
 
             let mut y = rect.top() + 6.0;
             for (index, item) in items.iter().enumerate() {

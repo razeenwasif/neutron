@@ -1,29 +1,32 @@
-//! The window ground: depth through translucency with slow-drifting colour fields.
+//! The window ground: a still, softly lit surface for the cards to sit on.
 //!
-//! # The 3-layer visual model
+//! # Two layers, and nothing moves
 //!
-//! 1. A deep near-black purple ground with top radial illumination.
-//! 2. Two large slow-drifting colour fields (purple, electric indigo) on 41s
-//!    and 57s loops that give the glass something to refract.
-//! 3. Translucent panels floating above them.
+//! 1. A flat ground with a wide overhead wash, so the surface is lit rather
+//!    than merely flat.
+//! 2. Two large static colour washes, well outside the centre, which tint the
+//!    ground without ever reading as circles.
 //!
-//! # Why the drifting colour fields matter
+//! Cards are opaque and sit on top. They do not refract anything, which is the
+//! whole reason the ground is allowed to be this quiet.
 //!
-//! The orbs are the load-bearing element of the glassmorphism system. A blur
-//! with nothing behind it is just a grey box — translucent panels only read as
-//! glass because there is coloured light moving underneath for them to refract.
+//! # Why the drifting is gone
 //!
-//! # Geometry and animation
+//! This module used to move: two colour fields on 41- and 57-second loops,
+//! there to give translucent glass something to refract. Both premises are
+//! gone. The cards are opaque now, so there is nothing to refract *through*;
+//! and on a light palette a moving ground stops reading as depth and starts
+//! reading as a smudge travelling under the text.
 //!
-//! Two oversized colour fields drift on smooth sinusoidal ease-in-out loops:
-//! - **Field A (41s)**: purple `#9333ea`, top-left, drifting `+7vw, +6vh`, scaling `1.0 → 1.10`.
-//! - **Field B (57s)**: electric indigo `#6366f1`, bottom-right, drifting `-8vw, -5vh`, scaling `1.08 → 0.98`.
+//! It was also the only continuous repaint in the program. `request_repaint_after`
+//! ran forever so that a soft gradient could move under a pixel per frame, and
+//! it measured 1.69% of a core focused, 0.52% unfocused, against 0.3% for a
+//! still ground. A file manager that is open all day should cost nothing while
+//! nobody is touching it.
 //!
-//! Two rather than three, each near window-sized: what should show is the
-//! gradient where they overlap, not a recognisable circle. The periods share no
-//! common factor, so the pair never settles into a visible repeat.
-//!
-//! Each field is a three-layer gaussian falloff fan — see [`glow`].
+//! Each wash is still a three-layer gaussian falloff fan — see [`glow`] — for
+//! the same reason as before: at this size any hard edge makes the background
+//! read as a shape rather than as light.
 
 use egui::{Color32, Mesh, Painter, Rect, Shape, epaint::Vertex, pos2, vec2};
 
@@ -32,43 +35,28 @@ use crate::theme::Palette;
 /// Segments in a gradient fan.
 const SEGMENTS: usize = 48;
 
-/// Paints the animated ground with slow-drifting colour fields.
-pub fn paint(painter: &Painter, rect: Rect, p: &Palette, time: f64) {
+/// Paints the ground: an overhead wash, then the static colour washes.
+///
+/// Takes no time parameter, and deliberately: there is nothing here that could
+/// use one, and a signature that accepts a clock invites something to start
+/// moving again.
+pub fn paint(painter: &Painter, rect: Rect, p: &Palette) {
     // Base fill first, so the corners outside the ellipse are never bare.
     painter.rect_filled(rect, 0.0, p.ground_deep);
 
-    // Light source above the window, so the ground feels lit rather than merely flat.
+    // Light source above the window, so the ground feels lit rather than flat.
     let centre = pos2(rect.center().x, rect.top());
     let radius = vec2(rect.width() * 1.25, rect.height() * 1.15);
     fan(painter, centre, radius, p.ground, p.ground_deep);
 
-    // Drifting colour fields on top of the wash.
     let span = rect.width().max(rect.height());
-    for (i, orb) in p.orbs.iter().enumerate() {
-        let period = if orb.period > 0.0 { orb.period as f64 } else { 34.0 };
-        let progress = (time / period).fract() as f32;
-        // Smooth sinusoidal ease-in-out: 0 at 0% and 100%, 1.0 at 50%
-        let k = (1.0 - (progress * std::f32::consts::TAU).cos()) * 0.5;
-
-        // Opposed drift, so the two fields breathe against each other rather
-        // than sliding the whole background one way.
-        let (dx, dy, scale) = match i {
-            0 => (0.07 * k, 0.06 * k, 1.0 + 0.10 * k),
-            1 => (-0.08 * k, -0.05 * k, 1.08 - 0.10 * k),
-            _ => (0.0, 0.0, 1.0),
-        };
-
+    for orb in p.orbs.iter() {
         let at = pos2(
-            rect.left() + rect.width() * (orb.x + dx),
-            rect.top() + rect.height() * (orb.y + dy),
+            rect.left() + rect.width() * orb.x,
+            rect.top() + rect.height() * orb.y,
         );
-        glow(painter, at, span * orb.radius * scale, orb.colour);
+        glow(painter, at, span * orb.radius, orb.colour);
     }
-}
-
-/// Static fallback for painting the ground without time progression.
-pub fn paint_static(painter: &Painter, rect: Rect, p: &Palette) {
-    paint(painter, rect, p, 0.0);
 }
 
 /// A soft light: concentric fans approximating a gaussian falloff.
@@ -174,7 +162,22 @@ mod tests {
                 assert!((-0.5..=1.5).contains(&orb.x), "{mode:?}: x {} out of range", orb.x);
                 assert!((-0.5..=1.5).contains(&orb.y), "{mode:?}: y {} out of range", orb.y);
                 assert!(orb.radius > 0.0);
-                assert!(orb.period > 0.0);
+            }
+        }
+    }
+
+    /// The ground is a backdrop, not a feature. A wash heavy enough to be
+    /// noticed as a shape is a wash heavy enough to tint a card sitting on it,
+    /// and the cards are the thing being read.
+    #[test]
+    fn the_washes_stay_faint() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            for orb in &Palette::for_mode(mode).orbs {
+                assert!(
+                    orb.colour.a() <= 40,
+                    "{mode:?}: a wash at alpha {} is no longer a wash",
+                    orb.colour.a()
+                );
             }
         }
     }
