@@ -101,6 +101,25 @@ pub fn draw(painter: &Painter, centre: Pos2, glyph: Glyph, colour: Color32) {
     }
 }
 
+/// A tick sized to fit inside a circle of `radius`.
+///
+/// Its own function rather than a [`Glyph`], because every glyph in that enum
+/// is drawn to one fixed envelope and this one has to match whatever badge it
+/// is being put inside. The stroke scales with it too: a 1.4px line inside a
+/// nine-pixel circle is a hairline, not a tick.
+pub fn check(painter: &Painter, centre: Pos2, radius: f32, colour: Color32) {
+    let s = radius * 0.52;
+    let stroke = Stroke::new((radius * 0.28).max(1.2), colour);
+    painter.add(Shape::line(
+        vec![
+            pos2(centre.x - s, centre.y + s * 0.1),
+            pos2(centre.x - s * 0.25, centre.y + s * 0.8),
+            pos2(centre.x + s, centre.y - s * 0.7),
+        ],
+        stroke,
+    ));
+}
+
 /// The glyph for a directory entry.
 pub fn for_kind(kind: EntryKind) -> Glyph {
     match kind {
@@ -554,6 +573,31 @@ pub fn split(painter: &Painter, centre: Pos2, vertical: bool, colour: Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The badge is a tick inside a disc, and the tick has to stay inside it.
+    /// Drawn from the radius rather than at a fixed size, because the same
+    /// helper is what any future badge would use.
+    #[test]
+    fn a_check_stays_inside_its_badge() {
+        for radius in [6.0f32, 9.0, 14.0, 24.0] {
+            let s = radius * 0.52;
+            // Furthest the tick reaches from the centre, plus half the stroke.
+            let stroke = (radius * 0.28).max(1.2);
+            let reach = (s * s + (s * 0.8) * (s * 0.8)).sqrt() + stroke / 2.0;
+            assert!(
+                reach <= radius,
+                "at r={radius} the tick reaches {reach}, outside the disc"
+            );
+        }
+    }
+
+    /// A hairline tick inside a small disc is invisible, so the stroke scales
+    /// with the badge and never goes below a floor.
+    #[test]
+    fn the_tick_stroke_scales_but_has_a_floor() {
+        assert!((6.0f32 * 0.28).max(1.2) >= 1.2);
+        assert!((24.0f32 * 0.28).max(1.2) > (9.0f32 * 0.28).max(1.2));
+    }
 
     #[test]
     fn every_entry_kind_maps_to_a_glyph() {

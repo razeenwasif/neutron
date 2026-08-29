@@ -1054,6 +1054,19 @@ fn draw_row(
     if response.double_clicked() {
         return Some(FileListAction::Activate(idx));
     }
+    // The selection badge, from the second reference design: a filled accent
+    // disc with a tick, in the tile's top-right.
+    //
+    // Drawn last so it sits over the icon rather than under it. It is worth
+    // having in a grid and not in a list for one reason: a grid row has no
+    // left edge to carry an accent, and a tint spread across a whole tile is
+    // the weakest selection cue in the application.
+    if selected {
+        let badge = pos2(rect.right() - 15.0, rect.top() + 15.0);
+        ui.painter().circle_filled(badge, 9.0, p.accent);
+        icons::check(ui.painter(), badge, 9.0, Color32::WHITE);
+    }
+
     if response.clicked() {
         let mods = ui.input(|i| i.modifiers);
         let mode = if mods.shift {
@@ -1280,8 +1293,16 @@ fn draw_tile(
     let is_cursor = marks.selection.cursor() == Some(idx);
 
     if selected {
-        ui.painter()
-            .rect_filled(rect, RADIUS_CONTROL as f32, p.selection);
+        // Tint and an accent edge. A tile is a much larger shape than a row,
+        // and a tint alone across that area is easy to miss against a card of
+        // other tinted things.
+        ui.painter().rect(
+            rect,
+            RADIUS_CONTROL as f32,
+            p.selection,
+            Stroke::new(1.0, p.accent),
+            egui::StrokeKind::Inside,
+        );
     } else if response.hovered() {
         ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
     }
