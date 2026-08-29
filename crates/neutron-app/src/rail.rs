@@ -29,7 +29,7 @@ use neutron_ui::icons::{self, Glyph};
 use neutron_ui::theme::{self, Palette};
 
 /// Width of the strip, including its padding.
-pub const WIDTH: f32 = 54.0;
+pub const WIDTH: f32 = 64.0;
 
 /// Height of one button: glyph, then its label.
 const ITEM: f32 = 40.0;
@@ -73,8 +73,13 @@ enum Needs {
     Cursor,
 }
 
-/// A separator between groups.
-const RULE: Option<Item> = None;
+/// A gap between groups.
+///
+/// Space rather than a rule. A hairline across a 64px strip is a lot of
+/// contrast for something whose only job is to say "these three go together",
+/// and the rail already sits on its own card — one more line inside a bordered
+/// box reads as clutter. Grouping by rhythm is quieter and says the same thing.
+const GAP: Option<Item> = None;
 
 fn items() -> Vec<Option<Item>> {
     vec![
@@ -84,11 +89,11 @@ fn items() -> Vec<Option<Item>> {
         // the shell on a worker thread, and asking it every frame to grey out a
         // button would be a COM call in the paint path.
         Some(Item { glyph: Glyph::Paste, label: "Paste", action: RailAction::Paste, hint: "Paste here (Ctrl+V)", needs: Needs::Nothing }),
-        RULE,
+        GAP,
         Some(Item { glyph: Glyph::Rename, label: "Rename", action: RailAction::Rename, hint: "Rename this file (F2)", needs: Needs::Cursor }),
         Some(Item { glyph: Glyph::Trash, label: "Delete", action: RailAction::Delete, hint: "Send to the Recycle Bin (Delete)", needs: Needs::Selection }),
         Some(Item { glyph: Glyph::NewFolder, label: "Folder", action: RailAction::NewFolder, hint: "New folder (Ctrl+Shift+N)", needs: Needs::Nothing }),
-        RULE,
+        GAP,
         Some(Item { glyph: Glyph::Extract, label: "Extract", action: RailAction::Extract, hint: "Extract this archive", needs: Needs::Selection }),
         Some(Item { glyph: Glyph::Compress, label: "Zip", action: RailAction::Compress, hint: "Compress to a zip", needs: Needs::Selection }),
     ]
@@ -98,18 +103,17 @@ fn items() -> Vec<Option<Item>> {
 pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
     let mut chosen = None;
     let full = ui.available_rect_before_wrap();
+
+    // A whisper of a gradient down the strip, so the rail reads as a distinct
+    // surface from the sidebar beside it without needing a heavier fill or a
+    // second border to say so.
+    theme::vertical_wash(ui.painter(), full.expand(12.0), p);
+
     let mut y = full.top();
 
     for entry in items() {
         let Some(item) = entry else {
-            // A hairline, inset from both edges so it reads as a divider
-            // rather than as the card's own border.
-            let at = y + 5.0;
-            ui.painter().line_segment(
-                [pos2(full.left() + 8.0, at), pos2(full.right() - 8.0, at)],
-                egui::Stroke::new(1.0, p.border),
-            );
-            y += 11.0;
+            y += 12.0;
             continue;
         };
 
@@ -198,7 +202,7 @@ mod tests {
     fn labels_fit_the_strip() {
         for item in items().into_iter().flatten() {
             assert!(
-                item.label.len() <= 8,
+                item.label.len() <= 9,
                 "{:?}: {:?} is too long for the rail",
                 item.action,
                 item.label
@@ -237,5 +241,13 @@ mod tests {
             items().iter().any(|i| i.is_none()),
             "a flat list of ten verbs is a menu, not a rail"
         );
+    }
+
+    /// The strip has to hold a 9pt label plus side padding. This is the number
+    /// the label length test is derived from, so it is worth pinning.
+    #[test]
+    fn the_strip_is_wide_enough_for_its_labels() {
+        // Narrower than this and the rail crops its own labels.
+        const { assert!(WIDTH >= 60.0) };
     }
 }

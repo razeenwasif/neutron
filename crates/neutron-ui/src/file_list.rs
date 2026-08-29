@@ -888,12 +888,19 @@ fn draw_row(
     let is_cursor = marks.selection.cursor() == Some(idx);
 
     if selected {
-        ui.painter().rect(
-            rect,
-            RADIUS_CONTROL as f32,
-            p.selection,
-            Stroke::new(1.0, p.border_strong),
-            egui::StrokeKind::Inside,
+        // Tint plus an edge, not a bordered pill. A stroke all the way round a
+        // row draws a box the eye has to read past to get to the filename;
+        // the edge marks the row and gets out of the way.
+        ui.painter()
+            .rect_filled(rect, RADIUS_CONTROL as f32, p.selection);
+        let edge = Rect::from_min_size(
+            pos2(rect.left(), rect.top() + 2.0),
+            vec2(2.5, rect.height() - 4.0),
+        );
+        ui.painter().rect_filled(
+            edge,
+            egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 },
+            p.accent,
         );
     } else if response.hovered() {
         ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
@@ -972,13 +979,14 @@ fn draw_row(
         // context for what is being renamed, and blanking them would make the
         // row jump.
     } else {
-        draw_cell_text(
+        draw_name_text(
             ui,
             name_rect,
             list.name(idx),
+            kind,
             &body,
             name_colour,
-            Align2::LEFT_CENTER,
+            p.text_faint,
         );
     }
 
@@ -1396,6 +1404,69 @@ fn draw_cell_text(ui: &Ui, cell: Rect, text: &str, font: &FontId, color: Color32
     ui.painter().galley(pos, galley, color);
 }
 
+
+/// Splits a filename into its stem and its extension, extension first dot
+/// included.
+///
+/// Returns `None` when there is nothing to split, which is most of the
+/// interesting cases:
+///
+/// * a directory — `src.old` is a folder called `src.old`, not a `.old` file;
+/// * a dotfile — `.gitignore` is entirely a name, and dimming all of it would
+///   make the row look disabled;
+/// * a trailing dot — `weird.` has no extension, only a dot;
+/// * no dot at all.
+pub fn split_extension(name: &str, kind: EntryKind) -> Option<(&str, &str)> {
+    if kind.is_container() {
+        return None;
+    }
+    // `rfind` on a byte is safe for a UTF-8 boundary: '.' is ASCII and cannot
+    // appear inside a multi-byte sequence.
+    let at = name.rfind('.')?;
+    if at == 0 || at + 1 == name.len() {
+        return None;
+    }
+    Some((&name[..at], &name[at..]))
+}
+
+/// The filename, with its extension in a quieter colour.
+///
+/// Straight from the second reference design. The point is scanning: in a
+/// folder of forty photographs the extension is the same forty times, and it
+/// costs the same reading weight as the part that differs.
+#[allow(clippy::too_many_arguments)]
+fn draw_name_text(
+    ui: &Ui,
+    cell: Rect,
+    name: &str,
+    kind: EntryKind,
+    font: &FontId,
+    stem_colour: Color32,
+    // Always the faint tone. Passed rather than looked up so the two colours
+    // arrive from one place and cannot drift apart.
+    ext_colour: Color32,
+) {
+    let Some((stem, ext)) = split_extension(name, kind) else {
+        draw_cell_text(ui, cell, name, font, stem_colour, Align2::LEFT_CENTER);
+        return;
+    };
+
+    let inner = cell.shrink2(vec2(CELL_PAD / 2.0, 0.0));
+    let mut job = egui::text::LayoutJob::default();
+    job.append(stem, 0.0, egui::TextFormat::simple(font.clone(), stem_colour));
+    job.append(ext, 0.0, egui::TextFormat::simple(font.clone(), ext_colour));
+    job.wrap = egui::text::TextWrapping {
+        max_width: inner.width(),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+
+    let galley = ui.painter().layout_job(job);
+    let pos = pos2(inner.left(), inner.center().y - galley.size().y / 2.0);
+    ui.painter().galley(pos, galley, stem_colour);
+}
+
 pub fn kind_label(kind: EntryKind, name: &str) -> String {
     match kind {
         EntryKind::Directory => "Folder".to_owned(),
@@ -1421,6 +1492,64 @@ pub fn rows_per_page(height: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extension is dimmed to help scanning. Every case below is one where
+    /// dimming the wrong span would make a row look broken or disabled.
+    #[test]
+    fn an_ordinary_file_splits_at_the_last_dot() {
+        assert_eq!(
+            split_extension("report.final.docx", EntryKind::File),
+            Some(("report.final", ".docx"))
+        );
+        assert_eq!(
+            split_extension("notes.txt", EntryKind::File),
+            Some(("notes", ".txt"))
+        );
+    }
+
+    /// `src.old` is a folder called `src.old`. Dimming `.old` would say it is
+    /// a file of type "old".
+    #[test]
+    fn a_directory_is_never_split() {
+        assert_eq!(split_extension("src.old", EntryKind::Directory), None);
+        assert_eq!(split_extension("node_modules", EntryKind::Directory), None);
+    }
+
+    /// A dotfile is entirely a name. Splitting it would dim the whole row.
+    #[test]
+    fn a_dotfile_is_all_stem() {
+        assert_eq!(split_extension(".gitignore", EntryKind::File), None);
+        assert_eq!(split_extension(".env", EntryKind::File), None);
+    }
+
+    #[test]
+    fn a_trailing_dot_is_not_an_extension() {
+        assert_eq!(split_extension("weird.", EntryKind::File), None);
+    }
+
+    #[test]
+    fn a_name_with_no_dot_is_left_alone() {
+        assert_eq!(split_extension("LICENSE", EntryKind::File), None);
+        assert_eq!(split_extension("Makefile", EntryKind::File), None);
+    }
+
+    /// The split indexes into the string, so a multi-byte name must not panic
+    /// or cut a character in half.
+    #[test]
+    fn non_ascii_names_split_on_a_character_boundary() {
+        assert_eq!(
+            split_extension("résumé.pdf", EntryKind::File),
+            Some(("résumé", ".pdf"))
+        );
+        assert_eq!(
+            split_extension("写真.jpeg", EntryKind::File),
+            Some(("写真", ".jpeg"))
+        );
+        // A dot is the only thing searched for, and it is ASCII — but a name
+        // that is *all* multi-byte with no dot must still come back None
+        // rather than slicing.
+        assert_eq!(split_extension("写真", EntryKind::File), None);
+    }
 
     #[test]
     fn kind_labels_use_the_extension() {

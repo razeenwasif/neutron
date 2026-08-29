@@ -21,6 +21,7 @@
 mod app;
 mod archive_ops;
 mod bench;
+mod chrome;
 mod cloud;
 mod commands;
 mod connect;
@@ -88,6 +89,13 @@ fn main() -> eframe::Result<()> {
             .with_title("Neutron")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([720.0, 420.0])
+            // Neutron draws its own title bar. A system one sits above the
+            // layout as a separate strip in the OS's colours and corner radius,
+            // and nothing done inside the window makes the two read as one
+            // object. See `chrome.rs`, including what has to be put back by
+            // hand once the OS stops drawing the frame.
+            .with_decorations(false)
+            .with_resizable(true)
             .with_icon(app_icon()),
         // Deliberately *not* `.with_transparent(true)`. Measurement showed wgpu
         // cannot provide a surface with a transparent `CompositeAlphaMode` on

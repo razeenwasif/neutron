@@ -317,9 +317,40 @@ pub fn card(p: &Palette) -> egui::Frame {
         .shadow(card_shadow(p))
 }
 
-/// Draws an inset top-edge highlight stroke for glass panels and pills.
+/// A faint vertical gradient across `rect`, from the card colour to a slightly
+/// tinted version of it.
 ///
-/// Mirrors Aero's `--glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.08)`.
+/// For a surface that needs to read as distinct from the card beside it without
+/// a second border or a heavier fill. Two triangles, drawn once per frame.
+///
+/// The tint leans on the accent rather than on grey, because a grey wash on a
+/// near-white card reads as dirt; a trace of the brand hue reads as a surface.
+pub fn vertical_wash(painter: &egui::Painter, rect: egui::Rect, p: &Palette) {
+    let top = p.card;
+    // Toward the accent, but barely: 6% at the bottom edge.
+    let mix = |a: u8, b: u8| (a as f32 * 0.94 + b as f32 * 0.06).round() as u8;
+    let bottom = Color32::from_rgb(
+        mix(p.card.r(), p.accent.r()),
+        mix(p.card.g(), p.accent.g()),
+        mix(p.card.b(), p.accent.b()),
+    );
+
+    let mut mesh = egui::Mesh::default();
+    for (i, (at, colour)) in [(rect.top(), top), (rect.bottom(), bottom)]
+        .into_iter()
+        .enumerate()
+    {
+        mesh.colored_vertex(pos2(rect.left(), at), colour);
+        mesh.colored_vertex(pos2(rect.right(), at), colour);
+        let _ = i;
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// An inset top-edge highlight stroke.
+///
 /// A lit top edge, for a surface that is meant to look like a lit object.
 ///
 /// Cards no longer use this. They are opaque, and a white highlight on a white

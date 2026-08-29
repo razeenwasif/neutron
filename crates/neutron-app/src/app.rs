@@ -1935,11 +1935,20 @@ impl eframe::App for NeutronApp {
 
         self.keyboard(&ctx, &mut actions);
 
+        // Before every other panel: it claims the top strip, and the rest
+        // lay out inside what is left.
+        self.title_bar(ui, &p);
+
         self.status_bar(ui, &p, &mut actions);
         self.sidebar(ui, &p, &mut actions);
         self.action_rail(ui, &p, &mut actions);
         self.preview_pane(ui, &p);
         self.panes(ui, &p, &mut actions);
+
+        // After every panel: the eight grip regions sit on top of whatever
+        // is under the window edge, and an undecorated window has no resize
+        // border of its own.
+        crate::chrome::resize_edges(ui, screen);
 
         // Drawn last so it covers everything, and after input routing so the
         // overlay's own keys win while it is open.
@@ -3778,14 +3787,18 @@ impl NeutronApp {
             .resizable(false)
             .exact_size(crate::rail::WIDTH)
             .frame(
+                // No stroke: the wash inside already separates the strip
+                // from the sidebar, and a border around a 64px column beside a
+                // bordered sidebar is two lines doing one job.
                 theme::card(p)
+                    .stroke(egui::Stroke::NONE)
                     .outer_margin(egui::Margin {
                         left: GUTTER as i8,
                         right: 0,
                         top: GUTTER as i8,
                         bottom: GUTTER as i8,
                     })
-                    .inner_margin(egui::Margin::symmetric(0, 8)),
+                    .inner_margin(egui::Margin::symmetric(0, 10)),
             )
             .show(ui, |ui| {
                 if let Some(chosen) = crate::rail::show(ui, p, &state) {
@@ -3802,6 +3815,34 @@ impl NeutronApp {
                     });
                 }
             });
+    }
+
+    /// The window's own title bar, above every other panel.
+    ///
+    /// Transparent: it sits on the ground, in the gutter the cards already
+    /// leave around themselves, so the bar costs no vertical space that the
+    /// layout was not spending anyway.
+    fn title_bar(&self, ui: &mut egui::Ui, p: &Palette) {
+        let title = self
+            .workspace
+            .active_tab()
+            .map(|t| format!("{} — Neutron", t.location().display_name()))
+            .unwrap_or_else(|| "Neutron".to_owned());
+
+        egui::Panel::top("title-bar")
+            .resizable(false)
+            .exact_size(crate::chrome::HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::TRANSPARENT)
+                    .inner_margin(egui::Margin {
+                        left: GUTTER as i8,
+                        right: 0,
+                        top: 0,
+                        bottom: 0,
+                    }),
+            )
+            .show(ui, |ui| crate::chrome::show(ui, p, &title));
     }
 
     fn sidebar(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {

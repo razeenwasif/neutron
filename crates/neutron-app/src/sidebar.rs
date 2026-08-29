@@ -81,26 +81,32 @@ pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) ->
     let pill = Rect::from_min_max(pos2(rect.left(), rect.top()), pos2(rect.right(), rect.bottom()));
 
     if selected {
-        // Translucent selection wash plus subtle border
-        ui.painter().rect(
-            pill,
-            RADIUS_CONTROL as f32,
-            p.selection,
-            egui::Stroke::new(1.0, p.border_strong),
-            egui::StrokeKind::Inside,
-        );
-        // Active indicator: glowing vertical accent bar on the left edge (matches Aero)
-        let bar_h = (pill.height() * 0.58).round();
+        // A soft accent fill and no stroke. The row is already the only tinted
+        // thing in the column; a border around it as well is a second line
+        // saying what the first one said.
+        ui.painter()
+            .rect_filled(pill, RADIUS_CONTROL as f32, p.selection);
+
+        // The tick sits flush against the card's inner edge rather than inset
+        // into the pill, so it reads as the sidebar marking its place rather
+        // than as a decoration on the row.
+        let bar_h = (pill.height() * 0.52).round();
         let bar = Rect::from_min_size(
-            pos2(pill.left() + 1.0, (pill.center().y - bar_h / 2.0).round()),
+            pos2(pill.left() - 10.0, (pill.center().y - bar_h / 2.0).round()),
             vec2(3.0, bar_h),
         );
-        ui.painter().rect_filled(bar, 1.5, p.accent);
+        ui.painter().rect_filled(
+            bar,
+            egui::CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 },
+            p.accent,
+        );
     } else if response.hovered() {
         ui.painter().rect_filled(pill, RADIUS_CONTROL as f32, p.hover);
     }
 
-    let colour = if selected { p.text } else { p.text_muted };
+    // The active row takes the accent for both glyph and label, which is how
+    // both reference designs mark a current destination.
+    let colour = if selected { p.accent } else { p.text_muted };
     icons::draw(
         ui.painter(),
         pos2(rect.left() + 18.0, rect.center().y),
