@@ -158,6 +158,16 @@ enum Action {
 /// handed to the apartment pool, which may not touch application state at all.
 /// A disconnected channel means the window has gone, so the log is the only
 /// place left for it — which is where it goes.
+/// Menu id for Neutron's own context-menu rows.
+///
+/// Three id spaces share this menu and have to stay distinguishable by value
+/// alone: the shell's `1..=0x7FFF`, Neutron's here, and the plugins' from
+/// `plugins::MENU_ID_BASE` upward. That is what stops one of ours being handed
+/// to `IContextMenu::InvokeCommand`, where it would invoke an unrelated verb.
+const MENU_ID_PIN: u32 = 0x0800_0001;
+const _: () = assert!(MENU_ID_PIN > 0x7FFF);
+const _: () = assert!(MENU_ID_PIN < crate::plugins::MENU_ID_BASE);
+
 fn report(to: &crossbeam_channel::Sender<(crate::notice::Level, String)>, text: String) {
     tracing::warn!("{text}");
     let _ = to.send((crate::notice::Level::Error, text));
@@ -232,6 +242,9 @@ pub struct NeutronApp {
     /// Folders pinned to Quick access. Read once at start-up and kept here;
     /// the file is only rewritten when one is added or removed.
     pins: crate::pins::Pins,
+    /// The folder the open context menu's pin row would act on, decided when
+    /// the menu was built.
+    pin_target: Option<PathBuf>,
     cloud: Vec<Place>,
     wsl: Vec<Place>,
     shell_roots: Vec<Place>,
@@ -486,6 +499,7 @@ impl NeutronApp {
             icons,
             known_folders: Vec::new(),
             pins,
+            pin_target: None,
             cloud: Vec::new(),
             wsl: Vec::new(),
             shell_roots: Vec::new(),
@@ -1766,6 +1780,16 @@ impl NeutronApp {
             // thread: this is the side that knows what is installed, and it is
             // also where the ids handed out have to be remembered.
             let mut items = pending.items;
+
+            // Neutron's own rows come before the plugins', and after the
+            // shell's: they are part of the application rather than an
+            // extension of it.
+            self.pin_target = self.menu_pin_row().map(|(row, target)| {
+                items.push(neutron_core::MenuItem::separator());
+                items.push(row);
+                target
+            });
+
             let has_selection = self.selection_paths().is_some();
             let rows = self.plugins.menu_rows(has_selection);
             if !rows.is_empty() {
@@ -1794,14 +1818,23 @@ impl NeutronApp {
         // A plugin row's id means nothing to the shell — handing it to
         // `InvokeCommand` would invoke an unrelated verb. So the apartment
         // thread is told the menu was dismissed, and the command runs here.
+        // Ours, like a plugin's, means nothing to the shell.
+        let pin = (answer == Some(MENU_ID_PIN))
+            .then(|| self.pin_target.take())
+            .flatten();
+
         let plugin = answer.and_then(|id| self.plugins.menu_choice(id));
-        let for_shell = match plugin {
-            Some(_) => None,
-            None => answer,
+        let for_shell = match (&pin, &plugin) {
+            (None, None) => answer,
+            _ => None,
         };
 
         if let Some(reply) = self.menu_reply.take() {
             let _ = reply.send(for_shell);
+        }
+
+        if let Some(dir) = pin {
+            self.apply_pin(dir);
         }
 
         if let Some(reference) = plugin {
@@ -2242,10 +2275,6 @@ impl NeutronApp {
             bindings.push((egui::Key::F6, Action::FocusNextPane));
 
             if ctrl {
-                if shift {
-                    // Shift, because plain Ctrl+D is the theme toggle.
-                    bindings.push((egui::Key::D, Action::TogglePin));
-                }
                 bindings.extend([
                     (egui::Key::A, Action::SelectAll),
                     (egui::Key::H, Action::ToggleHidden),
@@ -2274,7 +2303,17 @@ impl NeutronApp {
                             Mode::Files
                         }),
                     ),
-                    (egui::Key::D, Action::ToggleTheme),
+                    (
+                        // One binding, chosen by Shift, rather than two entries
+                        // for the same key: both were in the table at once and
+                        // Ctrl+Shift+D ran the pin *and* flipped the theme.
+                        egui::Key::D,
+                        if shift {
+                            Action::TogglePin
+                        } else {
+                            Action::ToggleTheme
+                        },
+                    ),
                     (egui::Key::R, Action::Refresh),
                     (egui::Key::W, Action::CloseActiveTab),
                     // Backslash splits, mirroring the common terminal binding.
@@ -2415,25 +2454,55 @@ impl NeutronApp {
         all
     }
 
-    /// Pins the focused folder to Quick access, or unpins it if it is already
-    /// there.
-    ///
-    /// One command for both, because which one applies is a property of where
-    /// you are standing rather than something to choose from a menu.
-    fn toggle_pin(&mut self) {
-        let Some(dir) = self
-            .workspace
-            .active_tab()
-            .and_then(|t| t.location().as_path())
-            .map(Path::to_path_buf)
-        else {
-            // A pin is a path on disk. Nothing without one can be restored
-            // next launch, so the refusal names the place rather than failing
-            // quietly — see `place.rs`.
-            self.refuse_without_a_path("pin");
-            return;
-        };
 
+    /// The pin row Neutron adds to the shell's menu, and the folder it acts on.
+    ///
+    /// The target is worked out when the menu is *built*, not when a row is
+    /// chosen: by then the selection may have moved, and a pin that lands on a
+    /// different folder than the one right-clicked is worse than no pin at all.
+    ///
+    /// Right-clicking a folder pins that folder; right-clicking anywhere else
+    /// pins the one being shown, which is what `Ctrl+Shift+D` does.
+    fn menu_pin_row(&self) -> Option<(neutron_core::MenuItem, PathBuf)> {
+        let tab = self.workspace.active_tab()?;
+        let dir = tab.location().as_path()?;
+
+        let target = tab
+            .selection
+            .cursor()
+            .filter(|&i| i < tab.list.len())
+            .filter(|&i| tab.list.kind(i).is_container())
+            .filter(|&i| tab.selection.is_selected(i))
+            .map(|i| dir.join(tab.list.name(i)))
+            .unwrap_or_else(|| dir.to_path_buf());
+
+        let pinned = self.pins.folders.contains(&target);
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.to_string_lossy().into_owned());
+
+        Some((
+            neutron_core::MenuItem {
+                id: MENU_ID_PIN,
+                label: if pinned {
+                    format!("Unpin {name} from Quick access")
+                } else {
+                    format!("Pin {name} to Quick access")
+                },
+                accel: "Ctrl+Shift+D".to_owned(),
+                enabled: true,
+                ..Default::default()
+            },
+            target,
+        ))
+    }
+
+    /// Pins or unpins `dir`, and persists it.
+    ///
+    /// Shared by the keyboard, the palette and the context menu, so all three
+    /// give the same answer to the same question.
+    fn apply_pin(&mut self, dir: PathBuf) {
         let mut pins = self.pins.clone();
         let outcome = pins.toggle(&dir);
         let name = dir
@@ -2467,6 +2536,28 @@ impl NeutronApp {
             }
             wake.request_repaint();
         });
+    }
+
+    /// Pins the focused folder to Quick access, or unpins it if it is already
+    /// there.
+    ///
+    /// One command for both, because which one applies is a property of where
+    /// you are standing rather than something to choose from a menu.
+    fn toggle_pin(&mut self) {
+        let Some(dir) = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.location().as_path())
+            .map(Path::to_path_buf)
+        else {
+            // A pin is a path on disk. Nothing without one can be restored
+            // next launch, so the refusal names the place rather than failing
+            // quietly — see `place.rs`.
+            self.refuse_without_a_path("pin");
+            return;
+        };
+
+        self.apply_pin(dir);
     }
 
     /// Forgets the Google Drive credential.

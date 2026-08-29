@@ -54,6 +54,10 @@ pub fn show(
 
             let mut chosen = None;
             ui.horizontal(|ui| {
+                // egui puts `item_spacing.x` between the space and the column,
+                // which lands entirely on the left and made the left gap wider
+                // than the right by exactly one spacing unit.
+                ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(margin);
                 ui.vertical(|ui| {
                     ui.set_width(content);
