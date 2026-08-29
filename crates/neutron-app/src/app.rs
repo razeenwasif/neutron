@@ -129,6 +129,9 @@ enum Action {
     /// Begin the Google Drive consent flow.
     ConnectDrive,
     TogglePin,
+    /// Ask first, then run the boxed action. See [`crate::confirm`] for the
+    /// short list of things that earn one.
+    Ask(Box<Action>),
     /// Right-clicked a sidebar row: open Neutron's own menu for that place.
     SidebarMenu(NodeId, egui::Pos2),
     SignOutDrive,
@@ -255,6 +258,12 @@ pub struct NeutronApp {
     /// Where the maximise button is, shared with the window procedure so
     /// Windows can offer Snap Layouts over it.
     snap: std::sync::Arc<neutron_shell::snaplayout::MaximiseButton>,
+    /// A question waiting for an answer, and the action to run on yes.
+    ///
+    /// One at a time: two modals stacked on each other is a state nobody can
+    /// reason about, and the second question is always about something the
+    /// first one may be about to change.
+    confirm: Option<(crate::confirm::Confirm, Box<Action>)>,
     cloud: Vec<Place>,
     wsl: Vec<Place>,
     shell_roots: Vec<Place>,
@@ -519,6 +528,7 @@ impl NeutronApp {
             pin_target: None,
             tab_target: None,
             snap,
+            confirm: None,
             cloud: Vec::new(),
             wsl: Vec::new(),
             shell_roots: Vec::new(),
@@ -949,6 +959,7 @@ impl NeutronApp {
 
             Action::ConnectDrive => self.connect_drive(),
             Action::TogglePin => self.toggle_pin(),
+            Action::Ask(then) => self.ask(*then),
             Action::SidebarMenu(id, at) => self.sidebar_menu(id, at),
             Action::SignOutDrive => self.sign_out_drive(),
             Action::ForgetServer => self.forget_server(),
@@ -2032,6 +2043,10 @@ impl eframe::App for NeutronApp {
         self.finder_overlay(ui, &p, &mut actions);
         self.connect_overlay(ui, &p, &mut actions);
 
+        // Last of all: a question is answered before anything underneath it is
+        // touched, and its scrim has to cover the overlays too.
+        self.confirm_overlay(ui, &p);
+
 
         // Queued *after* drawing so a `DropTab` pushed by a tab strip this
         // frame is applied first. Pushed before it, this would clear the drag
@@ -2497,6 +2512,100 @@ impl NeutronApp {
         let tab = self.workspace.open_tab(group, location.clone(), view);
         self.workspace.focused = group;
         self.reload(tab, location);
+    }
+
+
+    /// Runs an action that has already been decided on.
+    ///
+    /// The context is the one held on `self`, so a confirmed action can be run
+    /// from the dialog's own frame rather than being queued for the next one.
+    fn apply_now(&mut self, action: Action) {
+        let ctx = self.ctx.clone();
+        self.apply(&ctx, action);
+    }
+
+    /// Puts a question in front of an action, choosing its wording from what
+    /// the action is about to do.
+    ///
+    /// The wording is built here rather than at each call site so the count and
+    /// the place named in the button are the ones the action will actually act
+    /// on — a dialog that says "3 files" while the code deletes 4 is worse than
+    /// no dialog.
+    fn ask(&mut self, then: Action) {
+        let Some(question) = self.question_for(&then) else {
+            // Nothing about this needs asking. Doing it rather than inventing a
+            // dialog keeps the list of things that get one short, which is what
+            // makes people read them.
+            self.apply_now(then);
+            return;
+        };
+        self.confirm = Some((question, Box::new(then)));
+    }
+
+    /// The wording for `action`, or `None` if it does not warrant asking.
+    fn question_for(&self, action: &Action) -> Option<crate::confirm::Confirm> {
+        match action {
+            Action::Delete { .. } => {
+                let place = self.workspace.active_tab()?.location();
+                // Only on a server. A local delete goes to the Recycle Bin and
+                // is undone from there; asking about it would train people to
+                // dismiss the dialog that matters.
+                let (site, _) = place.as_remote()?;
+                let name = self
+                    .sites
+                    .get(site)
+                    .map(|s| s.display().to_owned())
+                    .unwrap_or_else(|| "that server".to_owned());
+
+                let count = self.workspace.active_tab()?.selection.len();
+                let what = match count {
+                    1 => "1 item".to_owned(),
+                    n => format!("{n} items"),
+                };
+                Some(crate::confirm::Confirm {
+                    title: format!("Delete from {name}?"),
+                    body: format!(
+                        "{what} will be deleted from {name}. A server has no \
+                         Recycle Bin, so this cannot be undone."
+                    ),
+                    proceed: format!("Delete {what}"),
+                })
+            }
+
+            Action::ForgetServer => {
+                let (site, _) = self.workspace.active_tab()?.location().as_remote()?;
+                let name = self
+                    .sites
+                    .get(site)
+                    .map(|s| s.display().to_owned())
+                    .unwrap_or_else(|| "that server".to_owned());
+                Some(crate::confirm::Confirm {
+                    title: format!("Forget {name}?"),
+                    body: "Its saved password is removed from Credential Manager. \
+                           If you do not know the password, this cannot be undone."
+                        .to_owned(),
+                    proceed: "Forget it".to_owned(),
+                })
+            }
+
+            _ => None,
+        }
+    }
+
+    /// The confirmation dialog, drawn over everything.
+    fn confirm_overlay(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let Some((question, _)) = self.confirm.as_ref() else {
+            return;
+        };
+        match crate::confirm::show(ui, p, question) {
+            crate::confirm::Answer::Waiting => {}
+            crate::confirm::Answer::Cancelled => self.confirm = None,
+            crate::confirm::Answer::Confirmed => {
+                if let Some((_, then)) = self.confirm.take() {
+                    self.apply_now(*then);
+                }
+            }
+        }
     }
 
     /// Neutron's own menu for a sidebar row.
@@ -2987,7 +3096,9 @@ impl NeutronApp {
 
             C::ConnectServer => Some(Action::OpenConnect),
             C::ReloadSites => Some(Action::ReloadSites),
-            C::ForgetServer => Some(Action::ForgetServer),
+            // Asks first: it takes the password out of Credential Manager,
+            // and the user may not know it any more.
+            C::ForgetServer => Some(Action::Ask(Box::new(Action::ForgetServer))),
             C::TogglePin => Some(Action::TogglePin),
 
             C::SignOutDrive => Some(Action::SignOutDrive),

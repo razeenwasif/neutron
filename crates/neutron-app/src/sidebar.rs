@@ -173,12 +173,30 @@ pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) ->
     RowHit::of(&response, rect)
 }
 
+/// The mark for a shell root.
+///
+/// Keyed on the CLSID, not the label. `::{645FF040-...}` is the Recycle Bin on
+/// every Windows in every language; "Recycle Bin" is the name on an English
+/// one and nothing anywhere else.
+///
+/// Without this they were four identical diamonds, and the Recycle Bin — the
+/// one of them a person actually goes to — was indistinguishable from Control
+/// Panel.
+fn shell_glyph(place: &Place) -> Glyph {
+    match place.id.parsing_name().unwrap_or_default() {
+        "::{645FF040-5081-101B-9F08-00AA002F954E}" => Glyph::Trash,
+        "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}" => Glyph::Drive,
+        "::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}" => Glyph::Server,
+        _ => Glyph::Diamond,
+    }
+}
+
 fn glyph_for(place: &Place) -> Glyph {
     match place.kind {
         PlaceKind::Drive => Glyph::Drive,
         PlaceKind::Cloud => Glyph::Cloud,
         PlaceKind::Wsl => Glyph::Terminal,
-        PlaceKind::Shell => Glyph::Diamond,
+        PlaceKind::Shell => shell_glyph(place),
         PlaceKind::Server => Glyph::Server,
         // Home gets its own glyph; the other known folders are folders.
         PlaceKind::KnownFolder if place.name == "Home" => Glyph::Home,

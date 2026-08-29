@@ -200,9 +200,19 @@ fn a_plugin_printing_forever_is_cut_off_and_the_host_returns() {
 
     let started = Instant::now();
     let out = run(&set, "/tmp", &[]);
+
     // Returns because the response cap fires, not because the deadline does.
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
-    assert_eq!(out.status.as_deref(), Some("working"));
+
+    // The whole outcome, not just the field being checked. This failed once in
+    // CI with `left: None, right: Some("working")`, which says nothing about
+    // *why* nothing was applied — the host reports every way a run can go wrong
+    // through `error`, and that is the field that would have explained it.
+    assert_eq!(
+        out.status.as_deref(),
+        Some("working"),
+        "nothing was applied before the cap fired; whole outcome: {out:?}"
+    );
 }
 
 #[test]

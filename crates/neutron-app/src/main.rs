@@ -24,6 +24,7 @@ mod bench;
 mod chrome;
 mod cloud;
 mod commands;
+mod confirm;
 mod connect;
 mod dashboard;
 mod finder;
