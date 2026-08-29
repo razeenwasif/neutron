@@ -255,12 +255,24 @@ up on.
   Worth stating plainly against a project whose pitch includes a single ~15 MB
   binary. Nothing is loaded until a server is opened, so start-up and idle
   memory are unaffected.
-  - **Since revised down to 18.8 MiB** by pinning `russh` to `ring` (section 14),
-    which took a second complete crypto library out of the binary. Measured on
-    the current tree, same `lto = "fat"` profile. Not an A/B against the
-    previous commit, because the previous commit *cannot be built on this
-    machine* — which is the finding that led to the change.
-- The drifting fields require a continuous repaint. Measured idle CPU: **17.7%** of one core at 60fps, **8.4%** at 30fps (current setting), against **0.3%** for a static ground. The loops are 41s and 57s long, so the lower rate is visually identical.
+  - **Now 19.01 MiB**, re-measured 2026-08-29 on the current tree, same
+    `lto = "fat"` profile. An earlier note here said 18.8 MiB; that was read
+    from a three-day-old binary, because waiting for a release build by testing
+    for the file's existence returns at once when a stale one is already there.
+    Corrected, and the trap is written down in `docs/perf.md`.
+  - Pinning `russh` to `ring` (section 14) took one of two complete crypto
+    libraries out. How much that saved cannot be measured here: the commit
+    before it *cannot be built on this machine*, which is the finding that led
+    to the change.
+- The drifting fields require a continuous repaint. When this section was
+  written the rate was 30fps and the cost **8.4%** of a core (**17.7%** at
+  60fps), against **0.3%** for a static ground.
+  - **That is no longer the setting.** `ambient_interval` has returned 100ms —
+    10fps focused, 2fps unfocused — since *Stop repainting the ground faster
+    than it moves*, and the fields drift under a pixel per frame at that rate.
+    Measured 2026-08-29: **1.69%** focused, **0.52%** unfocused. This bullet
+    went stale the moment that commit landed and stayed wrong for four
+    milestones; `docs/perf.md` had it right the whole time.
 
 
 #### 14. Three Things That Were Not Finished

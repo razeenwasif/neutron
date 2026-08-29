@@ -6,12 +6,27 @@ binary on the target machine.
 Re-measure after each milestone and update this file. A target that is never
 checked is decoration.
 
-**Machine:** Windows 11, WSL2 host, 6 fixed NTFS volumes (A, B, C, F, G, I),
-hybrid graphics (integrated + discrete).
+**Machine:** Windows 11, 6 fixed NTFS volumes (A, B, C, F, G, I), hybrid
+graphics — AMD Radeon integrated (the default, `NEUTRON_GPU_POWER=low`) and an
+NVIDIA RTX 4090. Sessions up to 2026-08-20 were measured on a WSL2 host with
+the binary cross-built from a Linux shell; that distribution is gone and the
+2026-08-29 session was measured natively, which is why the GPU rows move.
+
+> **Quote private bytes, not working set.** Windows trims a working set
+> whenever it likes, and across identical runs this session it varied from 256
+> to 448 MB. Private bytes was stable to a few percent. A comparison between
+> the two metrics is what made memory look like it had regressed by 140 MB when
+> it had not moved at all.
 
 ---
 
-## ⚠ Measuring from WSL: `WSLENV` is mandatory
+## ⚠ Historical: measuring from WSL needed `WSLENV`
+
+**This no longer applies.** The WSL distribution this was built from is gone and
+the binary is built natively, so a variable set in the building shell reaches
+the process normally. Kept because the lesson outlived the setup, and because
+this is what a silently invalidated round of measurement looks like written
+down.
 
 Environment variables set in a WSL shell **do not reach a Windows process**
 unless they are also named in `WSLENV`:
@@ -159,15 +174,18 @@ thousands of them that nobody asked for.
 
 ## Targets vs. reality
 
+Last re-measured 2026-08-29 at `9cd35af`; see that session below for method.
+
 | Metric | Target | Actual | Status |
 |---|---:|---:|---|
-| Enumerate 100k-file dir | <200 ms | ~92 ms | ✅ 2.2× under |
-| Frame time p99 scrolling | <8 ms | 0.23 ms | ✅ 35× under |
-| Cold start | <100 ms | 374 ms | ❌ **not achievable as architected** (369 ms of it is GPU device creation) |
-| Idle memory | <60 MB | 310 MB | ❌ **not achievable as architected** |
-| Idle CPU, focused | ~0% | 1.17% | ➖ 10 fps for a drifting ground |
-| Idle CPU, unfocused | ~0% | 0.39% | ✅ |
-| Binary size | ~15 MB | 11 MB | ✅ |
+| Enumerate + sort 100k-file dir | <200 ms | 52 ms | ✅ 3.8× under |
+| Frame time p99 scrolling | <8 ms | 0.21 ms | ✅ 38× under |
+| Cold start, repeat launch | <100 ms | 410 ms | ❌ **not achievable as architected** (403 ms of it is GPU bring-up) |
+| Cold start, first launch after a build | <100 ms | 801 ms | ❌ same cause, cold driver and shader cache |
+| Idle memory, private bytes | <60 MB | 488 MB | ❌ **not achievable as architected** |
+| Idle CPU, focused | ~0% | 1.69% | ➖ 10 fps for a drifting ground |
+| Idle CPU, unfocused | ~0% | 0.52% | ✅ |
+| Binary size | ~15 MB | 19.0 MiB | ❌ the server clients; see `PROGRESS.md` §13 |
 
 ### The two failures are the same failure
 
@@ -585,24 +603,188 @@ magic, a wrong volume, trailing bytes and a length field of `u64::MAX`.
 
 ---
 
+## Re-measured (2026-08-29)
+
+Everything below was taken from the release binary at `9cd35af`, on the machine
+described at the top of this file — which has changed since the earlier
+sessions, so several rows move for reasons that have nothing to do with
+Neutron's code. Where that is the case it says so.
+
+Two of these numbers had gone stale in opposite directions, and one of them had
+gone stale *in this file* while `PROGRESS.md` was right — see "Which document
+was wrong" below.
+
+### Enumerate and sort — much faster, and never recorded
+
+`neutron --bench C:\Users\Razeen\.neutron-bench 6`, the synthetic
+100,200-entry directory from `scripts/make-bench-dir.ps1`.
+
+| | median | mean | min | max | per entry |
+|---|---:|---:|---:|---:|---:|
+| enumerate (warm) | 44.90 ms | 44.91 ms | 43.71 ms | 46.81 ms | 0.448 µs |
+| sort (warm) | 7.20 ms | 7.20 ms | 7.14 ms | 7.27 ms | 0.072 µs |
+
+**52 ms** for the pair, against the 92 ms this file has carried since M1. The
+perf pass of 2026-08-19 — the allocation removals in sorting and filtering, and
+the name-arena search — is where that went, and nobody re-ran the headline
+number afterwards. The same folder inside the running app measures 51.8 ms
+enumerate + 8.7 ms sort, slightly higher because the renderer is competing for
+a core.
+
+### Frame time while scrolling — confirmed
+
+900 `Down` keystrokes delivered to the 100,200-entry listing, twenty
+`p50/p99` reports over the run:
+
+| | value |
+|---|---:|
+| p50 | 0.12 ms |
+| p99, median of 20 reports | 0.21 ms |
+| p99, worst single report | 0.57 ms |
+
+Unchanged from the 0.23 ms recorded before, which is the point: this is the
+metric the project is actually about, and it has stayed flat through archives,
+plugins, servers, Drive and the preview pane.
+
+### Cold start — the same, once you separate the first launch from the rest
+
+Six consecutive launches, small folder, `NEUTRON_LOG=info`:
+
+| run | total | setup | gpu | paint |
+|---|---:|---:|---:|---:|
+| 1 | 419 ms | 0 ms | +412 ms | +6 ms |
+| 2 | 394 ms | 0 ms | +388 ms | +5 ms |
+| 3 | 412 ms | 0 ms | +406 ms | +6 ms |
+| 4 | 407 ms | 0 ms | +401 ms | +6 ms |
+| 5 | 418 ms | 0 ms | +412 ms | +6 ms |
+| 6 | 401 ms | 0 ms | +395 ms | +6 ms |
+
+Median **410 ms**, against 374 ms before. Within the noise of a different GPU
+and driver, and the shape is identical: ~98% of it is GPU bring-up, our own
+paint is 6 ms.
+
+**The first launch after a build is 801 ms** (gpu +772, paint +29) — roughly
+double the steady figure, because the driver DLLs are not resident and the
+shader cache is cold. This file has never distinguished the two, and the
+distinction is the honest one: 801 ms is what someone sees the first time they
+run it, and 410 ms is what they see afterwards.
+
+### Memory — unchanged, and the metric that was being compared was the wrong one
+
+| Metric | M1 | now |
+|---|---:|---:|
+| Private bytes | ~470 MB | 487.6 MB |
+| Working set | ~280 MB | 305.2 MB |
+| Threads | 43 | 70 |
+| Handles | — | 795 |
+
+**Private bytes has barely moved** — 470 → 488 MB, about 4%, across everything
+added since M1.
+
+Working set is not a stable number and should not be quoted as one. Across runs
+of the *same* build and the same configuration this session it read 256 MB,
+303 MB, 305 MB, 440 MB and 448 MB, depending on how long the window had been
+open and what else the machine was doing. Windows trims it whenever it likes.
+The targets table used to carry a working-set figure as "idle memory", which is
+how a 310 MB row and a 448 MB reading can both be true and neither be a
+regression. **Private bytes is the number to track.**
+
+The thread count is the one real change: 43 → 70. The preview worker, the
+download and archive threads, the plugin pipes and the remote runtime each add
+their own, and they are almost all parked on a channel.
+
+### Idle CPU
+
+Sampled over 12 s after a settle, with the foreground window confirmed by
+`GetForegroundWindow` at both ends of the sample rather than assumed.
+
+| | before | now |
+|---|---:|---:|
+| Focused (10 fps ambient) | 1.17% | 1.69% |
+| Unfocused (2 fps ambient) | 0.39% | 0.52% |
+
+The first attempt at the unfocused number read 1.43%, which was wrong: Windows
+11's `notepad.exe` is a launcher that exits immediately, so the window never
+actually lost focus and the sample was a focused one with variance on top.
+Asserting the foreground window is not optional for this measurement.
+
+### Binary size
+
+**19.01 MiB** (19,932,672 bytes), release, `lto = "fat"`.
+
+Against ~11 MB at M1. The servers account for most of it — see `PROGRESS.md`
+§13 — and pinning `russh` to `ring` took one of the two crypto libraries back
+out.
+
+> A caution about how this was measured, because it produced a wrong number
+> first. Waiting for a release build with `until [ -f target/release/neutron.exe ]`
+> returns immediately when a *stale* binary is already there, and the 18.81 MiB
+> that was briefly recorded in `PROGRESS.md` came from a three-day-old build.
+> Wait for the build to report `Finished`, and check the file's mtime against
+> the commit.
+
+### An aside worth keeping: the discrete GPU uses less memory
+
+`NEUTRON_GPU_POWER` selects the adapter. The default is `low`, which picks the
+integrated AMD part.
+
+| | private bytes | working set | cold start |
+|---|---:|---:|---:|
+| `low` (integrated) | 486.3 MB | 303.4 MB | 410 ms |
+| `high` (discrete) | 401.1 MB | 256.1 MB | 427 ms |
+
+The discrete card costs 17 ms more to bring up and saves 85 MB of private
+bytes, which is the opposite of what "low power" suggests — the integrated part
+allocates its framebuffers out of system memory. Not a reason to change the
+default, since 17 ms of start-up is worth more here than 85 MB of a modern
+machine's RAM, but worth knowing before anyone attacks the memory number.
+
+### Which document was wrong
+
+Both, on different rows, and each was right where the other was stale:
+
+| Claim | Written at | Verdict |
+|---|---|---|
+| `perf.md`: idle CPU 1.17% at 10 fps | `82d2418`, after the fps change | correct |
+| `PROGRESS.md` §13: "8.4% at 30fps (current setting)" | `36f5a83`, before it | stale — `ambient_interval` returns 100 ms |
+| `perf.md`: binary 11 MB | M1, never updated | stale |
+| `PROGRESS.md` §13: 19.8 MiB | `f22b0a4`, after the servers | correct for its commit |
+
+The lesson is the one at the top of this file, which was already written down
+and still got ignored: *re-measure after each milestone and update this file. A
+target that is never checked is decoration.* Four milestones landed between the
+last measurement and this one.
+
+---
+
 ## Reproducing
 
-```bash
-cargo xtask build -- --release
+```powershell
+cargo build --release -p neutron-app
 
-# Directory scaling (headless).
-cd /mnt/c && ./Users/Razeen/.neutron-target/release/neutron.exe \
-    --bench 'C:\Windows\WinSxS' 6
+# Directory scaling (headless — no window, nothing competing for a core).
+.\target\release\neutron.exe --bench 'C:\Users\Razeen\.neutron-bench' 6
 
-# Frame time while scrolling — note WSLENV.
-WSLENV=NEUTRON_LOG NEUTRON_LOG=debug ./neutron.exe 'C:\some\big\folder'
+# Cold start: one line per launch, at info level.
+$env:NEUTRON_LOG = 'info'
+.\target\release\neutron.exe 'C:\some\folder' 2> cold.log
+
+# Frame time: p50/p99 every 240 frames, at debug level. Needs real scrolling —
+# an idle window reports its idle frames, which is a different number.
+$env:NEUTRON_LOG = 'debug'
 ```
+
+For idle CPU and memory, sample `Get-Process neutron` over ten seconds or more
+after letting the window settle, and **confirm the foreground window** with
+`GetForegroundWindow` before believing a "focused" or "unfocused" reading.
+`notepad.exe` on Windows 11 is a launcher that exits immediately and will not
+hold focus away from the window under test.
 
 The 100k-entry directory is synthetic; recreate it with
 [`scripts/make-bench-dir.ps1`](../scripts/make-bench-dir.ps1). It is not kept on
 disk between runs.
-
-> Killing the WSL-side wrapper (Ctrl-C, `timeout`) does **not** kill the Windows
-> process. Stale instances hold a lock on `neutron.exe` and make the next build
-> fail with "Access is denied". Clear them with
-> `taskkill.exe /IM neutron.exe /F`.
+> A stale instance holds a lock on `neutron.exe` and makes the next build fail
+> with "Access is denied". Clear them with
+> `Get-Process neutron | Stop-Process -Force`. This used to bite via the WSL
+> wrapper, where Ctrl-C killed the Linux side and left the Windows process
+> running; it still bites whenever a measurement run is interrupted.

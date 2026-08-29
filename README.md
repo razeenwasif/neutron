@@ -16,7 +16,7 @@ view; a preview pane; listings that update themselves; zip and tar archives;
 plugins as separate processes; FTP, FTPS and SFTP servers; Google Drive over the
 API; and one status line that says when any of it fails.
 
-A 100k-entry folder opens in ~92ms and scrolls at 0.23ms per frame.
+A 100k-entry folder opens in 52ms and scrolls at 0.21ms per frame.
 
 ---
 
@@ -548,11 +548,14 @@ costs nothing in legibility.
 
 **The drifting is paid for, and the bill is known.** A moving ground needs a
 continuous repaint, which is the one piece of this program that costs something
-for decoration alone: **17.7%** of a core at 60fps, **8.4%** at 30fps — the
-current setting — against **0.3%** for a static ground. Since the loops are 41
-and 57 seconds long the lower rate is visually identical, and an unfocused
-window drops further. It is a deliberate trade rather than an oversight, which
-is why the number is written down.
+for decoration alone. The rate is chosen against how fast the ground actually
+moves rather than against what looks like a frame rate: the fields loop over 41
+and 57 seconds, which at their fastest is about 8 px/s across a 1500 px window,
+so **10fps** shifts a soft gradient by under a pixel per frame. Measured cost at
+that rate: **1.69%** of a core focused, **0.52%** unfocused, against **0.3%**
+for a static ground. It ran at 30fps once and that was buying nothing at all.
+A deliberate trade rather than an oversight, which is why the number is written
+down — and re-measured.
 
 **Navigation lives in the pane, not in a toolbar.** Back/forward/up, the
 breadcrumb, the location title and the filter field are all inside each pane's
@@ -576,17 +579,20 @@ See [`docs/perf.md`](docs/perf.md) for measured numbers.
 
 | Metric | Target | Actual |
 |---|---:|---:|
-| Enumerate + sort 100k entries | <200 ms | **~92 ms** |
-| Frame time p99 while scrolling | <8 ms | **0.23 ms** |
+| Enumerate + sort 100k entries | <200 ms | **52 ms** |
+| Frame time p99 while scrolling | <8 ms | **0.21 ms** |
 | Index 3.3M files, all volumes | <10 s | **2.6 s** (warm cache) |
 | Search, incremental keystroke | <1 ms | **0.003 ms** |
 | Search, first character | <1 ms | 6–9 ms ❌ |
-| Cold start | <100 ms | 374 ms ❌ |
-| Idle memory | <60 MB | 310 MB ❌ |
-| Binary size | ~15 MB | 18.8 MiB ❌ |
+| Cold start, repeat launch | <100 ms | 410 ms ❌ |
+| Cold start, first after a build | <100 ms | 801 ms ❌ |
+| Idle memory, private bytes | <60 MB | 488 MB ❌ |
+| Binary size | ~15 MB | 19.0 MiB ❌ |
 
-These track [`docs/perf.md`](docs/perf.md), which is the measurement of record;
-an earlier version of this table had drifted from it.
+Re-measured 2026-08-29; [`docs/perf.md`](docs/perf.md) is the measurement of
+record and carries the method. Quote **private bytes** for memory, not working
+set — Windows trims a working set at will, and across identical runs it varied
+from 256 to 448 MB while private bytes held to a few percent.
 
 Cold start and idle memory share one cause — GPU device creation, which costs
 the best part of a second and a few hundred megabytes before any of our code
