@@ -29,6 +29,14 @@ use neutron_ui::theme::{self, Palette, RADIUS_CARD, RADIUS_CONTROL, micro_caps};
 const TILE: f32 = 84.0;
 /// Smallest tile width before the grid drops a column.
 const TILE_MIN: f32 = 150.0;
+/// Space between tiles, and between rows of them.
+const GAP: f32 = 12.0;
+/// Widest the dashboard's content is allowed to get.
+///
+/// A greeting and a row of tiles stretched across a 4K pane is a line of text
+/// with a metre of nothing after it. The column is capped and centred, which is
+/// what every dashboard does and what the concept's own layout implies.
+const MAX_CONTENT: f32 = 980.0;
 
 /// Draws the dashboard. Returns a destination if one was chosen.
 pub fn show(
@@ -40,6 +48,26 @@ pub fn show(
     egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show(ui, |ui| {
+            let full = ui.available_width();
+            let content = full.min(MAX_CONTENT);
+            let margin = ((full - content) / 2.0).max(0.0);
+
+            let mut chosen = None;
+            ui.horizontal(|ui| {
+                ui.add_space(margin);
+                ui.vertical(|ui| {
+                    ui.set_width(content);
+                    chosen = body(ui, p, volumes, known);
+                });
+            });
+            chosen
+        })
+        .inner
+}
+
+fn body(ui: &mut Ui, p: &Palette, volumes: &[Place], known: &[Place]) -> Option<NodeId> {
+    {
+        {
             ui.add_space(4.0);
             greeting(ui, p);
             ui.add_space(18.0);
@@ -62,8 +90,8 @@ pub fn show(
 
             ui.add_space(16.0);
             chosen
-        })
-        .inner
+        }
+    }
 }
 
 fn greeting(ui: &mut Ui, p: &Palette) {
@@ -194,27 +222,38 @@ fn tiles(ui: &mut Ui, p: &Palette, places: &[Place]) -> Option<NodeId> {
     }
     let mut chosen = None;
 
-    let available = ui.available_width();
-    let columns = ((available / TILE_MIN).floor() as usize).clamp(1, 5);
-    let gap = 12.0;
-    let width = ((available - gap * (columns - 1) as f32) / columns as f32).floor();
+    let columns = columns_for(ui.available_width(), places.len());
+    let width =
+        ((ui.available_width() - GAP * (columns - 1) as f32) / columns as f32).floor();
 
-    let mut i = 0;
-    while i < places.len() {
+    for row in places.chunks(columns) {
         ui.horizontal(|ui| {
-            for _ in 0..columns {
-                let Some(place) = places.get(i) else { break };
-                i += 1;
+            // egui adds `item_spacing.x` between widgets of its own accord. With
+            // the gap added by hand as well, every tile cost width + 8 + 12 and
+            // the last one in each row fell off the end.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (n, place) in row.iter().enumerate() {
+                if n > 0 {
+                    ui.add_space(GAP);
+                }
                 if tile(ui, p, place, width) {
                     chosen = Some(place.id.clone());
                 }
-                ui.add_space(gap);
             }
         });
-        ui.add_space(gap);
+        ui.add_space(GAP);
     }
 
     chosen
+}
+
+/// How many tiles fit across `available`.
+///
+/// Capped at the number there actually are, so four folders fill a wide pane
+/// as four wide tiles rather than four narrow ones with a hole beside them.
+fn columns_for(available: f32, count: usize) -> usize {
+    let fits = ((available + GAP) / (TILE_MIN + GAP)).floor() as usize;
+    fits.clamp(1, 5).min(count.max(1))
 }
 
 fn tile(ui: &mut Ui, p: &Palette, place: &Place, width: f32) -> bool {
@@ -283,17 +322,53 @@ mod tests {
     /// The grid has to stay usable in a narrow pane. A split four ways is not
     /// unusual, and a tile that never fits is a tile that never renders.
     #[test]
-    fn the_tile_grid_always_keeps_at_least_one_column() {
-        for available in [80.0f32, 149.0, 150.0, 600.0, 2000.0] {
-            let columns = ((available / TILE_MIN).floor() as usize).clamp(1, 5);
-            assert!(columns >= 1, "{available}px gave {columns} columns");
-            assert!(columns <= 5, "{available}px gave {columns} columns");
+    fn the_grid_always_keeps_at_least_one_column() {
+        for available in [0.0f32, 40.0, 149.0, 150.0, 600.0, 4000.0] {
+            let columns = columns_for(available, 12);
+            assert!((1..=5).contains(&columns), "{available}px gave {columns}");
         }
     }
 
+    /// The row must fit. This is the arithmetic that was wrong: a trailing gap
+    /// after the last tile pushed every row over the edge.
     #[test]
-    fn a_wide_pane_fills_out_but_stops_at_five() {
-        assert_eq!(((2000.0f32 / TILE_MIN).floor() as usize).clamp(1, 5), 5);
-        assert_eq!(((320.0f32 / TILE_MIN).floor() as usize).clamp(1, 5), 2);
+    fn a_row_of_tiles_fits_the_width_it_was_given() {
+        for available in [150.0f32, 320.0, 700.0, 980.0] {
+            let columns = columns_for(available, 12);
+            let width = ((available - GAP * (columns - 1) as f32) / columns as f32).floor();
+            let used = width * columns as f32 + GAP * (columns - 1) as f32;
+            assert!(
+                used <= available,
+                "{columns} tiles of {width} used {used} of {available}"
+            );
+            assert!(width >= 1.0, "{available}px gave a {width}px tile");
+        }
+    }
+
+    /// Four folders in a wide pane should be four wide tiles, not four narrow
+    /// ones with a hole beside them.
+    #[test]
+    fn a_short_list_does_not_leave_empty_columns() {
+        assert_eq!(columns_for(4000.0, 4), 4);
+        assert_eq!(columns_for(4000.0, 1), 1);
+        assert_eq!(columns_for(4000.0, 12), 5);
+    }
+
+    /// A pane narrower than one tile still gets one, rather than zero and a
+    /// division by zero after it.
+    #[test]
+    fn a_pane_too_narrow_for_a_tile_still_draws_one() {
+        assert_eq!(columns_for(10.0, 6), 1);
+        assert_eq!(columns_for(0.0, 6), 1);
+    }
+
+    /// The content column is capped so a greeting does not sit alone at the
+    /// left of a very wide pane.
+    #[test]
+    fn the_content_column_is_capped_and_centred() {
+        let margin = |full: f32| ((full - full.min(MAX_CONTENT)) / 2.0).max(0.0);
+        assert_eq!(margin(600.0), 0.0, "a narrow pane uses all of itself");
+        assert!(margin(2000.0) > 0.0, "a wide pane centres its column");
+        assert_eq!(margin(MAX_CONTENT), 0.0);
     }
 }

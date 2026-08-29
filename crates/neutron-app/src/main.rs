@@ -34,6 +34,7 @@ mod loader;
 mod notice;
 mod preview;
 mod panes;
+mod pins;
 mod place;
 mod rail;
 mod remote;

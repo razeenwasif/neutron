@@ -58,6 +58,8 @@ pub enum CommandId {
     ReloadSites,
     ForgetServer,
 
+    TogglePin,
+
     SignOutDrive,
 
     OpenTerminal,
@@ -189,6 +191,15 @@ pub const ALL: &[CommandDef] = &[
         id: CommandId::ForgetServer,
         title: "Forget this server",
         hint: "",
+    },
+
+    // One entry rather than a Pin and an Unpin. Which of the two applies is a
+    // property of where you are standing, and the palette is filtered by typing
+    // "pin" either way.
+    CommandDef {
+        id: CommandId::TogglePin,
+        title: "Pin or unpin this folder",
+        hint: "Ctrl+Shift+D",
     },
 
     // Likewise the other half of "Connect Google Drive" in the sidebar. The

@@ -128,6 +128,7 @@ enum Action {
     StartIndexer,
     /// Begin the Google Drive consent flow.
     ConnectDrive,
+    TogglePin,
     SignOutDrive,
     ForgetServer,
     MoveCursor { delta: isize, extend: bool },
@@ -228,6 +229,9 @@ pub struct NeutronApp {
     icons: IconService,
 
     known_folders: Vec<Place>,
+    /// Folders pinned to Quick access. Read once at start-up and kept here;
+    /// the file is only rewritten when one is added or removed.
+    pins: crate::pins::Pins,
     cloud: Vec<Place>,
     wsl: Vec<Place>,
     shell_roots: Vec<Place>,
@@ -400,6 +404,17 @@ impl NeutronApp {
         // the window never appeared at all.
         let places_rx = spawn_places_discovery(cc.egui_ctx.clone());
 
+        // Pinned folders, for the sidebar. Same shape as the servers below:
+        // one small JSON file read once, at construction, before there is a
+        // frame to drop.
+        let pins = match crate::pins::load() {
+            Ok(pins) => pins,
+            Err(e) => {
+                tracing::warn!("pins.json: {e}");
+                crate::pins::Pins::default()
+            }
+        };
+
         // The saved servers, for the sidebar. Reading a small JSON file; no
         // connection is opened until one is chosen.
         let (sites, sites_error) = match neutron_remote::site::load() {
@@ -470,6 +485,7 @@ impl NeutronApp {
             sta,
             icons,
             known_folders: Vec::new(),
+            pins,
             cloud: Vec::new(),
             wsl: Vec::new(),
             shell_roots: Vec::new(),
@@ -899,6 +915,7 @@ impl NeutronApp {
             Action::StartIndexer => self.index.start_helper(),
 
             Action::ConnectDrive => self.connect_drive(),
+            Action::TogglePin => self.toggle_pin(),
             Action::SignOutDrive => self.sign_out_drive(),
             Action::ForgetServer => self.forget_server(),
 
@@ -2225,6 +2242,10 @@ impl NeutronApp {
             bindings.push((egui::Key::F6, Action::FocusNextPane));
 
             if ctrl {
+                if shift {
+                    // Shift, because plain Ctrl+D is the theme toggle.
+                    bindings.push((egui::Key::D, Action::TogglePin));
+                }
                 bindings.extend([
                     (egui::Key::A, Action::SelectAll),
                     (egui::Key::H, Action::ToggleHidden),
@@ -2349,6 +2370,101 @@ impl NeutronApp {
                 }
             };
             let _ = done.send(state);
+            wake.request_repaint();
+        });
+    }
+
+
+
+    /// Pinned folders as sidebar places.
+    ///
+    /// Built per frame rather than kept: it is a handful of paths, and a cached
+    /// copy is one more thing that can disagree with `self.pins` after a
+    /// toggle.
+    fn pinned_places(&self) -> Vec<Place> {
+        self.pins
+            .folders
+            .iter()
+            .map(|path| Place {
+                name: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+                id: NodeId::Path(path.clone()),
+                kind: neutron_core::places::PlaceKind::KnownFolder,
+                capacity: None,
+            })
+            .collect()
+    }
+
+    /// What Quick access holds: the known folders, then anything pinned.
+    ///
+    /// Known folders first because they are always the same four and the eye
+    /// learns where they are; pins after, newest first, because that order is
+    /// the point of them.
+    fn quick_access(&self) -> Vec<Place> {
+        let mut all = self.known_folders.clone();
+        // A pin that is already a known folder is not listed twice. Pinning
+        // Downloads is a reasonable thing to try, and two identical tiles side
+        // by side looks like a bug rather than a preference.
+        all.extend(
+            self.pinned_places()
+                .into_iter()
+                .filter(|pinned| !self.known_folders.iter().any(|k| k.id == pinned.id)),
+        );
+        all
+    }
+
+    /// Pins the focused folder to Quick access, or unpins it if it is already
+    /// there.
+    ///
+    /// One command for both, because which one applies is a property of where
+    /// you are standing rather than something to choose from a menu.
+    fn toggle_pin(&mut self) {
+        let Some(dir) = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.location().as_path())
+            .map(Path::to_path_buf)
+        else {
+            // A pin is a path on disk. Nothing without one can be restored
+            // next launch, so the refusal names the place rather than failing
+            // quietly — see `place.rs`.
+            self.refuse_without_a_path("pin");
+            return;
+        };
+
+        let mut pins = self.pins.clone();
+        let outcome = pins.toggle(&dir);
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+
+        if outcome == crate::pins::Toggled::Full {
+            // Refused rather than dropping the oldest: that would lose a pin
+            // the user made on purpose, and say nothing about it.
+            self.notices.info(format!(
+                "Quick access holds {} folders — unpin one first",
+                crate::pins::MAX
+            ));
+            return;
+        }
+
+        // Applied here so the sidebar changes on this frame; the write below
+        // only makes it outlast the session.
+        self.pins = pins.clone();
+        self.notices.info(match outcome {
+            crate::pins::Toggled::Pinned => format!("Pinned {name} to Quick access"),
+            _ => format!("Unpinned {name}"),
+        });
+
+        let notices = self.notice_tx.clone();
+        let wake = self.ctx.clone();
+        self.sta.submit(move || {
+            if let Err(e) = crate::pins::save(&pins) {
+                report(&notices, format!("Could not save pins: {e}"));
+            }
             wake.request_repaint();
         });
     }
@@ -2688,6 +2804,7 @@ impl NeutronApp {
             C::ConnectServer => Some(Action::OpenConnect),
             C::ReloadSites => Some(Action::ReloadSites),
             C::ForgetServer => Some(Action::ForgetServer),
+            C::TogglePin => Some(Action::TogglePin),
 
             C::SignOutDrive => Some(Action::SignOutDrive),
 
@@ -3930,6 +4047,12 @@ impl NeutronApp {
                     }
                 }
 
+                for place in self.pinned_places() {
+                    if sidebar::row(ui, p, &place, current) {
+                        actions.push(Action::Navigate(place.id.clone()));
+                    }
+                }
+
                 if !self.shell_roots.is_empty() {
                     sidebar::section(ui, p, "System");
                     for place in &self.shell_roots {
@@ -4231,7 +4354,7 @@ impl NeutronApp {
         // widget at all. It draws from what the sidebar scan already found.
         if matches!(tab.location(), NodeId::Home) {
             if let Some(target) =
-                crate::dashboard::show(ui, p, &self.drives, &self.known_folders)
+                crate::dashboard::show(ui, p, &self.drives, &self.quick_access())
             {
                 actions.push(Action::Navigate(target));
             }
