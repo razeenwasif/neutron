@@ -1937,6 +1937,7 @@ impl eframe::App for NeutronApp {
 
         self.status_bar(ui, &p, &mut actions);
         self.sidebar(ui, &p, &mut actions);
+        self.action_rail(ui, &p, &mut actions);
         self.preview_pane(ui, &p);
         self.panes(ui, &p, &mut actions);
 
@@ -3757,6 +3758,49 @@ impl NeutronApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 crate::preview::show(ui, p, &self.preview, subject);
+            });
+    }
+
+
+    /// The action rail: a fixed strip of verbs between the sidebar and the
+    /// panes. See [`crate::rail`] for why it exists in a keyboard-first
+    /// application.
+    fn action_rail(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
+        let tab = self.workspace.active_tab();
+        let state = crate::rail::RailState {
+            has_selection: tab.is_some_and(|t| !t.selection.is_empty()),
+            has_cursor: tab.is_some_and(|t| {
+                t.selection.cursor().is_some_and(|i| i < t.list.len())
+            }),
+        };
+
+        egui::Panel::left("action-rail")
+            .resizable(false)
+            .exact_size(crate::rail::WIDTH)
+            .frame(
+                theme::card(p)
+                    .outer_margin(egui::Margin {
+                        left: GUTTER as i8,
+                        right: 0,
+                        top: GUTTER as i8,
+                        bottom: GUTTER as i8,
+                    })
+                    .inner_margin(egui::Margin::symmetric(0, 8)),
+            )
+            .show(ui, |ui| {
+                if let Some(chosen) = crate::rail::show(ui, p, &state) {
+                    use crate::rail::RailAction as R;
+                    actions.push(match chosen {
+                        R::Copy => Action::Clip { cut: false },
+                        R::Cut => Action::Clip { cut: true },
+                        R::Paste => Action::Paste,
+                        R::Delete => Action::Delete { permanent: false },
+                        R::Rename => Action::BeginRename,
+                        R::NewFolder => Action::NewFolder,
+                        R::Extract => Action::ExtractSelection,
+                        R::Compress => Action::CompressSelection,
+                    });
+                }
             });
     }
 

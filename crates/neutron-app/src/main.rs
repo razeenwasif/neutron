@@ -33,6 +33,7 @@ mod notice;
 mod preview;
 mod panes;
 mod place;
+mod rail;
 mod remote;
 mod plugins;
 mod sidebar;
