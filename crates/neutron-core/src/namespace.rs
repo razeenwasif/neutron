@@ -14,6 +14,16 @@ use crate::entry::EntryList;
 /// dispatch in `neutron-shell` is a match rather than a guess.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeId {
+    /// The dashboard: where a window opens, and the one location that is not a
+    /// container of files.
+    ///
+    /// A variant rather than a flag on a path, because it genuinely is a
+    /// different kind of place: no children to enumerate, no parent to go up
+    /// to, nothing in it to rename or delete. That is what the other virtual
+    /// variants already model, and what every `match` here is already shaped
+    /// to handle.
+    Home,
+
     /// A real filesystem location. Always stored `\\?\`-prefixed on Windows so
     /// the 260-char `MAX_PATH` limit never applies.
     Path(PathBuf),
@@ -147,6 +157,7 @@ impl NodeId {
     /// Label for the breadcrumb / tab title.
     pub fn display_name(&self) -> String {
         match self {
+            NodeId::Home => "Dashboard".to_owned(),
             NodeId::Path(p) => p
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -196,6 +207,7 @@ impl NodeId {
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            NodeId::Home => write!(f, "<home>"),
             NodeId::Path(p) => write!(f, "{}", p.display()),
             NodeId::Shell { parsing, .. } => write!(f, "{parsing}"),
             NodeId::Cloud { provider, id, .. } => write!(f, "<{provider:?}:{id}>"),

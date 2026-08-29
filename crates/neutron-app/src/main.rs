@@ -25,6 +25,7 @@ mod chrome;
 mod cloud;
 mod commands;
 mod connect;
+mod dashboard;
 mod finder;
 mod header;
 mod icon_service;

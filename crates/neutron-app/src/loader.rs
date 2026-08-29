@@ -210,6 +210,10 @@ fn worker(
         // touch COM — that is the whole performance argument — so the shell
         // backend is asked only for the nodes it claims.
         let outcome = match &req.id {
+            // Nothing to enumerate: the dashboard draws itself from what the
+            // sidebar already knows. An empty listing rather than an error,
+            // because there is no failure here to report.
+            NodeId::Home => Ok(EntryList::default()),
             NodeId::Cloud { id, .. } => drive.list(id),
             // Before the shell backend is asked: a remote path is a POSIX
             // string and the shell would make something of it.

@@ -132,47 +132,72 @@ fn folder(painter: &Painter, c: Pos2, stroke: Stroke) {
 
 // --- the action rail -------------------------------------------------------
 //
-// Drawn to the same 14-16px envelope as everything above, because they sit in a
-// 54px strip beside the sidebar and have a label under them. Anything more
-// detailed becomes a smudge at that size.
+// Drawn to a larger envelope than the sidebar's glyphs. The rail's buttons are
+// the biggest click targets in the window and carry a label underneath, so a
+// mark sized for a 31px navigation row looks lost in one; `ACTION` is the
+// factor between the two.
+//
+// Every coordinate below is the same 14px envelope the rest of the file uses,
+// multiplied through by that factor in one place, so the two sets stay in
+// proportion if either is retuned.
+
+/// How much larger a rail glyph is than a sidebar one.
+const ACTION: f32 = 1.35;
+
+/// A point offset from `c`, in envelope units scaled to the rail.
+fn a(c: Pos2, dx: f32, dy: f32) -> Pos2 {
+    pos2(c.x + dx * ACTION, c.y + dy * ACTION)
+}
 
 fn copy_pages(painter: &Painter, c: Pos2, stroke: Stroke) {
     // Two offset sheets: the universal "there are now two of these".
-    let back = Rect::from_min_max(pos2(c.x - 6.5, c.y - 7.0), pos2(c.x + 2.0, c.y + 2.5));
-    let front = Rect::from_min_max(pos2(c.x - 2.0, c.y - 2.5), pos2(c.x + 6.5, c.y + 7.0));
-    painter.rect_stroke(back, 2.0, stroke, egui::StrokeKind::Inside);
-    painter.rect_stroke(front, 2.0, stroke, egui::StrokeKind::Inside);
+    painter.rect_stroke(
+        Rect::from_min_max(a(c, -6.5, -7.0), a(c, 2.0, 2.5)),
+        2.0 * ACTION,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_stroke(
+        Rect::from_min_max(a(c, -2.0, -2.5), a(c, 6.5, 7.0)),
+        2.0 * ACTION,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn cut_scissors(painter: &Painter, c: Pos2, stroke: Stroke) {
     // Two blades crossing above two rings.
-    painter.line_segment([pos2(c.x - 5.0, c.y - 7.0), pos2(c.x + 4.0, c.y + 3.0)], stroke);
-    painter.line_segment([pos2(c.x + 5.0, c.y - 7.0), pos2(c.x - 4.0, c.y + 3.0)], stroke);
-    painter.circle_stroke(pos2(c.x - 4.5, c.y + 5.0), 2.4, stroke);
-    painter.circle_stroke(pos2(c.x + 4.5, c.y + 5.0), 2.4, stroke);
+    painter.line_segment([a(c, -5.0, -7.0), a(c, 4.0, 3.0)], stroke);
+    painter.line_segment([a(c, 5.0, -7.0), a(c, -4.0, 3.0)], stroke);
+    painter.circle_stroke(a(c, -4.5, 5.0), 2.4 * ACTION, stroke);
+    painter.circle_stroke(a(c, 4.5, 5.0), 2.4 * ACTION, stroke);
 }
 
 fn paste_board(painter: &Painter, c: Pos2, stroke: Stroke) {
     // A clipboard: the board, and the clip on top.
-    let body = Rect::from_min_max(pos2(c.x - 6.0, c.y - 4.5), pos2(c.x + 6.0, c.y + 7.0));
-    painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
-    let clip = Rect::from_min_max(pos2(c.x - 3.0, c.y - 7.5), pos2(c.x + 3.0, c.y - 3.0));
-    painter.rect_stroke(clip, 1.5, stroke, egui::StrokeKind::Inside);
+    painter.rect_stroke(
+        Rect::from_min_max(a(c, -6.0, -4.5), a(c, 6.0, 7.0)),
+        2.0 * ACTION,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_stroke(
+        Rect::from_min_max(a(c, -3.0, -7.5), a(c, 3.0, -3.0)),
+        1.5 * ACTION,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn trash(painter: &Painter, c: Pos2, stroke: Stroke) {
     // Lid, then a bin that tapers — a plain rectangle reads as a box.
-    painter.line_segment([pos2(c.x - 6.5, c.y - 4.5), pos2(c.x + 6.5, c.y - 4.5)], stroke);
-    painter.line_segment([pos2(c.x - 2.5, c.y - 4.5), pos2(c.x - 2.5, c.y - 6.5)], stroke);
-    painter.line_segment([pos2(c.x - 2.5, c.y - 6.5), pos2(c.x + 2.5, c.y - 6.5)], stroke);
-    painter.line_segment([pos2(c.x + 2.5, c.y - 6.5), pos2(c.x + 2.5, c.y - 4.5)], stroke);
+    painter.line_segment([a(c, -6.5, -4.5), a(c, 6.5, -4.5)], stroke);
     painter.add(Shape::line(
-        vec![
-            pos2(c.x - 5.0, c.y - 2.5),
-            pos2(c.x - 4.0, c.y + 7.0),
-            pos2(c.x + 4.0, c.y + 7.0),
-            pos2(c.x + 5.0, c.y - 2.5),
-        ],
+        vec![a(c, -2.5, -4.5), a(c, -2.5, -6.5), a(c, 2.5, -6.5), a(c, 2.5, -4.5)],
+        stroke,
+    ));
+    painter.add(Shape::line(
+        vec![a(c, -5.0, -2.5), a(c, -4.0, 7.0), a(c, 4.0, 7.0), a(c, 5.0, -2.5)],
         stroke,
     ));
 }
@@ -181,64 +206,56 @@ fn pencil(painter: &Painter, c: Pos2, stroke: Stroke) {
     // A nib on a shaft, at the usual 45 degrees.
     painter.add(Shape::closed_line(
         vec![
-            pos2(c.x - 7.0, c.y + 7.0),
-            pos2(c.x - 5.0, c.y + 2.0),
-            pos2(c.x + 4.0, c.y - 7.0),
-            pos2(c.x + 7.0, c.y - 4.0),
-            pos2(c.x - 2.0, c.y + 5.0),
+            a(c, -7.0, 7.0),
+            a(c, -5.0, 2.0),
+            a(c, 4.0, -7.0),
+            a(c, 7.0, -4.0),
+            a(c, -2.0, 5.0),
         ],
         stroke,
     ));
 }
 
 fn folder_plus(painter: &Painter, c: Pos2, stroke: Stroke) {
-    folder(painter, pos2(c.x, c.y - 0.5), stroke);
-    // The cross sits over the body rather than beside it: at 16px a glyph with
-    // something appended alongside is two smudges instead of one mark.
-    painter.line_segment([pos2(c.x + 0.5, c.y - 1.0), pos2(c.x + 0.5, c.y + 3.5)], stroke);
-    painter.line_segment([pos2(c.x - 1.75, c.y + 1.25), pos2(c.x + 2.75, c.y + 1.25)], stroke);
+    // The folder body, at the rail's scale rather than the sidebar's.
+    painter.rect_stroke(
+        Rect::from_min_max(a(c, -7.0, -3.5), a(c, 7.0, 6.5)),
+        2.5 * ACTION,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    painter.add(Shape::line(
+        vec![a(c, -7.0, -3.5), a(c, -3.5, -6.0), a(c, -0.5, -6.0), a(c, 1.5, -3.5)],
+        stroke,
+    ));
+    // The cross sits over the body rather than beside it: at this size a glyph
+    // with something appended alongside is two smudges instead of one mark.
+    painter.line_segment([a(c, 0.0, -0.5), a(c, 0.0, 4.0)], stroke);
+    painter.line_segment([a(c, -2.25, 1.75), a(c, 2.25, 1.75)], stroke);
 }
 
 fn extract(painter: &Painter, c: Pos2, stroke: Stroke) {
     // An arrow coming down out of a tray: unpacking, not downloading.
-    painter.line_segment([pos2(c.x, c.y - 7.0), pos2(c.x, c.y + 1.0)], stroke);
+    painter.line_segment([a(c, 0.0, -7.0), a(c, 0.0, 1.0)], stroke);
     painter.add(Shape::line(
-        vec![
-            pos2(c.x - 3.0, c.y - 2.0),
-            pos2(c.x, c.y + 1.0),
-            pos2(c.x + 3.0, c.y - 2.0),
-        ],
+        vec![a(c, -3.0, -2.0), a(c, 0.0, 1.0), a(c, 3.0, -2.0)],
         stroke,
     ));
     painter.add(Shape::line(
-        vec![
-            pos2(c.x - 6.5, c.y + 3.0),
-            pos2(c.x - 6.5, c.y + 7.0),
-            pos2(c.x + 6.5, c.y + 7.0),
-            pos2(c.x + 6.5, c.y + 3.0),
-        ],
+        vec![a(c, -6.5, 3.0), a(c, -6.5, 7.0), a(c, 6.5, 7.0), a(c, 6.5, 3.0)],
         stroke,
     ));
 }
 
 fn compress(painter: &Painter, c: Pos2, stroke: Stroke) {
     // The same tray with the arrow going in: packing.
-    painter.line_segment([pos2(c.x, c.y - 7.0), pos2(c.x, c.y + 1.0)], stroke);
+    painter.line_segment([a(c, 0.0, -7.0), a(c, 0.0, 1.0)], stroke);
     painter.add(Shape::line(
-        vec![
-            pos2(c.x - 3.0, c.y - 4.0),
-            pos2(c.x, c.y - 7.0),
-            pos2(c.x + 3.0, c.y - 4.0),
-        ],
+        vec![a(c, -3.0, -4.0), a(c, 0.0, -7.0), a(c, 3.0, -4.0)],
         stroke,
     ));
     painter.add(Shape::line(
-        vec![
-            pos2(c.x - 6.5, c.y + 3.0),
-            pos2(c.x - 6.5, c.y + 7.0),
-            pos2(c.x + 6.5, c.y + 7.0),
-            pos2(c.x + 6.5, c.y + 3.0),
-        ],
+        vec![a(c, -6.5, 3.0), a(c, -6.5, 7.0), a(c, 6.5, 7.0), a(c, 6.5, 3.0)],
         stroke,
     ));
 }

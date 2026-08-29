@@ -31,8 +31,11 @@ use neutron_ui::theme::{self, Palette};
 /// Width of the strip, including its padding.
 pub const WIDTH: f32 = 64.0;
 
-/// Height of one button: glyph, then its label.
-const ITEM: f32 = 40.0;
+/// Height of one button: glyph, then its label, with room to breathe.
+const ITEM: f32 = 52.0;
+
+/// Space between buttons within a group.
+const SPACING: f32 = 4.0;
 
 /// What the rail is asking for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,18 +110,21 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
     // A whisper of a gradient down the strip, so the rail reads as a distinct
     // surface from the sidebar beside it without needing a heavier fill or a
     // second border to say so.
-    theme::vertical_wash(ui.painter(), full.expand(12.0), p);
+    // The card, not an expanded copy of it: anything painted outside the
+    // frame lands on the ground as a band down each side, and squares off the
+    // corners on the way.
+    theme::vertical_wash(ui.painter(), full, theme::RADIUS_CARD as f32, p);
 
     let mut y = full.top();
 
     for entry in items() {
         let Some(item) = entry else {
-            y += 12.0;
+            y += 14.0;
             continue;
         };
 
         let rect = Rect::from_min_size(pos2(full.left(), y), vec2(full.width(), ITEM));
-        y += ITEM + 1.0;
+        y += ITEM + SPACING;
 
         let enabled = match item.needs {
             Needs::Nothing => true,
@@ -130,8 +136,8 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
 
         if enabled && response.hovered() {
             ui.painter().rect_filled(
-                rect.shrink2(vec2(3.0, 1.0)),
-                theme::RADIUS_SMALL,
+                rect.shrink2(vec2(6.0, 1.0)),
+                theme::RADIUS_CONTROL,
                 p.hover,
             );
         }
@@ -149,20 +155,20 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
 
         icons::draw(
             ui.painter(),
-            pos2(rect.center().x, rect.top() + 13.0),
+            pos2(rect.center().x, rect.top() + 17.0),
             item.glyph,
             glyph_colour,
         );
 
         let galley = ui.painter().layout_no_wrap(
             item.label.to_owned(),
-            egui::FontId::proportional(9.0),
+            egui::FontId::proportional(9.5),
             text_colour,
         );
         ui.painter().galley(
             pos2(
-                rect.center().x - galley.size().x / 2.0,
-                rect.top() + 24.0,
+                (rect.center().x - galley.size().x / 2.0).round(),
+                rect.top() + 32.0,
             ),
             galley,
             text_colour,

@@ -43,6 +43,13 @@ pub struct Pathless {
 pub fn pathless(id: &NodeId, sites: &Sites) -> Option<Pathless> {
     match id {
         NodeId::Path(_) => None,
+        // The dashboard has no files in it at all, so an operation that wants
+        // one is not "not yet" — it is a category error, and the sentence says
+        // so without promising anything.
+        NodeId::Home => Some(Pathless {
+            name: "the dashboard".to_owned(),
+            later: false,
+        }),
         NodeId::Remote { site, .. } => Some(Pathless {
             // A site that is not in the list is one whose entry was removed
             // while a tab still showed it. Naming it "that server" is better

@@ -546,11 +546,11 @@ impl NeutronApp {
             .and_then(|json| serde_json::from_str(&json).ok())
             .and_then(|saved| Workspace::restore(&saved));
 
-        restored.unwrap_or_else(|| {
-            Workspace::new(NodeId::Path(
-                neutron_shell::places::home().unwrap_or_else(|| PathBuf::from(r"C:\")),
-            ))
-        })
+        // A window with nothing restored opens on the dashboard: on launch
+        // the question is where to go, not what is in one particular folder. A
+        // path on the command line still wins, because that is someone saying
+        // exactly where they want to be.
+        restored.unwrap_or_else(|| Workspace::new(NodeId::Home))
     }
 
     fn palette(&self) -> Palette {
@@ -3661,6 +3661,10 @@ impl NeutronApp {
             let idx = tab.selection.cursor().filter(|&i| i < tab.list.len())?;
             let name = tab.list.name(idx);
             let source = match tab.location() {
+                // Nothing is ever selected on the dashboard, so this is
+                // unreachable in practice — listed rather than wildcarded so a
+                // future location has to decide for itself.
+                NodeId::Home => return None,
                 NodeId::Path(dir) => crate::preview::Source::Local(dir.join(name)),
                 // A server's rows are addressed by joining a name to a POSIX
                 // path. The name went through `safe_name` on the way into the
@@ -3909,6 +3913,16 @@ impl NeutronApp {
             .auto_shrink([false, false])
             .id_salt("sidebar_scroll")
             .show(ui, |ui| {
+                let dashboard = neutron_core::places::Place {
+                    name: "Dashboard".to_owned(),
+                    id: NodeId::Home,
+                    kind: neutron_core::places::PlaceKind::KnownFolder,
+                    capacity: None,
+                };
+                if sidebar::row(ui, p, &dashboard, current) {
+                    actions.push(Action::Navigate(NodeId::Home));
+                }
+
                 sidebar::section(ui, p, "Quick access");
                 for place in &self.known_folders {
                     if sidebar::row(ui, p, place, current) {
@@ -4210,6 +4224,17 @@ impl NeutronApp {
                 ui.colored_label(p.danger, "Could not open this location");
                 ui.colored_label(p.text_muted, e.as_str());
             });
+            return;
+        }
+
+        // The dashboard is not a listing, so it does not go through the list
+        // widget at all. It draws from what the sidebar scan already found.
+        if matches!(tab.location(), NodeId::Home) {
+            if let Some(target) =
+                crate::dashboard::show(ui, p, &self.drives, &self.known_folders)
+            {
+                actions.push(Action::Navigate(target));
+            }
             return;
         }
 

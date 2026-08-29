@@ -453,6 +453,9 @@ pub struct PersistedPane {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum PersistedLocation {
+    /// The dashboard. Restorable and cheap: it names nothing that can go
+    /// missing between sessions.
+    Home,
     Path(String),
     Shell { parsing: String, display: String },
     /// A folder on a saved server. Restorable because it is named by the site's
@@ -463,6 +466,7 @@ pub enum PersistedLocation {
 impl PersistedLocation {
     pub fn from_node(id: &NodeId) -> Option<Self> {
         match id {
+            NodeId::Home => Some(PersistedLocation::Home),
             NodeId::Path(p) => Some(PersistedLocation::Path(p.to_string_lossy().into_owned())),
             NodeId::Shell { parsing, display } => Some(PersistedLocation::Shell {
                 parsing: parsing.to_string(),
@@ -480,6 +484,7 @@ impl PersistedLocation {
 
     pub fn to_node(&self) -> NodeId {
         match self {
+            PersistedLocation::Home => NodeId::Home,
             PersistedLocation::Path(p) => NodeId::Path(PathBuf::from(p)),
             PersistedLocation::Shell { parsing, display } => {
                 NodeId::shell(parsing.as_str(), display.as_str())

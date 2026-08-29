@@ -276,7 +276,7 @@ fn storage_panel(ui: &Ui, p: &Palette, rect: Rect, drives: &[Place]) {
 /// whereas these are volumes of one machine and reading them as a single
 /// quantity split into parts is more truthful — and it keeps the sidebar from
 /// becoming the most colourful thing on screen.
-fn segment_colour(p: &Palette, index: usize, count: usize) -> Color32 {
+pub fn segment_colour(p: &Palette, index: usize, count: usize) -> Color32 {
     if count <= 1 {
         return p.accent;
     }

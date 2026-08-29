@@ -325,7 +325,17 @@ pub fn card(p: &Palette) -> egui::Frame {
 ///
 /// The tint leans on the accent rather than on grey, because a grey wash on a
 /// near-white card reads as dirt; a trace of the brand hue reads as a surface.
-pub fn vertical_wash(painter: &egui::Painter, rect: egui::Rect, p: &Palette) {
+///
+/// # Staying inside the card
+///
+/// `rect` is the card, and the mesh is clipped to it inset by `radius` at the
+/// top and bottom. A rectangular mesh cannot have rounded corners, so without
+/// the inset it paints over them and squares the card off — and any overshoot
+/// beyond the card lands on the ground as a band down each side. The ramp is
+/// still computed across the whole card, so what shows in the clipped band is
+/// the right part of it.
+pub fn vertical_wash(painter: &egui::Painter, rect: egui::Rect, radius: f32, p: &Palette) {
+    let painter = painter.with_clip_rect(rect.shrink2(egui::vec2(0.0, radius)));
     let top = p.card;
     // Toward the accent, but barely: 6% at the bottom edge.
     let mix = |a: u8, b: u8| (a as f32 * 0.94 + b as f32 * 0.06).round() as u8;
