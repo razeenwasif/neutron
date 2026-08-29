@@ -174,7 +174,7 @@ thousands of them that nobody asked for.
 
 ## Targets vs. reality
 
-Last re-measured 2026-08-29 at `9cd35af`; see that session below for method.
+Last re-measured 2026-08-29 at `a710f5d`; see the sessions below for method.
 
 | Metric | Target | Actual | Status |
 |---|---:|---:|---|
@@ -183,8 +183,8 @@ Last re-measured 2026-08-29 at `9cd35af`; see that session below for method.
 | Cold start, repeat launch | <100 ms | 410 ms | ❌ **not achievable as architected** (403 ms of it is GPU bring-up) |
 | Cold start, first launch after a build | <100 ms | 801 ms | ❌ same cause, cold driver and shader cache |
 | Idle memory, private bytes | <60 MB | 488 MB | ❌ **not achievable as architected** |
-| Idle CPU, focused | ~0% | 1.69% | ➖ 10 fps for a drifting ground |
-| Idle CPU, unfocused | ~0% | 0.52% | ✅ |
+| Idle CPU, focused | ~0% | 0.26% | ✅ the ground stopped moving — see below |
+| Idle CPU, unfocused | ~0% | 0.00% | ✅ |
 | Binary size | ~15 MB | 19.0 MiB | ❌ the server clients; see `PROGRESS.md` §13 |
 
 ### The two failures are the same failure
@@ -788,3 +788,42 @@ disk between runs.
 > `Get-Process neutron | Stop-Process -Force`. This used to bite via the WSL
 > wrapper, where Ctrl-C killed the Linux side and left the Windows process
 > running; it still bites whenever a measurement run is interrupted.
+
+---
+
+## The redesign (2026-08-29, `a710f5d`)
+
+The ground stopped moving. Everything else here is unchanged, and that is the
+finding: a visual redesign that replaced the whole palette, the window frame and
+the opening screen moved exactly one number.
+
+| Metric | Before | After |
+|---|---:|---:|
+| Idle CPU, focused | 1.69% | **0.26%** |
+| Idle CPU, unfocused | 0.52% | **0.00%** |
+| Cold start, repeat launch | 410 ms | 416 ms |
+| Idle memory, private bytes | 488 MB | 499 MB |
+| Binary | 19.01 MiB | 19.02 MiB |
+| Threads | 70 | 54 |
+
+**Idle CPU is the whole story.** Two colour fields drifting on 41- and
+57-second loops needed `request_repaint_after` running forever, so that a soft
+gradient could move by under a pixel per frame. With opaque cards there is
+nothing for them to refract through, so they went, and with them the only
+continuous repaint in the program. 0.26% is the cost of an application that is
+awake but not doing anything; the earlier static-ground measurement of 0.3%
+agrees.
+
+`ambient::paint` no longer takes a time parameter. That is deliberate rather
+than tidy: a signature that accepts a clock invites something to start moving
+again, and this number is the reason not to.
+
+**Cold start, memory and the binary did not move.** All three are within
+run-to-run noise of the session before. The redesign added a dashboard, an
+action rail, a window frame, pinning and eight glyphs, and no new dependency —
+which is what the binary figure says.
+
+**Method,** unchanged from the session above and worth repeating because one of
+these readings is easy to get wrong: sample `Get-Process neutron` over 12
+seconds after a settle, and confirm the foreground window with
+`GetForegroundWindow` at *both* ends before believing a "focused" number.

@@ -1,45 +1,64 @@
 # Neutron Progress
 
-## UI Redesign: Depth Through Translucency (Aero-Style Glassmorphism)
+## UI: Light Surfaces On A Still Ground
+
+> **Superseded, 2026-08-29.** Sections 1–3 used to describe an Aero-style
+> glassmorphism pass: a near-black violet ground, two colour fields drifting on
+> 41- and 57-second loops, and translucent panels refracting them. None of that
+> is in the program any more — see section 20 for what replaced it and why. The
+> headings below are the current design.
 
 ### Status: Complete & Verified
 
 #### 1. Visual Architecture
-- **3-Layer Depth Model**:
-  1. **Ground**: Near-black deep violet `#0c0714` / `#05020a` with radial overhead light source.
-  2. **Ambient Drifting Colour Fields**: Two large slow-drifting colour fields on sinusoidal ease-in-out loops, each near window-sized so what shows is the gradient where they overlap rather than a recognisable circle:
-     - **Field A (41s loop)**: Vibrant purple (`#9333ea`), top-left, drifting `+7vw, +6vh`, scaling `1.0 → 1.10`.
-     - **Field B (57s loop)**: Electric indigo / violet (`#6366f1`), bottom-right, drifting `-8vw, -5vh`, scaling `1.08 → 0.98`.
-     - Periods share no common factor, so the pair never settles into a visible repeat. Each field is a three-layer gaussian falloff fan — two layers still left a discernible rim at this size.
-  3. **Translucent Glass Panels**: Floating glass cards at `rgba(36, 27, 56, 0.44)` in dark mode and `rgba(252, 250, 255, 0.62)` in light, with soft glass shadow, subtle glass stroke, a top-edge highlight that fades down the upper sides, and a darker bottom edge so the panel has thickness.
-     - The dark fill is *lighter* than the ground, not darker. At this transparency a near-ground fill composites to the same colour and the panel edge disappears in the unlit corners.
+- **Two layers, and nothing moves**:
+  1. **Ground**: near-white `#eef0f4` / `#e6e9ef` with a wide overhead wash, plus
+     two *static* colour washes placed far off-centre so neither reads as a
+     circle. Held under alpha 40 by a test: a wash heavy enough to notice is
+     heavy enough to tint a card sitting on it.
+  2. **Opaque cards**: the sidebar, the action rail and each pane are solid
+     white with a hairline border, a 14px radius and a shadow at alpha 18.
+- The cards being opaque is what makes the hairline enough. It is also why every
+  contrast figure below is a single number rather than a range — a card is the
+  same colour wherever it sits.
+- **Light is the default.** Dark is the same design with the values inverted
+  around the same structure, not a second look.
 
 #### 2. Disciplined Purple Palette & WCAG AA Compliance
-- Primary purple brand ramp (`#c084fc` / `#a855f7` / `#9333ea`).
-- Strictly reserved amber (`#fbbf24`) and rose (`#fb7185`) accents for warning and error states.
-- Dark theme set as default (`ThemeMode::Dark`).
-- All text surfaces tested and verified to meet WCAG AA contrast (>= 4.5:1 for primary text, >= 3.0:1 for muted text).
-- Contrast is measured at **both** extremes of the lit ground — a card over the deepest unlit corner *and* over the brightest colour field at its peak. Checking only the deep ground is the best case for light text on a dark card, and would pass however washed-out the lit areas became.
+- One accent, `#7250e6`, with hover and pressed steps.
+- Reserved amber and rose for warning and error states.
+- All text surfaces meet WCAG AA (>= 4.5:1 primary, >= 3.0:1 muted) against
+  every surface they can land on.
+- The contrast tests survived the entire palette being replaced, because they
+  were written against the **roles** — text on a card, muted on an inset, accent
+  on a selected row — rather than against the colours. That is the whole
+  argument for testing a palette this way.
+- One value differs from the design draft deliberately: `text_faint` is
+  `#777888` rather than the mockup's `#9a9bab`, which measured 2.9:1 on white
+  and would have been the only token below AA.
 
 #### 3. Component Refinements
-- **Sidebar**:
-  - Wordmark brand icon with purple gradient glow and glass highlight.
-  - Active navigation item with glowing vertical accent indicator on the left rim (matching Aero's `.nav-item.active::before`).
-  - Segmented storage capacity bar in violet-to-purple ramp.
-- **Panes & Tab Strip**:
-  - Translucent glass card background refracts moving orbs underneath.
-  - Inset top-edge glass refraction highlight.
-  - Active tab indicator underline in purple accent.
-  - Focus is carried by the active tab's accent underline. The pane itself keeps one hairline in both states: an accent ring plus a glow around the largest element on screen read as a selection box, and framed the whole window when only one pane was open.
-- **Header & Filter Pill**:
-  - Filter search pill with purple focus ring and glowing search glyph when active.
-  - Breadcrumbs with responsive ellipsis truncation.
-- **Finder & Command Palette Overlay**:
-  - Elevated floating card with glass highlight and deep shadow.
-  - Purple mode chip and fuzzy match character highlighting.
-- **File List**:
-  - Selection row pill with purple highlight and border.
-  - Focus cursor indicator.
+- **Sidebar**: brand mark on a purple gradient chip; small-caps section labels;
+  the active row takes a soft accent fill with accent glyph and label, and its
+  tick sits flush against the card's inner edge rather than inset into the row.
+  Segmented storage bar in a violet-to-purple ramp.
+- **Action rail**: a fixed 64px strip of verbs between the sidebar and the
+  panes, grouped by rhythm rather than by rules, on a faint vertical wash. See
+  section 20.
+- **Panes & tab strip**: opaque card, active tab underlined in the accent. Focus
+  is carried by that underline; an accent ring around the largest element on
+  screen read as a selection box and framed the whole window when only one pane
+  was open.
+- **Header**: a chevron breadcrumb, and under it the location's own name set
+  large. Not redundant — one is a path you navigate, the other is a label that
+  says at a glance which pane you are looking at.
+- **File list**: selection is a tint plus a 2.5px left edge rather than a
+  bordered pill, and filenames carry their extension in the faint tone.
+- **Grid**: selection adds an accent border and a filled accent disc with a tick
+  in the tile's top-right. A tile has no left edge to carry an accent the way a
+  row does.
+- **Window frame**: Neutron's own — title bar, drag, three buttons, and the
+  eight resize regions an undecorated window has to put back.
 
 #### 4. Grid View
 - `Ctrl+Shift+L`, a header toggle, and a command palette entry switch between list and grid.
@@ -264,16 +283,13 @@ up on.
     libraries out. How much that saved cannot be measured here: the commit
     before it *cannot be built on this machine*, which is the finding that led
     to the change.
-- The drifting fields require a continuous repaint. When this section was
-  written the rate was 30fps and the cost **8.4%** of a core (**17.7%** at
-  60fps), against **0.3%** for a static ground.
-  - **That is no longer the setting.** `ambient_interval` has returned 100ms —
-    10fps focused, 2fps unfocused — since *Stop repainting the ground faster
-    than it moves*, and the fields drift under a pixel per frame at that rate.
-    Measured 2026-08-29: **1.69%** focused, **0.52%** unfocused. This bullet
-    went stale the moment that commit landed and stayed wrong for four
-    milestones; `docs/perf.md` had it right the whole time.
-
+- **The drifting ground cost 1.69% of a core, and no longer exists.** This
+  bullet has now been wrong twice, which is worth leaving on the record. It was
+  written at 30fps (**8.4%**, or **17.7%** at 60fps) and stayed that way through
+  four milestones after the rate dropped to 10fps (**1.69%** focused, **0.52%**
+  unfocused). Section 20 removed the fields altogether: **0.26%** focused,
+  **0.00%** unfocused. `docs/perf.md` had the intermediate figure right the
+  whole time, which is the argument for one file owning the measurements.
 
 #### 14. Three Things That Were Not Finished
 
@@ -533,7 +549,7 @@ Not changed: `IPreviewHandler` is still absent, for the reasons in section 7.
   filename (`cloud.rs`). The second is the security-relevant one — its cases are
   traversal, the NTFS stream colon, bare dots, control characters, device names,
   trailing dots and a 5,000-character name.
-- Full suite on the Windows target: **629 tests**, and clippy clean under
+- Full suite on the Windows target: **658 tests**, and clippy clean under
   `--all-targets -- -D warnings`, which is what CI runs. The FTP and SFTP
   suites run there — the fake servers are ordinary std sockets — but the
   plugin suite does not; see above.
@@ -587,3 +603,87 @@ a reason, because those tests are about what a preview *is* and belong beside
 that code rather than after several hundred lines of egui calls they say nothing
 about. "Clippy clean" was true of the default invocation and is now true of the
 one CI runs.
+
+#### 20. The Redesign
+
+Two concept images in `assets/` — a light cloud-storage dashboard and a light
+file explorer — share a language: near-white surfaces, large radii, hairline
+borders instead of shadows, a page title above a chevron breadcrumb, small-caps
+section labels, and selection carried by a coloured badge. This is that language
+applied to what Neutron actually shows.
+
+The visible result is in sections 1–3. What follows is the part worth keeping:
+the decisions, and the four bugs that only appeared by using it.
+
+**The drifting ground is gone, and both reasons it existed went with it.** The
+colour fields were there to give translucent glass something to refract. The
+cards are opaque now, so there is nothing to refract *through*; and on a light
+palette a moving ground stops reading as depth and starts reading as a smudge
+travelling under the text.
+
+It was also the only continuous repaint in the program. Measured on the same
+machine: **1.69%** of a core with the drift, **0.26%** without. `ambient::paint`
+takes no clock parameter any more, deliberately — a signature that accepts one
+invites something to start moving again.
+
+**The rail is against the project's own pitch, and stays.** The README lists
+"mouse-centric" as *Explorer's* problem, and every verb on the rail already has
+a keystroke and a palette entry. But a palette only helps someone who already
+knows the command exists, and a visible row of verbs is how a person finds out
+what a file manager can do. Each row's hover text names its shortcut, so the
+rail teaches its own way out. It dims on the *selection*, never on whether the
+location can be written to: those go through the same guard as the keyboard and
+answer by naming the place, and a rail that silently greys itself out in a zip
+teaches nothing.
+
+**The dashboard is a location, not a mode.** `NodeId::Home` is a variant rather
+than a flag on a path, because it is genuinely a different kind of place:
+nothing to enumerate, no parent, nothing in it to rename. The compiler found
+every site that had to decide, which was five — most matches already had the
+catch-all the three virtual variants need. It draws only what the sidebar scan
+already found, so it starts no work of its own and never waits on a sleeping
+disk.
+
+**Pins are a file, not session state.** The saved workspace already remembers
+which folders were *open*. A pin is one you go back to whether or not it was
+open when you last closed the window, so keeping them in the session would lose
+them the first time a tab was closed.
+
+**The icon is generated, not rasterised.** There is no SVG rasteriser among the
+build requirements, and rendering each `.ico` size from the geometry beats
+downscaling one bitmap — 16px is where an icon is judged and it fails first at
+the corners. Worth recording separately: the documented way to rebuild it was
+`convert -background none …`, and on Windows a bare `convert` resolves to
+`C:\Windows\System32\convert.exe`, which converts a FAT volume to NTFS. The
+instructions named a filesystem tool.
+
+##### Four bugs that only showed up by using it
+
+- **A wash painted outside its card.** `vertical_wash` was drawing
+  `full.expand(12.0)` — twelve pixels beyond the frame on every side. One cause,
+  three symptoms: it squared off the rounded corners, left a card-coloured band
+  down each side, and made correctly-centred glyphs look off-centre against the
+  wider painted band. A rectangular mesh cannot have rounded corners, so it is
+  clipped to the card and inset by the radius.
+- **egui's automatic spacing, twice.** `item_spacing.x` is inserted between
+  widgets whether or not you are also spacing them by hand. In the tile grid
+  that made every tile cost `width + 8 + 12` and pushed the last one in each row
+  off the end; in the dashboard's centring it landed entirely on the left and
+  made that gap wider than the right by exactly one unit. The second instance
+  should have been caught when the first was fixed.
+- **Two bindings for one key.** `(D, TogglePin)` and `(D, ToggleTheme)` were
+  both in the table, so `Ctrl+Shift+D` pinned *and* flipped the theme. One
+  binding chosen by Shift, the way `Ctrl+F` and `Ctrl+P` already were.
+- **A menu row that was never written.** Right-clicking to pin did nothing
+  because there was no such item — the keystroke and the palette entry existed
+  and the menu had been forgotten.
+
+##### Cost
+
+- Idle CPU **1.69% → 0.26%** of one core focused, **0.52% → 0.00%**
+  unfocused. Both sampled over 12s with the foreground window confirmed at
+  each end, because that is the reading that is easy to get wrong.
+- Binary **19.02 MiB**, unchanged within measurement noise: the redesign added
+  code but no dependency.
+- Cold start and memory unchanged at ~416ms and ~499 MB private, both of which
+  are GPU bring-up and neither of which this touched.

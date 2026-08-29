@@ -16,6 +16,10 @@ view; a preview pane; listings that update themselves; zip and tar archives;
 plugins as separate processes; FTP, FTPS and SFTP servers; Google Drive over the
 API; and one status line that says when any of it fails.
 
+Redesigned throughout: light by default, opaque cards on a still ground, a fixed
+action rail, Neutron's own window frame, and a dashboard to open on. See
+[Design](#design).
+
 A 100k-entry folder opens in 52ms and scrolls at 0.21ms per frame.
 
 ---
@@ -78,6 +82,10 @@ that reason.
 ```
 crates/
   neutron-app/      window, event loop, tabs, panes         (bin: neutron)
+     chrome.rs      the title bar, its buttons, and the resize edges
+     rail.rs        the fixed strip of verbs
+     dashboard.rs   what a window opens on
+     pins.rs        folders pinned to Quick access
   neutron-ui/       theme, ambient layer, virtualized list, formatting
   neutron-core/     domain types, sorting, history, traits  ← no Win32, tests on Linux
   neutron-fuzzy/    fzf-style matching with highlight spans ← no Win32, tests on Linux
@@ -469,7 +477,8 @@ do not.
 | *right-click* | The shell's own menu, drawn in Neutron's glass |
 | `F5`, `Ctrl+R` | Refresh |
 | `Esc` | Clear selection |
-| `Ctrl+D` | Toggle dark/light theme |
+| `Ctrl+D` | Toggle light/dark theme |
+| `Ctrl+Shift+D` | Pin or unpin this folder in Quick access |
 
 The filter narrows the listing already in memory — a case-insensitive substring
 over names, applied without touching the disk, so it stays instant while typing
@@ -523,56 +532,76 @@ neutron --bench <path> [runs]      headless enumerate + sort timing
 
 ## Design
 
-**Glass on a lit ground.** Three layers. At the bottom a near-black deep violet
-ground with an overhead light. Above it two large, slowly drifting colour fields
-— a vibrant purple and an electric indigo — each close to window-sized, so what
-you see is the gradient where they overlap rather than a recognisable circle.
-Their loops are 41s and 57s and share no common factor, so the pair never
-settles into a visible repeat. On top of both, the sidebar and each pane are
-translucent glass cards with a top-edge highlight, a darker bottom edge so the
-panel has thickness, and the moving fields refracting underneath.
+**Cards on a still ground.** A near-white ground with a soft overhead wash and
+two static colour washes far off-centre, so the window is tinted rather than
+flat. On it, the sidebar, the action rail and each pane are opaque white cards
+with a hairline border, a large radius and a shadow you have to look for.
+Depth comes from elevation and from that hairline, not from ruled lines through
+the content.
 
-The dark card fill is *lighter* than the ground, not darker. At this
-transparency a near-ground fill composites to the same colour and the card's
-edge disappears in the unlit corners.
+**Light is the default**; dark is `Ctrl+D`, and it is the same design with the
+values inverted rather than a second look — opaque cards, a still ground, one
+accent.
 
-Depth comes from elevation, not from ruled borders. **Dark is the default**;
-light is `Ctrl+D`.
+**Nothing moves.** The ground used to drift: two colour fields on 41- and
+57-second loops, there to give translucent glass something to refract. Both
+premises are gone. The cards are opaque, so there is nothing to refract
+*through*, and on a light palette a moving ground stops reading as depth and
+starts reading as a smudge travelling under the text.
 
-**Colour is scarce, except on the ground.** Every surface that carries content
-is near-neutral. The accent appears in roughly three places — the selected row,
-the focus ring, the active tab's underline — and file icons are grey, not
-purple. Saturated colour spread across every row destroys its usefulness as a
-signal: if everything is purple, purple stops meaning "this is selected". The
-ground is exempt precisely because no text ever lands on it, so colour there
-costs nothing in legibility.
+It was also the only continuous repaint in the program — `request_repaint_after`
+running forever so that a soft gradient could move by under a pixel per frame.
+Measured: **1.69%** of a core with it, **0.26%** without. A file manager that is
+open all day should cost nothing while nobody is touching it, and
+`ambient::paint` now takes no clock at all, because a signature that accepts one
+invites something to start moving again.
 
-**The drifting is paid for, and the bill is known.** A moving ground needs a
-continuous repaint, which is the one piece of this program that costs something
-for decoration alone. The rate is chosen against how fast the ground actually
-moves rather than against what looks like a frame rate: the fields loop over 41
-and 57 seconds, which at their fastest is about 8 px/s across a 1500 px window,
-so **10fps** shifts a soft gradient by under a pixel per frame. Measured cost at
-that rate: **1.69%** of a core focused, **0.52%** unfocused, against **0.3%**
-for a static ground. It ran at 30fps once and that was buying nothing at all.
-A deliberate trade rather than an oversight, which is why the number is written
-down — and re-measured.
+**Colour is scarce.** Every surface that carries content is near-neutral. The
+accent appears in about five places — the selected row's left edge, the active
+sidebar row, the active tab's underline, the focus ring, and the grid's
+selection badge — and file icons are grey, not purple. Saturated colour spread
+across every row destroys its usefulness as a signal: if everything is purple,
+purple stops meaning "this is selected".
+
+**The location is named twice, on purpose.** A chevron breadcrumb you can
+navigate, and under it the folder's own name set large. They are not redundant:
+one is a path, the other is a label that says at a glance which pane you are
+looking at. Both reference designs lead their content area this way.
+
+**A filename is two things.** The stem carries the text colour and the
+extension is dimmed. In a folder of forty photographs the extension is the same
+forty times and costs the same reading weight as the part that differs.
 
 **Navigation lives in the pane, not in a toolbar.** Back/forward/up, the
-breadcrumb, the location title and the filter field are all inside each pane's
-card. With split panes there is no single "current location", so a window-wide
-breadcrumb would have to pick one pane and ignore the other — every control it
-held was really a control on the focused pane wearing a costume.
+breadcrumb, the title and the filter are all inside each pane's card. With split
+panes there is no single "current location", so a window-wide breadcrumb would
+have to pick one pane and ignore the other — every control it held was really a
+control on the focused pane wearing a costume.
+
+**The rail is the exception to keyboard-first.** A fixed strip of verbs beside
+the sidebar: copy, cut, paste, rename, delete, new folder, extract, zip. Every
+one already has a keystroke and a palette entry, and the pitch above lists
+"mouse-centric" as *Explorer's* problem — but a palette only helps someone who
+already knows the command exists, and a visible row of verbs is how you find out
+what a file manager can do. Each row's hover text names its shortcut, so the
+rail teaches its own way out.
+
+**The window frame is Neutron's own.** A system title bar sits above the layout
+as a separate strip in the OS's colours and corner radius, and nothing done
+inside the window makes the two read as one object. The cost is that everything
+the OS gave away for free has to be put back: dragging, the three buttons,
+double-click to maximise, and the resize border, which an undecorated window
+does not have.
 
 All colour lives in `neutron-ui/src/theme.rs`, with tests asserting WCAG contrast
-for text, muted text, accents, and selected rows against every surface they can
-land on — cards composited over the ground, since a translucent card is partly
-made of what it sits on.
+for text, muted text, accents and selected rows against every surface they can
+land on. Those tests survived the whole palette being replaced, because they
+were written against the *roles* rather than the colours.
 
 > Neutron originally asked Windows for a transparent window and used the DWM
 > acrylic backdrop. Measurement showed wgpu cannot supply a surface with a
 > transparent `CompositeAlphaMode` on any backend available here, so the ground
-> and its lights are painted by Neutron itself and the effect is self-contained.
+> is painted by Neutron itself and the effect is self-contained.
 
 ## Performance
 
@@ -587,7 +616,9 @@ See [`docs/perf.md`](docs/perf.md) for measured numbers.
 | Search, first character | <1 ms | 6–9 ms ❌ |
 | Cold start, repeat launch | <100 ms | 410 ms ❌ |
 | Cold start, first after a build | <100 ms | 801 ms ❌ |
-| Idle memory, private bytes | <60 MB | 488 MB ❌ |
+| Idle CPU, focused | ~0% | 0.26% |
+| Idle CPU, unfocused | ~0% | 0.00% |
+| Idle memory, private bytes | <60 MB | 499 MB ❌ |
 | Binary size | ~15 MB | 19.0 MiB ❌ |
 
 Re-measured 2026-08-29; [`docs/perf.md`](docs/perf.md) is the measurement of
