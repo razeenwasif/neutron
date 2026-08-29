@@ -44,13 +44,23 @@ pub fn show(
     p: &Palette,
     volumes: &[Place],
     known: &[Place],
-) -> Option<NodeId> {
+    recent: &[crate::recent::Visit],
+) -> Option<Chosen> {
     egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show(ui, |ui| {
             let full = ui.available_width();
             let content = full.min(MAX_CONTENT);
             let margin = ((full - content) / 2.0).max(0.0);
+
+            // A pane narrower than the cap gets the whole thing, with no
+            // wrapper at all. The centring below forces a column of exactly
+            // `content` wide, and in a split pane that is wider than the pane
+            // — so the tiles were laid out for a width they never had and ran
+            // off the edge. Nothing to centre, nothing to nest.
+            if margin <= 0.5 {
+                return body(ui, p, volumes, known, recent);
+            }
 
             let mut chosen = None;
             ui.horizontal(|ui| {
@@ -61,7 +71,7 @@ pub fn show(
                 ui.add_space(margin);
                 ui.vertical(|ui| {
                     ui.set_width(content);
-                    chosen = body(ui, p, volumes, known);
+                    chosen = body(ui, p, volumes, known, recent);
                 });
             });
             chosen
@@ -69,7 +79,23 @@ pub fn show(
         .inner
 }
 
-fn body(ui: &mut Ui, p: &Palette, volumes: &[Place], known: &[Place]) -> Option<NodeId> {
+/// What the dashboard was asked to do.
+pub enum Chosen {
+    /// Go to a place.
+    Go(NodeId),
+    /// Open a file that was opened before.
+    Open(std::path::PathBuf),
+    /// Drop one from the recent list.
+    Forget(std::path::PathBuf),
+}
+
+fn body(
+    ui: &mut Ui,
+    p: &Palette,
+    volumes: &[Place],
+    known: &[Place],
+    recent: &[crate::recent::Visit],
+) -> Option<Chosen> {
     {
         {
             ui.add_space(4.0);
@@ -83,13 +109,20 @@ fn body(ui: &mut Ui, p: &Palette, volumes: &[Place], known: &[Place]) -> Option<
 
             section(ui, p, "Quick access");
             ui.add_space(8.0);
-            let mut chosen = tiles(ui, p, known);
+            let mut chosen = tiles(ui, p, known).map(Chosen::Go);
+
+            if !recent.is_empty() {
+                ui.add_space(20.0);
+                section(ui, p, "Recent files");
+                ui.add_space(8.0);
+                chosen = recent_rail(ui, p, recent).or(chosen);
+            }
 
             if !volumes.is_empty() {
                 ui.add_space(20.0);
                 section(ui, p, "Drives");
                 ui.add_space(8.0);
-                chosen = tiles(ui, p, volumes).or(chosen);
+                chosen = tiles(ui, p, volumes).map(Chosen::Go).or(chosen);
             }
 
             ui.add_space(16.0);
@@ -217,6 +250,126 @@ fn segmented_bar(ui: &mut Ui, p: &Palette, volumes: &[&Place]) {
         );
         x += width + 1.5;
     }
+}
+
+
+/// Height of a recent-file card.
+const RECENT_H: f32 = 62.0;
+/// Width of one. Fixed rather than shared out, because the rail scrolls: a
+/// card that got narrower as more files arrived would be a list pretending to
+/// be a rail.
+const RECENT_W: f32 = 190.0;
+
+/// Recently opened files, as a horizontally scrolling strip.
+///
+/// A strip rather than a table. The dashboard's other two groups are already
+/// tiles, and a table underneath them would read as a different screen stapled
+/// on. It also fails better: a long list of files pushes the storage card and
+/// the destinations off the top, and those are what the dashboard is *for*.
+fn recent_rail(ui: &mut Ui, p: &Palette, recent: &[crate::recent::Visit]) -> Option<Chosen> {
+    let mut chosen = None;
+
+    egui::ScrollArea::horizontal()
+        .id_salt("recent-rail")
+        .max_height(RECENT_H + 4.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (i, visit) in recent.iter().enumerate() {
+                    if i > 0 {
+                        ui.add_space(GAP);
+                    }
+                    if let Some(hit) = recent_card(ui, p, visit) {
+                        chosen = Some(hit);
+                    }
+                }
+            });
+        });
+
+    chosen
+}
+
+fn recent_card(ui: &mut Ui, p: &Palette, visit: &crate::recent::Visit) -> Option<Chosen> {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(RECENT_W, RECENT_H), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return None;
+    }
+
+    let hovered = response.hovered();
+    ui.painter().rect(
+        rect,
+        RADIUS_CARD as f32,
+        if hovered { p.card_hover } else { p.card },
+        egui::Stroke::new(1.0, if hovered { p.border_strong } else { p.border }),
+        egui::StrokeKind::Inside,
+    );
+
+    let name = visit
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| visit.path.to_string_lossy().into_owned());
+
+    icons::draw(
+        ui.painter(),
+        pos2(rect.left() + 22.0, rect.top() + 22.0),
+        Glyph::File,
+        p.icon,
+    );
+
+    // Clipped through a layout job: a long filename would otherwise run past
+    // the card and over the next one.
+    let text_left = rect.left() + 40.0;
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        name,
+        egui::FontId::proportional(12.5),
+        p.text,
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: rect.right() - text_left - 12.0,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = ui.painter().layout_job(job);
+    ui.painter()
+        .galley(pos2(text_left, rect.top() + 14.0), galley, p.text);
+
+    // The folder, not the whole path: the filename is above it, and what is
+    // actually needed is which of the four places called `notes.txt` this is.
+    let folder = visit
+        .path
+        .parent()
+        .and_then(|d| d.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "—".to_owned());
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        format!("{folder}  ·  {}", neutron_ui::format::timestamp(visit.at)),
+        egui::FontId::proportional(10.5),
+        p.text_faint,
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: rect.right() - text_left - 12.0,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = ui.painter().layout_job(job);
+    ui.painter()
+        .galley(pos2(text_left, rect.top() + 34.0), galley, p.text_faint);
+
+    let response = response.on_hover_text(visit.path.to_string_lossy());
+    if response.clicked() {
+        return Some(Chosen::Open(visit.path.clone()));
+    }
+    // Right-click forgets it. A recent list is the one list here the user never
+    // curates, so the only control over it that matters is taking something
+    // out — a file opened once by accident should not sit there for a week.
+    if response.secondary_clicked() {
+        return Some(Chosen::Forget(visit.path.clone()));
+    }
+    None
 }
 
 /// Quick destinations, as a responsive grid of tiles.

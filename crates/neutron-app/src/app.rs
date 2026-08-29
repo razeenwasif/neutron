@@ -129,6 +129,15 @@ enum Action {
     /// Begin the Google Drive consent flow.
     ConnectDrive,
     TogglePin,
+    /// Open the address bar on the focused pane, or close it if it is open.
+    ToggleAddress,
+    /// Open a file from the dashboard's recent rail.
+    OpenRecent(PathBuf),
+    /// Drop one from the recent list.
+    ForgetRecent(PathBuf),
+    SetAddress(String),
+    SubmitAddress,
+    CancelAddress,
     /// Ask first, then run the boxed action. See [`crate::confirm`] for the
     /// short list of things that earn one.
     Ask(Box<Action>),
@@ -264,6 +273,13 @@ pub struct NeutronApp {
     /// reason about, and the second question is always about something the
     /// first one may be about to change.
     confirm: Option<(crate::confirm::Confirm, Box<Action>)>,
+    /// The pane whose address bar is open, and what has been typed into it.
+    ///
+    /// One at a time, keyed by pane: two panes each showing a path field over
+    /// their breadcrumb would be two answers to "where am I" on screen at once.
+    address: Option<(GroupId, String)>,
+    /// Files opened lately, for the dashboard.
+    recent: crate::recent::Recent,
     cloud: Vec<Place>,
     wsl: Vec<Place>,
     shell_roots: Vec<Place>,
@@ -439,6 +455,14 @@ impl NeutronApp {
         // Pinned folders, for the sidebar. Same shape as the servers below:
         // one small JSON file read once, at construction, before there is a
         // frame to drop.
+        let recent = match crate::recent::load() {
+            Ok(recent) => recent,
+            Err(e) => {
+                tracing::warn!("recent.json: {e}");
+                crate::recent::Recent::default()
+            }
+        };
+
         let pins = match crate::pins::load() {
             Ok(pins) => pins,
             Err(e) => {
@@ -529,6 +553,8 @@ impl NeutronApp {
             tab_target: None,
             snap,
             confirm: None,
+            address: None,
+            recent,
             cloud: Vec::new(),
             wsl: Vec::new(),
             shell_roots: Vec::new(),
@@ -959,6 +985,16 @@ impl NeutronApp {
 
             Action::ConnectDrive => self.connect_drive(),
             Action::TogglePin => self.toggle_pin(),
+            Action::ToggleAddress => self.toggle_address(ctx),
+            Action::OpenRecent(path) => self.open_local(path),
+            Action::ForgetRecent(path) => self.forget_recent(path),
+            Action::SetAddress(text) => {
+                if let Some((_, current)) = self.address.as_mut() {
+                    *current = text;
+                }
+            }
+            Action::SubmitAddress => self.submit_address(),
+            Action::CancelAddress => self.address = None,
             Action::Ask(then) => self.ask(*then),
             Action::SidebarMenu(id, at) => self.sidebar_menu(id, at),
             Action::SignOutDrive => self.sign_out_drive(),
@@ -1149,7 +1185,7 @@ impl NeutronApp {
         if let Some((target, is_path)) = t.list.target(idx) {
             let target = target.to_owned();
             if !kind.is_container() && is_path {
-                self.launch(PathBuf::from(target), neutron_shell::open::Verb::Open);
+                self.open_local(PathBuf::from(target));
                 return;
             }
             let node = if is_path {
@@ -1262,7 +1298,7 @@ impl NeutronApp {
                     .unwrap_or_default();
                 self.navigate(tab, NodeId::shell(path.to_string_lossy().into_owned(), name));
             } else {
-                self.launch(path, neutron_shell::open::Verb::Open);
+                self.open_local(path);
             }
         }
     }
@@ -1881,6 +1917,55 @@ impl NeutronApp {
         }
     }
 
+    /// Drops a file from the recent list.
+    fn forget_recent(&mut self, path: PathBuf) {
+        if !self.recent.forget(&path) {
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        self.notices.info(format!("Removed {name} from Recent files"));
+
+        let recent = self.recent.clone();
+        self.sta.submit(move || {
+            if let Err(e) = crate::recent::save(&recent) {
+                tracing::warn!("could not save recent files: {e}");
+            }
+        });
+    }
+
+    /// Opens a local file and remembers it.
+    ///
+    /// The two call sites are a double-click and the shell's answer about what
+    /// a row leads to. Deliberately not used for a plugin's `open` responses —
+    /// one command can ask for eight, and a recent list flooded by one plugin
+    /// run is no longer a record of what *you* were doing — nor for a file
+    /// fetched from a server, which is a copy under `%TEMP%` that will not be
+    /// there later.
+    fn open_local(&mut self, path: PathBuf) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        if self.recent.record(&path, now) {
+            let recent = self.recent.clone();
+            let notices = self.notice_tx.clone();
+            self.sta.submit(move || {
+                if let Err(e) = crate::recent::save(&recent) {
+                    // A warning, not a notice: failing to remember a file is
+                    // not a failure to open it, and the open is what the user
+                    // asked for.
+                    tracing::warn!("could not save recent files: {e}");
+                    let _ = &notices;
+                }
+            });
+        }
+        self.launch(path, neutron_shell::open::Verb::Open);
+    }
+
     /// Opens `path` with the shell, on an apartment thread.
     ///
     /// Fire and forget. There is nothing useful to wait for — the launched
@@ -1888,6 +1973,9 @@ impl NeutronApp {
     /// association lookup reads the registry, may load a shell extension, and
     /// on a network or cloud path can block for many seconds.
     fn launch(&self, path: PathBuf, verb: neutron_shell::open::Verb) {
+        // Recording happens in `open_local`, not here: `launch` is also how a
+        // fetched *copy* of a remote file is opened, and a path under %TEMP%
+        // is not somewhere anyone can go back to.
         let owner = self.hwnd.unwrap_or(0);
         let notices = self.notice_tx.clone();
         self.sta.submit(move || {
@@ -2320,8 +2408,18 @@ impl NeutronApp {
                 bindings.extend([
                     (egui::Key::A, Action::SelectAll),
                     (egui::Key::H, Action::ToggleHidden),
-                    // Shift+L rather than plain L, which type-ahead owns.
-                    (egui::Key::L, Action::ToggleView),
+                    (
+                        // Ctrl+L is the address bar, as it is in every browser
+                        // and in Explorer. Shift escalates to the view toggle,
+                        // which had the plain binding first only because there
+                        // was nothing else asking for it.
+                        egui::Key::L,
+                        if shift {
+                            Action::ToggleView
+                        } else {
+                            Action::ToggleAddress
+                        },
+                    ),
                     // Filters the current listing. Index-wide search takes
                     // this binding at M4; until then narrowing what is already
                     // on screen is what Ctrl+F can honestly do.
@@ -2514,6 +2612,63 @@ impl NeutronApp {
         self.reload(tab, location);
     }
 
+
+
+    /// Opens the address bar on the focused pane, or closes it.
+    ///
+    /// Opens holding where the pane already is, selected, so `Ctrl+L` followed
+    /// by typing replaces the path rather than appending to it — which is what
+    /// every browser and Explorer do, and what muscle memory expects.
+    fn toggle_address(&mut self, ctx: &egui::Context) {
+        if self.address.is_some() {
+            self.address = None;
+            return;
+        }
+        let Some(group) = self.workspace.focused_group().map(|g| g.id) else {
+            return;
+        };
+        let Some(text) = self
+            .workspace
+            .active_tab()
+            .and_then(|t| crate::address::text_for(t.location()))
+        else {
+            // The dashboard and a Drive folder have no path to put in the
+            // field, and an empty address bar is a worse answer than none.
+            self.notices
+                .info("There is no path here to type over");
+            return;
+        };
+
+        let id = crate::header::address_id(group);
+        ctx.memory_mut(|m| m.request_focus(id));
+        self.address = Some((group, text));
+    }
+
+    /// Goes where the address bar says.
+    fn submit_address(&mut self) {
+        let Some((_, text)) = self.address.take() else {
+            return;
+        };
+        let Some(tab) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let current = self
+            .workspace
+            .tabs
+            .get(&tab)
+            .map(|t| t.location().clone())
+            .unwrap_or(NodeId::Home);
+
+        match crate::address::resolve(&text, &current, neutron_shell::places::home().as_deref()) {
+            Some(target) => self.navigate(tab, target),
+            // Nothing resolvable. Named rather than silent: the commonest cause
+            // is a variable that is not set, and the path the user typed is not
+            // the path an error would otherwise report.
+            None => self
+                .notices
+                .error(format!("Cannot work out where {text:?} is")),
+        }
+    }
 
     /// Runs an action that has already been decided on.
     ///
@@ -4586,6 +4741,14 @@ impl NeutronApp {
             show_hidden: tab.view.show_hidden,
             grid: tab.view.view == neutron_ui::file_list::ViewMode::Grid,
             filter: &tab.view.filter,
+            // Only in the pane it was opened on. A split showing two panes would
+            // otherwise draw the same field over both breadcrumbs, bound to one
+            // text id, and neither would behave.
+            address: self
+                .address
+                .as_ref()
+                .filter(|(g, _)| *g == group_id)
+                .map(|(_, text)| text.as_str()),
             shown,
             total,
         };
@@ -4605,6 +4768,9 @@ impl NeutronApp {
                 header::HeaderAction::ToggleHidden => Action::ToggleHidden,
                 header::HeaderAction::ToggleView => Action::ToggleView,
                 header::HeaderAction::Split(axis) => Action::Split(axis),
+                header::HeaderAction::SetAddress(text) => Action::SetAddress(text),
+                header::HeaderAction::SubmitAddress => Action::SubmitAddress,
+                header::HeaderAction::CancelAddress => Action::CancelAddress,
             });
         }
 
@@ -4666,10 +4832,18 @@ impl NeutronApp {
         // The dashboard is not a listing, so it does not go through the list
         // widget at all. It draws from what the sidebar scan already found.
         if matches!(tab.location(), NodeId::Home) {
-            if let Some(target) =
-                crate::dashboard::show(ui, p, &self.drives, &self.quick_access())
-            {
-                actions.push(Action::Navigate(target));
+            if let Some(hit) = crate::dashboard::show(
+                ui,
+                p,
+                &self.drives,
+                &self.quick_access(),
+                &self.recent.files,
+            ) {
+                actions.push(match hit {
+                    crate::dashboard::Chosen::Go(id) => Action::Navigate(id),
+                    crate::dashboard::Chosen::Open(path) => Action::OpenRecent(path),
+                    crate::dashboard::Chosen::Forget(path) => Action::ForgetRecent(path),
+                });
             }
             return;
         }

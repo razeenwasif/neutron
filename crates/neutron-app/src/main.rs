@@ -18,6 +18,7 @@
 //! deliberately: a single innocent-looking `std::fs::metadata` in a paint
 //! function reintroduces the stall.
 
+mod address;
 mod app;
 mod archive_ops;
 mod bench;
@@ -38,6 +39,7 @@ mod panes;
 mod pins;
 mod place;
 mod rail;
+mod recent;
 mod remote;
 mod plugins;
 mod sidebar;

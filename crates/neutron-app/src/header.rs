@@ -51,6 +51,12 @@ const FILTER_WIDTH: f32 = 180.0;
 #[derive(Debug, Clone, PartialEq)]
 pub enum HeaderAction {
     Back,
+    /// The address field's text changed.
+    SetAddress(String),
+    /// Enter in the address field.
+    SubmitAddress,
+    /// Escape, or a click somewhere else.
+    CancelAddress,
     Forward,
     Up,
     Navigate(NodeId),
@@ -70,6 +76,10 @@ pub struct Header<'a> {
     pub show_hidden: bool,
     pub grid: bool,
     pub filter: &'a str,
+    /// The address field's contents while it is open. `None` draws the
+    /// breadcrumb instead: the two share a strip because they answer the same
+    /// question, and only one of them is ever the one wanted.
+    pub address: Option<&'a str>,
     /// Number of entries currently listed, shown beside the title.
     pub shown: usize,
     /// Total before filtering, so a narrowed listing can say so.
@@ -201,8 +211,17 @@ pub fn show(
     // --- breadcrumb, in whatever is left between the arrows and the controls ---
     let trail = Rect::from_min_max(pos2(x + 8.0, nav.top()), pos2(right, nav.bottom()));
     if trail.width() > 40.0 {
-        if let Some(target) = breadcrumb(ui, p, trail, h.location) {
-            action = Some(HeaderAction::Navigate(target));
+        match h.address {
+            Some(text) => {
+                if let Some(a) = address_field(ui, p, group, trail, text) {
+                    action = Some(a);
+                }
+            }
+            None => {
+                if let Some(target) = breadcrumb(ui, p, trail, h.location) {
+                    action = Some(HeaderAction::Navigate(target));
+                }
+            }
         }
     }
 
@@ -312,6 +331,78 @@ fn split_button(ui: &mut Ui, p: &Palette, rect: Rect, vertical: bool, tip: &str)
     icons::split(ui.painter(), rect.center(), vertical, colour);
     response.clone().on_hover_text(tip);
     response.clicked()
+}
+
+/// The id of a pane's address field.
+///
+/// Absolute for the same reason the filter's is: `Ctrl+L` focuses it from the
+/// app's key handler, which runs before any pane `Ui` exists.
+pub fn address_id(group: neutron_core::GroupId) -> egui::Id {
+    egui::Id::new(("neutron-address", group))
+}
+
+/// A single-line path field where the breadcrumb usually is.
+///
+/// Full width of the strip, monospaced-ish and unadorned. A path is read for
+/// its structure and pasted in one piece, so it gets the whole trail rather
+/// than sharing it with the crumbs it replaces.
+fn address_field(
+    ui: &mut Ui,
+    p: &Palette,
+    group: neutron_core::GroupId,
+    rect: Rect,
+    current: &str,
+) -> Option<HeaderAction> {
+    let id = address_id(group);
+    let mut text = current.to_owned();
+
+    ui.painter().rect(
+        rect,
+        RADIUS_CONTROL as f32,
+        p.inset,
+        egui::Stroke::new(1.0, p.accent),
+        egui::StrokeKind::Inside,
+    );
+
+    let text_rect = Rect::from_min_max(
+        pos2(rect.left() + 10.0, rect.top()),
+        pos2(rect.right() - 8.0, rect.bottom()),
+    );
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(text_rect));
+    child.set_clip_rect(text_rect);
+
+    let response = child.add(
+        egui::TextEdit::singleline(&mut text)
+            .id(id)
+            .background_color(egui::Color32::TRANSPARENT)
+            .desired_width(text_rect.width())
+            .font(egui::FontId::proportional(12.5))
+            .text_color(p.text)
+            .vertical_align(egui::Align::Center),
+    );
+
+    // Escape closes it. egui does not surrender focus on Escape by itself, so
+    // without this the field would keep the keyboard and every shortcut in the
+    // application would stay switched off.
+    if response.has_focus() && child.input(|i| i.key_pressed(egui::Key::Escape)) {
+        child.memory_mut(|m| m.surrender_focus(id));
+        return Some(HeaderAction::CancelAddress);
+    }
+
+    // Enter before the plain lost-focus case: a submit that also reported a
+    // text change would navigate and then re-open the field with the same text.
+    if response.lost_focus() && child.input(|i| i.key_pressed(egui::Key::Enter)) {
+        return Some(HeaderAction::SubmitAddress);
+    }
+    // Clicking away is a cancel. Leaving the field open but unfocused would put
+    // a path bar over the breadcrumb of a pane nobody is typing in.
+    if response.lost_focus() {
+        return Some(HeaderAction::CancelAddress);
+    }
+    if response.changed() {
+        return Some(HeaderAction::SetAddress(text));
+    }
+    None
 }
 
 /// The narrowing filter, drawn as a pill with a magnifier — the search control
