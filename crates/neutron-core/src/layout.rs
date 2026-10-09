@@ -130,6 +130,31 @@ impl Layout {
         false
     }
 
+    /// Sets the ratio of the split whose *second* side starts with `second`.
+    ///
+    /// What a divider drag needs. A divider belongs to exactly one split, and
+    /// the first leaf of that split's second side names it uniquely — no other
+    /// split has that leaf as the first of its second side. The first side's
+    /// first leaf does not: when the first side is itself split, that leaf is
+    /// also a direct child of the inner split, and [`Self::set_ratio`] finds
+    /// the inner one, so dragging the outer divider moved the inner.
+    pub fn set_divider_ratio(&mut self, second: GroupId, ratio: f32) -> bool {
+        if let Layout::Split {
+            ratio: r,
+            first,
+            second: other,
+            ..
+        } = self
+        {
+            if other.groups().first() == Some(&second) {
+                *r = ratio.clamp(MIN_RATIO, 1.0 - MIN_RATIO);
+                return true;
+            }
+            return first.set_divider_ratio(second, ratio) || other.set_divider_ratio(second, ratio);
+        }
+        false
+    }
+
     /// All groups, left-to-right / top-to-bottom in visual order.
     pub fn groups(&self) -> Vec<GroupId> {
         let mut out = Vec::new();
@@ -182,6 +207,20 @@ mod tests {
 
     fn g(n: u64) -> GroupId {
         GroupId(n)
+    }
+
+    #[test]
+    fn a_divider_moves_its_own_split_even_when_the_first_side_is_split_too() {
+        // [[1 / 3] | 2]: the outer divider sits between the left column and 2.
+        let mut l = Layout::leaf(g(1));
+        l.split(g(1), Axis::Horizontal, g(2));
+        l.split(g(1), Axis::Vertical, g(3));
+
+        assert!(l.set_divider_ratio(g(2), 0.7));
+        let Layout::Split { ratio, first, .. } = &l else { panic!("not a split") };
+        assert!((ratio - 0.7).abs() < 1e-6, "the outer split did not move");
+        let Layout::Split { ratio: inner, .. } = &**first else { panic!("not a split") };
+        assert!((inner - 0.5).abs() < 1e-6, "the inner split moved instead");
     }
 
     #[test]

@@ -53,6 +53,9 @@ pub struct Config {
 
 /// `%APPDATA%\Neutron\terminal.json`.
 pub fn config_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support").into_os_string();
+    #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .or_else(|| std::env::var_os("HOME"))?;
@@ -108,13 +111,22 @@ pub fn open_at(dir: &Path) -> Result<(), String> {
         }
     }
 
-    match spawn("wt.exe", &["-d"], dir, true) {
-        Ok(()) => return Ok(()),
-        Err(e) => tracing::debug!("Windows Terminal not available: {e}"),
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/bin/open")
+            .args(["-a", "Terminal", "--"]).arg(dir).output().map_err(|e| e.to_string())?;
+        if output.status.success() { Ok(()) }
+        else { Err(String::from_utf8_lossy(&output.stderr).trim().into()) }
     }
-
-    spawn("cmd.exe", &[], dir, false)
-        .map_err(|e| format!("could not open a terminal: {e}"))
+    #[cfg(not(target_os = "macos"))]
+    {
+        match spawn("wt.exe", &["-d"], dir, true) {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::debug!("Windows Terminal not available: {e}"),
+        }
+        spawn("cmd.exe", &[], dir, false)
+            .map_err(|e| format!("could not open a terminal: {e}"))
+    }
 }
 
 /// Opens another Neutron window showing `dir`.

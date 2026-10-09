@@ -33,6 +33,7 @@ use std::path::PathBuf;
 
 use egui::{Rect, Sense, Ui, pos2, vec2};
 use neutron_core::{Axis, NodeId};
+use neutron_ui::file_list::ViewMode;
 use neutron_ui::icons::{self, Glyph};
 use neutron_ui::theme::{self, Palette, RADIUS_CONTROL, RADIUS_SMALL};
 
@@ -63,7 +64,8 @@ pub enum HeaderAction {
     SetFilter(String),
     ToggleHidden,
     Split(Axis),
-    ToggleView,
+    /// One of the view buttons.
+    SetView(ViewMode),
 }
 
 /// Everything the header needs to draw itself. Passed as a struct rather than
@@ -74,7 +76,7 @@ pub struct Header<'a> {
     pub can_forward: bool,
     pub has_parent: bool,
     pub show_hidden: bool,
-    pub grid: bool,
+    pub view: ViewMode,
     pub filter: &'a str,
     /// The address field's contents while it is open. `None` draws the
     /// breadcrumb instead: the two share a strip because they answer the same
@@ -162,26 +164,22 @@ pub fn show(
         right -= 30.0;
     }
 
-    // View toggle. Shows the view it switches *to*, which is the convention
-    // every image browser uses — a button showing the current state looks like
-    // a status light rather than a control.
-    let view = Rect::from_center_size(pos2(right - 14.0, nav.center().y), vec2(28.0, 28.0));
-    if icon_button(
-        ui,
-        p,
-        view,
-        if h.grid { Glyph::List } else { Glyph::Grid },
-        true,
-        false,
-        if h.grid {
-            "List view (Ctrl+Shift+L)"
-        } else {
-            "Grid view (Ctrl+Shift+L)"
-        },
-    ) {
-        action = Some(HeaderAction::ToggleView);
+    // The views, one button each with the current one lit. Three states no
+    // longer fit one toggle: a button that shows "the next view" makes the
+    // user cycle through one they do not want to reach the one they do.
+    // Laid out from the right, so listed here in reverse.
+    for (mode, glyph, tip) in [
+        (ViewMode::Columns, Glyph::Columns, "Column view (Ctrl+Shift+L cycles views)"),
+        (ViewMode::Grid, Glyph::Grid, "Grid view (Ctrl+Shift+L cycles views)"),
+        (ViewMode::List, Glyph::List, "List view (Ctrl+Shift+L cycles views)"),
+    ] {
+        let r = Rect::from_center_size(pos2(right - 14.0, nav.center().y), vec2(28.0, 28.0));
+        if icon_button(ui, p, r, glyph, true, h.view == mode, tip) && h.view != mode {
+            action = Some(HeaderAction::SetView(mode));
+        }
+        right -= 30.0;
     }
-    right -= 30.0;
+    right -= 6.0;
 
     let eye = Rect::from_center_size(pos2(right - 14.0, nav.center().y), vec2(28.0, 28.0));
     if icon_button(
@@ -191,7 +189,11 @@ pub fn show(
         Glyph::Eye,
         true,
         h.show_hidden,
-        "Show hidden files (Ctrl+H)",
+        if cfg!(target_os = "macos") {
+            "Show hidden files (Cmd+Shift+.)"
+        } else {
+            "Show hidden files (Ctrl+H)"
+        },
     ) {
         action = Some(HeaderAction::ToggleHidden);
     }
@@ -466,7 +468,15 @@ fn filter_field(
     // Escape leaves the field and clears it. Handled here rather than in the
     // app's key table because that table is skipped entirely while a text field
     // holds focus — which is exactly when this binding is wanted.
-    if output.response.has_focus() && child.input(|i| i.key_pressed(egui::Key::Escape)) {
+    //
+    // `lost_focus` as well as `has_focus`: egui takes focus away on Escape at
+    // the start of the frame, before this field runs, so on the Escape frame
+    // the field no longer has focus — it has just lost it. Checking focus
+    // alone meant Escape only ever left the field and kept the text.
+    let response = &output.response;
+    if (response.has_focus() || response.lost_focus())
+        && child.input(|i| i.key_pressed(egui::Key::Escape))
+    {
         child.memory_mut(|m| m.surrender_focus(id));
         return (!current.is_empty()).then(String::new);
     }
@@ -488,20 +498,33 @@ fn filter_field(
 fn segments(location: &NodeId) -> Option<Vec<(String, NodeId)>> {
     match location {
         NodeId::Path(path) => {
+            use std::path::Component;
+
             let mut segments = Vec::new();
             let mut acc = PathBuf::new();
+            // A Windows root is two components — `C:` and then `\` — and is one
+            // crumb. Held until the separator arrives, so the crumb leads to
+            // `C:\` and not to `C:`, which means "the current directory on
+            // drive C" and made every path built from it relative.
+            let mut drive: Option<String> = None;
             for component in path.components() {
                 acc.push(component.as_os_str());
-                // The root prints as `C:\`; trim the separator so it does not
-                // read "C:\ › Users".
-                let label = component
-                    .as_os_str()
-                    .to_string_lossy()
-                    .trim_end_matches(['\\', '/'])
-                    .to_owned();
-                if !label.is_empty() {
-                    segments.push((label, NodeId::Path(acc.clone())));
-                }
+                let label = match component {
+                    Component::Prefix(prefix) => {
+                        drive = Some(prefix.as_os_str().to_string_lossy().into_owned());
+                        continue;
+                    }
+                    // `/` on its own reads as a stray mark, but it is the only
+                    // name the root has, and without a crumb for it the top of
+                    // the disk could not be reached from the trail at all.
+                    Component::RootDir => drive.take().unwrap_or_else(|| "/".to_owned()),
+                    other => other.as_os_str().to_string_lossy().into_owned(),
+                };
+                segments.push((label, NodeId::Path(acc.clone())));
+            }
+            // A bare `C:` with no separator after it still gets its crumb.
+            if let Some(drive) = drive {
+                segments.push((drive, NodeId::Path(acc.clone())));
             }
             (!segments.is_empty()).then_some(segments)
         }
@@ -679,6 +702,51 @@ mod tests {
     fn a_shell_location_has_no_trail_to_walk() {
         // Its parent chain needs COM, which cannot happen while painting.
         assert!(segments(&NodeId::shell("::{GUID}", "This PC")).is_none());
+    }
+
+    #[test]
+    fn escape_in_the_filter_clears_it() {
+        let ctx = egui::Context::default();
+        let group = neutron_core::GroupId(7);
+        let rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(200.0, 28.0));
+        let run = |events: Vec<egui::Event>| {
+            let mut result = None;
+            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                result = filter_field(ui, &Palette::DARK, group, rect, "doc");
+            });
+            output.textures_delta.clear();
+            result
+        };
+
+        run(Vec::new());
+        ctx.memory_mut(|m| m.request_focus(filter_id(group)));
+        run(Vec::new());
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert_eq!(run(vec![escape]), Some(String::new()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_root_of_a_unix_path_has_a_crumb_of_its_own() {
+        let trail = segments(&NodeId::path("/Users/me")).expect("a trail");
+        let labels: Vec<&str> = trail.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["/", "Users", "me"]);
+        assert_eq!(trail[0].1, NodeId::path("/"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_crumb_leads_to_the_root_of_the_drive() {
+        let trail = segments(&NodeId::path(r"C:\Users")).expect("a trail");
+        let labels: Vec<&str> = trail.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["C:", "Users"]);
+        assert_eq!(trail[0].1, NodeId::path(r"C:\"));
     }
 
     #[test]

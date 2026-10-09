@@ -43,6 +43,7 @@ use crossbeam_channel::{Receiver, Sender};
 pub struct Apartment {
     /// Set only when this guard performed the initialisation, so a nested
     /// guard cannot uninitialise an apartment it did not create.
+    #[cfg_attr(not(windows), allow(dead_code))]
     owned: bool,
 }
 

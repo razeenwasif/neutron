@@ -25,6 +25,8 @@ use neutron_ui::theme::{self, GUTTER, Palette, RADIUS_CARD, RADIUS_CONTROL};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PaneAction {
     Focus(GroupId),
+    /// A divider was dragged. `target` is the first pane on its second side;
+    /// see `Layout::set_divider_ratio`.
     SetRatio { target: GroupId, ratio: f32 },
 }
 
@@ -78,10 +80,10 @@ pub fn show(
             show(ui, first, first_rect, p, focused, actions, draw_group);
             show(ui, second, second_rect, p, focused, actions, draw_group);
 
-            if let Some(new_ratio) = divider(ui, gutter, *axis, rect, p) {
-                // Ratio is addressed by the split's first leaf, matching how
-                // `Layout::set_ratio` locates the node.
-                if let Some(target) = first.groups().first().copied() {
+            // Named by the first pane of its second side, which no other
+            // divider shares — see `Layout::set_divider_ratio`.
+            if let Some(target) = second.groups().first().copied() {
+                if let Some(new_ratio) = divider(ui, gutter, *axis, rect, p, target) {
                     actions.push(PaneAction::SetRatio {
                         target,
                         ratio: new_ratio,
@@ -152,8 +154,18 @@ fn subdivide(rect: Rect, axis: Axis, ratio: f32) -> (Rect, Rect, Rect) {
 }
 
 /// Handles the gutter as a resize grip. Returns a new ratio while dragging.
-fn divider(ui: &mut Ui, rect: Rect, axis: Axis, parent: Rect, p: &Palette) -> Option<f32> {
-    let id = ui.id().with(("divider", rect.min.x as i32, rect.min.y as i32));
+fn divider(
+    ui: &mut Ui,
+    rect: Rect,
+    axis: Axis,
+    parent: Rect,
+    p: &Palette,
+    split: GroupId,
+) -> Option<f32> {
+    // Keyed by the split, never by where the gutter is: the gutter moves as it
+    // is dragged, and egui keeps a drag attached to the id it began on, so an
+    // id built from the position lost the drag after a single frame.
+    let id = ui.id().with(("divider", split.0));
     let response = ui.interact(rect, id, Sense::drag());
     let active = response.hovered() || response.dragged();
 
@@ -202,6 +214,110 @@ fn divider(ui: &mut Ui, rect: Rect, axis: Axis, parent: Rect, p: &Palette) -> Op
 /// Height of a tab strip, in points.
 pub const TAB_STRIP_HEIGHT: f32 = 38.0;
 
+/// Narrowest a tab is squeezed to before tabs start going off the strip. Wide
+/// enough for a few letters of the title and the close button.
+const MIN_TAB: f32 = 64.0;
+/// Width given to each of the arrows shown when tabs go off the strip.
+const OVERFLOW_ARROW: f32 = 26.0;
+/// Space between tabs.
+const TAB_GAP: f32 = 4.0;
+
+/// Each tab's width when `natural` widths have to share `room`: as they are if
+/// they fit, otherwise shrunk evenly — wide tabs first — down to [`MIN_TAB`].
+fn fit_tabs(natural: &[f32], room: f32) -> Vec<f32> {
+    let gaps = TAB_GAP * natural.len().saturating_sub(1) as f32;
+    let total: f32 = natural.iter().sum::<f32>() + gaps;
+    if total <= room || natural.is_empty() {
+        return natural.to_vec();
+    }
+    // The largest cap that makes them fit, so short titles keep their width
+    // and only the long ones are cut.
+    let available = (room - gaps).max(0.0);
+    let mut sorted = natural.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let mut remaining = available;
+    let mut cap = MIN_TAB;
+    for (k, w) in sorted.iter().enumerate() {
+        let share = remaining / (sorted.len() - k) as f32;
+        if *w <= share {
+            remaining -= w;
+        } else {
+            cap = share;
+            break;
+        }
+    }
+    natural.iter().map(|w| w.min(cap).max(MIN_TAB)).collect()
+}
+
+/// The first and last tab to draw so that `active` is among them and they fit
+/// in `room`. Everything, when everything fits.
+fn visible_run(widths: &[f32], active: usize, room: f32) -> (usize, usize) {
+    if widths.is_empty() {
+        return (0, 0);
+    }
+    let all: f32 = widths.iter().sum::<f32>() + TAB_GAP * (widths.len() - 1) as f32;
+    if all <= room + 2.0 * OVERFLOW_ARROW {
+        return (0, widths.len() - 1);
+    }
+    let active = active.min(widths.len() - 1);
+    let (mut first, mut last) = (active, active);
+    let mut used = widths[active];
+    // Grow to the right first, then the left, while there is room.
+    loop {
+        let grew_right = last + 1 < widths.len() && used + TAB_GAP + widths[last + 1] <= room;
+        if grew_right {
+            last += 1;
+            used += TAB_GAP + widths[last];
+        }
+        let grew_left = first > 0 && used + TAB_GAP + widths[first - 1] <= room;
+        if grew_left {
+            first -= 1;
+            used += TAB_GAP + widths[first];
+        }
+        if !grew_right && !grew_left {
+            return (first, last);
+        }
+    }
+}
+
+/// Where a tab dragged from `from` lands when released at `x`: the index it
+/// will have once moved.
+fn landing(drawn: &[(usize, Rect)], x: f32, from: usize) -> usize {
+    let before = drawn
+        .iter()
+        .filter(|(i, r)| *i != from && r.center().x < x)
+        .count();
+    let offset = drawn.first().map_or(0, |(i, _)| *i);
+    // `before` counts drawn tabs left of the pointer other than the dragged
+    // one; the dragged tab's own slot closes up when it moves.
+    let target = offset + before;
+    if offset > from { target - 1 } else { target }
+}
+
+/// One of the arrows at the ends of an overflowing strip. Shows how many tabs
+/// are off that end; returns whether it was clicked.
+fn overflow_arrow(ui: &mut Ui, p: &Palette, rect: Rect, group: GroupId, right: bool, hidden: usize) -> bool {
+    let response = ui.interact(rect, ui.id().with(("tab-overflow", group.0, right)), Sense::click());
+    if hidden > 0 && response.hovered() {
+        ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
+    }
+    let colour = if hidden == 0 { p.text_faint } else { p.text_muted };
+    let c = rect.center();
+    let d = if right { 1.0 } else { -1.0 };
+    ui.painter().add(egui::Shape::line(
+        vec![pos2(c.x - 2.0 * d, c.y - 4.0), pos2(c.x + 2.0 * d, c.y), pos2(c.x - 2.0 * d, c.y + 4.0)],
+        egui::Stroke::new(1.3, colour),
+    ));
+    if hidden > 0 {
+        response.clone().on_hover_text(format!(
+            "{hidden} more tab{} {}",
+            if hidden == 1 { "" } else { "s" },
+            if right { "to the right" } else { "to the left" }
+        ));
+    }
+    response.clicked()
+}
+
 /// What the user did in a tab strip.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TabAction {
@@ -212,6 +328,8 @@ pub enum TabAction {
     BeginDrag(usize),
     /// A dragged tab was released over this strip.
     DropHere,
+    /// A tab dragged within its own strip was released at a new position.
+    Reorder { from: usize, to: usize },
 }
 
 /// A tab being dragged, tracked across frames by the app.
@@ -241,6 +359,21 @@ pub fn tab_strip(
     let rect = Rect::from_min_size(full.min, vec2(full.width(), TAB_STRIP_HEIGHT));
     ui.advance_cursor_after_rect(rect);
 
+    // Every tab's natural width, then shrunk together to fit. Tabs that did
+    // not fit used to be dropped from the strip altogether — still open, but
+    // reachable only by Ctrl+1…9.
+    let font = egui::FontId::proportional(12.0);
+    let natural: Vec<f32> = titles
+        .iter()
+        .map(|t| (ui.painter().layout_no_wrap(t.clone(), font.clone(), p.text).size().x + 40.0).clamp(88.0, 200.0))
+        .collect();
+    let room = (rect.width() - 8.0 - 34.0).max(0.0);
+    let widths = fit_tabs(&natural, room);
+    // When even the narrowest tabs do not fit, show a run of them around the
+    // active one, with arrows to step to the ones either side.
+    let (first, last) = visible_run(&widths, active, room - 2.0 * OVERFLOW_ARROW);
+    let overflowing = first > 0 || last + 1 < titles.len();
+
     // Drop target: any strip other than the one the drag started in.
     if drag.is_some_and(|d| d.group != group_id) {
         let hovered = ui
@@ -257,24 +390,24 @@ pub fn tab_strip(
     }
 
     let mut x = rect.left() + 8.0;
-    let font = egui::FontId::proportional(12.0);
+    if overflowing {
+        let arrow = Rect::from_min_size(pos2(x, rect.top() + 6.0), vec2(OVERFLOW_ARROW - 4.0, rect.height() - 12.0));
+        if overflow_arrow(ui, p, arrow, group_id, false, first) && first > 0 {
+            action = Some(TabAction::Select(first - 1));
+        }
+        x += OVERFLOW_ARROW;
+    }
 
-    for (i, title) in titles.iter().enumerate() {
+    // Where each drawn tab sits, for working out where a dragged one lands.
+    let mut drawn: Vec<(usize, Rect)> = Vec::new();
+
+    for (i, title) in titles.iter().enumerate().take(last + 1).skip(first) {
         let is_active = i == active;
-
-        let galley = ui
-            .painter()
-            .layout_no_wrap(title.clone(), font.clone(), p.text);
-        let width = (galley.size().x + 40.0).clamp(88.0, 200.0);
+        let width = widths[i];
 
         let tab_rect =
             Rect::from_min_size(pos2(x, rect.top() + 6.0), vec2(width, rect.height() - 12.0));
-        if tab_rect.right() > rect.right() - 34.0 {
-            // Out of room. Overflow handling (scroll or menu) is a later
-            // refinement; dropping tabs is better than drawing them over the
-            // new-tab button.
-            break;
-        }
+        drawn.push((i, tab_rect));
 
         let response = ui.interact(
             tab_rect,
@@ -358,6 +491,35 @@ pub fn tab_strip(
         x += width + 4.0;
     }
 
+    if overflowing {
+        let arrow = Rect::from_min_size(pos2(x, rect.top() + 6.0), vec2(OVERFLOW_ARROW - 4.0, rect.height() - 12.0));
+        let hidden_after = titles.len() - 1 - last;
+        if overflow_arrow(ui, p, arrow, group_id, true, hidden_after) && hidden_after > 0 {
+            action = Some(TabAction::Select(last + 1));
+        }
+    }
+
+    // A tab dragged within its own strip: show where it would land, and move
+    // it there on release.
+    if let Some(d) = drag.filter(|d| d.group == group_id) {
+        if let Some(pointer) = ui.ctx().pointer_interact_pos().filter(|p| rect.contains(*p)) {
+            let to = landing(&drawn, pointer.x, d.index);
+            // Before the tab it will displace when moving left, after it when
+            // moving right — the gap the tab will drop into.
+            let marker_x = drawn
+                .iter()
+                .find(|(i, _)| *i == to)
+                .map(|(_, r)| if to > d.index { r.right() + 2.0 } else { r.left() - 2.0 })
+                .unwrap_or_else(|| drawn.last().map_or(rect.left() + 8.0, |(_, r)| r.right() + 2.0));
+            if to != d.index {
+                ui.painter().vline(marker_x, rect.top() + 8.0..=rect.bottom() - 8.0, egui::Stroke::new(2.0, p.accent));
+            }
+            if ui.input(|i| i.pointer.any_released()) && to != d.index {
+                action = Some(TabAction::Reorder { from: d.index, to });
+            }
+        }
+    }
+
     // New-tab button, pinned to the right.
     let plus_rect = Rect::from_center_size(
         pos2(rect.right() - 18.0, rect.center().y),
@@ -407,6 +569,86 @@ mod tests {
 
     fn rect(w: f32, h: f32) -> Rect {
         Rect::from_min_size(pos2(0.0, 0.0), vec2(w, h))
+    }
+
+    #[test]
+    fn tabs_that_fit_keep_their_width_and_the_rest_share_what_is_left() {
+        assert_eq!(fit_tabs(&[100.0, 100.0], 500.0), [100.0, 100.0]);
+        let fitted = fit_tabs(&[88.0, 200.0, 200.0], 400.0);
+        assert_eq!(fitted[0], 88.0, "a short title was cut");
+        let total: f32 = fitted.iter().sum::<f32>() + 2.0 * TAB_GAP;
+        assert!(total <= 400.0 + 0.01, "still too wide: {total}");
+        // Never below the minimum, however many there are.
+        assert!(fit_tabs(&[150.0; 40], 300.0).iter().all(|w| *w >= MIN_TAB));
+    }
+
+    #[test]
+    fn the_run_of_visible_tabs_always_holds_the_active_one() {
+        let widths = [MIN_TAB; 30];
+        for active in [0, 14, 29] {
+            let (first, last) = visible_run(&widths, active, 400.0);
+            assert!(first <= active && active <= last, "active {active} not in {first}..={last}");
+            assert!(last - first < 30);
+        }
+        assert_eq!(visible_run(&[100.0, 100.0], 1, 400.0), (0, 1));
+    }
+
+    #[test]
+    fn a_dragged_tab_lands_where_it_is_dropped() {
+        let at = |i: usize| (i, Rect::from_min_size(pos2(i as f32 * 100.0, 0.0), vec2(96.0, 20.0)));
+        let drawn: Vec<(usize, Rect)> = (0..4).map(at).collect();
+        // Tab 0 dropped just past the middle of tab 2 lands in slot 2.
+        assert_eq!(landing(&drawn, 260.0, 0), 2);
+        // Tab 3 dropped left of everything becomes the first.
+        assert_eq!(landing(&drawn, 5.0, 3), 0);
+        // Dropped where it started, it stays.
+        assert_eq!(landing(&drawn, 150.0, 1), 1);
+    }
+
+    #[test]
+    fn a_divider_follows_the_pointer_for_the_whole_drag() {
+        // The app applies each SetRatio and redraws, which moves the gutter;
+        // the drag has to survive that move every frame, not just the first.
+        let mut layout = Layout::leaf(GroupId(1));
+        layout.split(GroupId(1), Axis::Horizontal, GroupId(2));
+        let area = rect(816.0, 400.0);
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+
+        let mut frame = |layout: &mut Layout, events: Vec<egui::Event>| {
+            time += 1.0 / 60.0;
+            let mut actions = Vec::new();
+            let mut output = ctx.run_ui(
+                egui::RawInput { time: Some(time), events, ..Default::default() },
+                |ui| {
+                    show(ui, layout, area, &Palette::DARK, GroupId(1), &mut actions, &mut |_, _, _| {});
+                },
+            );
+            output.textures_delta.clear();
+            for action in actions {
+                if let PaneAction::SetRatio { target, ratio } = action {
+                    layout.set_divider_ratio(target, ratio);
+                }
+            }
+        };
+        let press = |at: egui::Pos2, pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // The gutter's centre: 400 points of pane, then 8 of the 16 gutter.
+        let start = pos2(408.0, 200.0);
+        frame(&mut layout, vec![egui::Event::PointerMoved(start)]);
+        frame(&mut layout, vec![press(start, true)]);
+        for step in 1..=10 {
+            frame(&mut layout, vec![egui::Event::PointerMoved(start + vec2(16.0 * step as f32, 0.0))]);
+        }
+        frame(&mut layout, vec![press(start + vec2(160.0, 0.0), false)]);
+
+        let Layout::Split { ratio, .. } = layout else { panic!("not a split") };
+        assert!(ratio > 0.65, "the divider stopped following at ratio {ratio}");
     }
 
     #[test]

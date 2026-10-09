@@ -43,6 +43,10 @@ russh-sftp = "2.4"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
 # Root certificates for FTPS. The same set reqwest already uses for Drive.
 webpki-roots = "1"
+# SHA-256 for FTPS certificate fingerprints. Already linked through rustls and
+# russh; named here only so the hash does not have to be borrowed from a TLS
+# cipher suite.
+ring = "0.17"
 
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true
@@ -54,4 +58,6 @@ features = ["Win32_Foundation", "Win32_Security_Credentials"]
 # client does when the host key changes.
 parking_lot = { workspace = true }
 rand = "0.10"
+# Only to turn a Unix listener into the stream russh's test agent serves from.
+futures = "0.3"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }

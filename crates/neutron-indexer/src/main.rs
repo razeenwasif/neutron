@@ -14,8 +14,10 @@
 //! neutron-indexer --bench          index and report timings, then exit
 //! ```
 
+#[cfg(windows)]
 use std::time::Instant;
 
+#[cfg(windows)]
 use neutron_index::VolumeIndex;
 
 fn main() -> anyhow::Result<()> {
@@ -133,6 +135,7 @@ fn bench() -> anyhow::Result<()> {
 }
 
 /// Times a few representative queries against the freshly built index.
+#[cfg(windows)]
 fn query_bench(indexes: &[VolumeIndex]) {
     if indexes.is_empty() {
         return;

@@ -133,7 +133,7 @@ mod win32 {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 mod win32 {
     use super::CredentialError;
 
@@ -150,6 +150,30 @@ mod win32 {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod win32 {
+    use super::CredentialError;
+    use serde_json::json;
+    pub fn store(target: &str, secret: &str) -> Result<(), CredentialError> {
+        crate::macos::call(json!({"action":"credential-store", "target":target, "secret":secret}))
+            .map(|_| ()).map_err(CredentialError)
+    }
+    pub fn load(target: &str) -> Option<String> {
+        // "Not stored" comes back as null; an error is a real keychain failure
+        // (locked, access refused) and is logged so it is not mistaken for one.
+        match crate::macos::call(json!({"action":"credential-load", "target":target})) {
+            Ok(value) => value.as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+            Err(error) => {
+                tracing::warn!(credential = target, %error, "could not read a credential from the keychain");
+                None
+            }
+        }
+    }
+    pub fn clear(target: &str) -> Result<(), CredentialError> {
+        crate::macos::call(json!({"action":"credential-clear", "target":target}))
+            .map(|_| ()).map_err(CredentialError)
+    }
+}
 pub use win32::{clear, load, store};
 
 #[cfg(test)]

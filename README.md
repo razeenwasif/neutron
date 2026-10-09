@@ -1,6 +1,6 @@
 # Neutron
 
-A faster Windows file explorer. Rust, `egui`/`wgpu`, single binary.
+A fast file explorer for Windows and macOS. Rust, `egui`/`wgpu`, single binary.
 
 **Status: M7 complete, plus everything since.** Tabs and arbitrarily nested
 split panes over a virtualized listing, with sortable columns, keyboard
@@ -39,7 +39,57 @@ A 100k-entry folder opens in 52ms and scrolls at 0.21ms per frame.
 
 ## Building
 
-Windows, natively. There is nothing to bridge and no wrapper to go through:
+On macOS, install stable Rust and the Xcode command line tools (`xcode-select --install`), then:
+
+```sh
+cargo xtask bundle             # release build: target/release/Neutron.app
+open target/release/Neutron.app
+cargo xtask install            # optional: build and install to ~/Applications
+cargo test --workspace --locked
+```
+
+The bundle is built for the current Mac's architecture (Apple Silicon or Intel)
+and requires macOS 12 or later. It contains the Rust app and a small native Swift
+helper for file operations, file URLs on the clipboard, Trash, and Keychain.
+`cargo run -p neutron-app -- /some/folder` also works during development.
+Configuration files live in `~/Library/Application Support/Neutron`.
+
+macOS supports local browsing, copy/cut/paste, safe copy and move without
+replacing existing files, rename, new folders, Trash, previews, archives, native
+file launching, Terminal, and saved remote/cloud credentials in Keychain.
+Command works for the existing Ctrl shortcuts; Command+Backspace moves the
+selection to Trash. The Finder's own keys work too: Command+Up and Command+Down
+to leave and enter folders, Command+[ and Command+] for back and forward, and
+Command+Shift+. for hidden files (Command+H belongs to Hide). The terminal opens
+with Control+`, since Command+` is the system's window switcher. Global search uses Spotlight (and its indexing/privacy
+settings). Folder search scans at most 100,000 entries or three seconds and
+marks partial results. Visible folders refresh within roughly one second.
+
+The Mac window uses native rounded corners, shadow, and traffic-light controls.
+The action rail runs Copy, Cut, Paste, Rename, Trash, New Folder, Extract, and
+Zip against the focused local pane. Buttons explain unavailable actions, and
+the rail scrolls in shorter windows. Archive jobs refresh their source folder
+when they finish, including when you have switched to another pane.
+
+The icon source is `assets/icon.svg`. To regenerate the bundled PNG, Windows
+ICO, and in-app RGBA assets, install Node.js and ImageMagick 7, then run:
+
+```sh
+npm ci --prefix scripts
+scripts/render-icon.sh
+```
+
+The macOS bundle generates its ICNS from the 1024-pixel PNG. The window and
+sidebar use a separate 256-pixel render made directly from the vector for
+Retina displays.
+
+The macOS context menu offers Neutron's file actions. Windows shell extensions,
+NTFS indexing, native file icons, and dragging files out to other apps are not
+available on macOS yet. Use copy/paste to transfer files to Finder. Windows
+keeps its native backends. The local bundle is ad-hoc signed; public distribution
+requires Developer ID signing and notarization.
+
+Windows, natively:
 
 ```powershell
 cargo build --release -p neutron-app
@@ -94,7 +144,7 @@ than Windows: they drive real child processes and are `#![cfg(unix)]`, so on
 Windows they are skipped and report nothing. CI runs them on Linux for exactly
 that reason.
 
-`neutron-shell`, `neutron-index` and `neutron-app` are Windows-only.
+`neutron-shell` and `neutron-app` include native macOS backends. The NTFS USN indexer remains Windows-only; macOS uses Spotlight and scoped filesystem search.
 
 ---
 
@@ -392,8 +442,16 @@ and a client that joins it onto a download folder writes exactly there, so any
 listed name carrying path structure is refused and the folder opens without it.
 
 Opening a remote file fetches a copy to `%TEMP%` and opens that; editing it does
-not write back, and the status bar says so. Nothing writes to a server yet —
-rename, delete, paste and new folder all refuse with a sentence.
+not write back, and the status bar says so.
+
+A server folder takes **new folders, renames, deletes and uploads** — paste local
+files or drop them onto the pane, and folders go up with everything in them.
+Each write runs on a connection of its own, so browsing stays responsive, and
+the status bar shows progress with a Stop button. Uploads never replace: a name
+the server folder already has is refused before anything is sent. Deleting asks
+first, says when folders will go with their contents, and never follows a
+symbolic link into somewhere else. A cut onto a server copies; the originals
+stay. Copying files *off* a server, other than opening one, is not done yet.
 
 **Forget this server** in the palette removes the one you are looking at, and
 takes its password out of Credential Manager with it. Until that existed a saved
@@ -487,7 +545,8 @@ do not.
 | `Ctrl+N` | Open a second window here |
 | ``Ctrl+` `` | Open a terminal here — see `docs/terminal.md` |
 | `Ctrl+H` | Show hidden files |
-| `Ctrl+Shift+L` | Switch between the list and the grid |
+| `Ctrl+Shift+L` | Cycle the view: list, grid, columns |
+| `←` `→` *(column view)* | Back out to the parent folder / into the selected folder |
 | `Alt+P` | Show the preview pane — works on servers and in Drive too |
 | `Ctrl+F` | Filter the current listing (`Esc` clears it) |
 | `Ctrl+Shift+F` | Search every volume (arrows move, `Enter` opens, `Esc` closes) |
@@ -501,6 +560,16 @@ do not.
 | `Esc` | Clear selection |
 | `Ctrl+D` | Toggle light/dark theme |
 | `Ctrl+Shift+D` | Pin or unpin this folder in Quick access |
+
+The column view works like the Finder's. Each folder on the way to the
+current one gets a column, with the next step highlighted, and selecting a
+folder shows its contents in a column to the right. Columns start at your home
+folder for anything inside it, and at the volume root otherwise. Clicking any
+row in any column makes that folder current. Drag the edge between two columns
+to resize the one on its left, hold `Option` (`Alt`) while dragging to resize
+them all, and double-click an edge to fit that column to its longest name.
+Servers, Drive and This PC have no path to build columns from, so they stay a
+list.
 
 The filter narrows the listing already in memory — a case-insensitive substring
 over names, applied without touching the disk, so it stays instant while typing

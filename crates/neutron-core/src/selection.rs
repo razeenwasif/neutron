@@ -95,10 +95,13 @@ impl Selection {
                 self.anchor = Some(idx);
             }
             SelectMode::Range => {
-                let anchor = self.anchor.unwrap_or(idx);
+                // With no anchor yet — a folder just opened, or a selection
+                // restored without one — this row becomes it, so the next
+                // Shift press extends from here instead of starting over.
+                let anchor = *self.anchor.get_or_insert(idx) as usize;
                 // A range with no resolvable endpoint (either side filtered out)
                 // degrades to a plain click rather than selecting nothing.
-                match (list.rank(anchor as usize), list.rank(storage_idx)) {
+                match (list.rank(anchor), list.rank(storage_idx)) {
                     (Some(a), Some(b)) => {
                         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
                         self.items.clear();
@@ -208,6 +211,21 @@ impl Selection {
 
     pub fn select_all(&mut self, list: &EntryList) {
         self.items = list.order().iter().copied().collect();
+    }
+
+    /// Drops every selected entry the current filter hides.
+    ///
+    /// For when the listing is narrowed under an existing selection — hiding
+    /// hidden files, say. A selection is what the next Delete acts on, and an
+    /// entry nobody can see must not be part of it.
+    pub fn retain_visible(&mut self, list: &EntryList) {
+        self.items.retain(|&i| list.rank(i as usize).is_some());
+        if self.cursor.is_some_and(|c| list.rank(c as usize).is_none()) {
+            self.cursor = None;
+        }
+        if self.anchor.is_some_and(|a| list.rank(a as usize).is_none()) {
+            self.anchor = self.cursor;
+        }
     }
 
     /// Total size of the selected entries, for the status bar.
@@ -528,4 +546,31 @@ mod tests {
         assert!(!sel.is_selected(0));
     }
 
+    #[test]
+    fn shift_down_in_a_folder_just_opened_extends_rather_than_starting_over() {
+        let list = list();
+        let mut sel = Selection::new();
+        for _ in 0..3 {
+            sel.move_cursor(&list, 1, true);
+        }
+        assert_eq!(sel.len(), 3, "each Shift+Down selected a single row");
+    }
+
+    #[test]
+    fn narrowing_the_listing_drops_what_it_hides_from_the_selection() {
+        // Select everything, then narrow the listing: the next Delete must
+        // act only on what is still on screen.
+        let mut list: EntryList = vec![mk("keep.txt", 1), mk("drop.txt", 2)].into_iter().collect();
+        crate::sort::apply(&mut list, SortSpec::default(), true);
+        let mut sel = Selection::new();
+        let dropped = (0..list.len()).find(|&i| list.name(i) == "drop.txt").unwrap();
+        sel.set(&[0, 1], Some(dropped));
+
+        crate::sort::apply_filtered(&mut list, SortSpec::default(), true, "keep");
+        sel.retain_visible(&list);
+
+        assert_eq!(sel.len(), 1);
+        assert!(!sel.is_selected(dropped));
+        assert_eq!(sel.cursor(), None);
+    }
 }

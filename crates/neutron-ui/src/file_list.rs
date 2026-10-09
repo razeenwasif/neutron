@@ -64,18 +64,24 @@ pub enum ViewMode {
     /// which is what makes a folder of images or executables recognisable at a
     /// glance rather than a column of near-identical filenames.
     Grid,
+    /// Finder's column view: the folders on the way to this one side by side,
+    /// each with the next step highlighted, and the selected folder's contents
+    /// to the right. Drawn by [`crate::columns`], not by this module.
+    Columns,
 }
 
 impl ViewMode {
+    /// The next view in the cycle the view shortcut steps through.
     pub fn toggled(self) -> Self {
         match self {
             ViewMode::List => ViewMode::Grid,
-            ViewMode::Grid => ViewMode::List,
+            ViewMode::Grid => ViewMode::Columns,
+            ViewMode::Columns => ViewMode::List,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FileListState {
     pub sort: SortSpec,
     pub show_hidden: bool,
@@ -89,27 +95,13 @@ pub struct FileListState {
     /// Live narrowing filter from the pane header's field. Empty means no
     /// filter; see [`neutron_core::sort::apply_filtered`].
     pub filter: String,
-    /// Storage index to bring into view on the next frame. Consumed once.
+    /// Storage index to bring into view on the next frame. Consumed once —
+    /// by the owner, which draws from a clone of this state and so has to
+    /// clear it itself once a frame has drawn it. Left standing, it pins the
+    /// listing to that row and the wheel cannot scroll away from it.
     pub scroll_to: Option<usize>,
-    /// Last observed vertical scroll offset, carried between frames so
-    /// scroll-into-view can move the minimum distance instead of always
-    /// snapping the target row to the top of the viewport.
-    scroll_offset: f32,
 }
 
-impl Default for FileListState {
-    fn default() -> Self {
-        Self {
-            sort: SortSpec::default(),
-            show_hidden: false,
-            view: ViewMode::default(),
-            columns: 0,
-            filter: String::new(),
-            scroll_to: None,
-            scroll_offset: 0.0,
-        }
-    }
-}
 
 /// Something the user did that the app must act on.
 // Not `Copy`: a rename carries the typed name. Everything else in here is a
@@ -136,7 +128,7 @@ pub enum FileListAction {
     /// The rename box's contents changed.
     RenameTyped(String),
     /// Enter, or the box losing focus: keep the typed name.
-    RenameCommit,
+    RenameCommit(String),
     /// Escape: put the old name back.
     RenameCancel,
     /// Click on empty space — clears the selection.
@@ -215,7 +207,10 @@ pub fn show(
     icons: Option<&dyn IconSource>,
 ) -> Option<FileListAction> {
     match state.view {
-        ViewMode::List => show_list(ui, state, list, marks, p, icons),
+        // The column view needs listings this widget does not have — the
+        // folders on the way here — so the app draws it with
+        // `crate::columns`. Falls back to the list if it lands here anyway.
+        ViewMode::List | ViewMode::Columns => show_list(ui, state, list, marks, p, icons),
         ViewMode::Grid => show_grid(ui, state, list, marks, p, icons),
     }
 }
@@ -256,7 +251,7 @@ fn show_list(
         if let Some(row) = list.rank(target) {
             let top = row as f32 * ROW_HEIGHT;
             let bottom = top + ROW_HEIGHT;
-            let current = state.scroll_offset;
+            let current = scroll_offset(ui, "list");
 
             let desired = if top < current {
                 Some(top)
@@ -306,7 +301,7 @@ fn show_list(
 
     });
 
-    state.scroll_offset = output.state.offset.y;
+    remember_scroll(ui, "list", output.id);
 
     // Empty space below the last row: clears the selection, or opens the
     // folder's own menu.
@@ -365,6 +360,24 @@ fn show_list(
     }
 
     action
+}
+
+/// Where the listing's scroll area is scrolled to, as of the last frame.
+///
+/// Read from egui's own record of the scroll area rather than kept in
+/// [`FileListState`]: the app draws from a clone of that state, so anything
+/// written there during paint is gone by the next frame, and an offset that
+/// always read zero made scroll-into-view measure from the wrong place.
+fn scroll_offset(ui: &Ui, which: &str) -> f32 {
+    ui.data(|d| d.get_temp::<egui::Id>(ui.id().with(("scroll-id", which))))
+        .and_then(|id| egui::scroll_area::State::load(ui.ctx(), id))
+        .map_or(0.0, |state| state.offset.y)
+}
+
+/// Records the scroll area's id for [`scroll_offset`]. Remembered rather than
+/// derived, because the scroll area hashes its salt into an id of its own.
+fn remember_scroll(ui: &Ui, which: &str, id: egui::Id) {
+    ui.data_mut(|d| d.insert_temp(ui.id().with(("scroll-id", which)), id));
 }
 
 /// Tracks a rubber-band drag and reports what it covers.
@@ -767,7 +780,7 @@ pub fn rename_field_id(generation: u64) -> egui::Id {
 /// Reports every keystroke rather than only the final answer: the string it
 /// edits lives in the application, so the box holds a copy for one frame and
 /// hands back what was typed.
-fn rename_box(
+pub(crate) fn rename_box(
     ui: &mut Ui,
     p: &Palette,
     rect: Rect,
@@ -812,6 +825,7 @@ fn rename_box(
             egui::text::CCursor::new(stem),
         )));
         egui::TextEdit::store_state(ui.ctx(), id, state);
+        ui.memory_mut(|m| m.request_focus(id));
     }
 
     let inner = field.shrink2(vec2(6.0, 0.0));
@@ -834,29 +848,116 @@ fn rename_box(
     if child.input(|i| i.key_pressed(egui::Key::Escape)) {
         return Some(FileListAction::RenameCancel);
     }
-    if child.input(|i| i.key_pressed(egui::Key::Enter)) {
-        // Enter on a name Windows will not accept leaves the box open with its
-        // border still red, rather than closing and quietly discarding what was
-        // typed. The red border is the explanation; taking the text away as
-        // well would leave nothing to correct.
-        if valid {
-            return Some(FileListAction::RenameCommit);
-        }
+    let enter = child.input(|i| i.key_pressed(egui::Key::Enter));
+    if enter && valid {
+        return Some(FileListAction::RenameCommit(text));
     }
     // Clicking away commits, as Explorer does: a rename abandoned by clicking
     // elsewhere is nearly always finished rather than unwanted, and Escape is
     // right there for the other case. An invalid name is the exception — there
     // is nothing to commit, and leaving the box open once focus has gone
     // somewhere else would be a trap.
-    if output.response.lost_focus() {
+    if first_frame {
+        output.response.request_focus();
+        // Opening from a button happens after the previous frame was drawn.
+        // Schedule the focused frame so the native text-input/IME state is
+        // updated before the user types, even while the pointer stays still.
+        ui.ctx().request_repaint();
+    }
+    if !first_frame && output.response.lost_focus() {
+        // Enter on a name the system will not accept leaves the box open with
+        // its border still red, rather than closing and quietly discarding what
+        // was typed. A single-line field gives up focus on Enter by itself, so
+        // it has to be taken back here — otherwise this is indistinguishable
+        // from clicking away, and the rename was cancelled.
+        if enter {
+            output.response.request_focus();
+            return (text != current).then_some(FileListAction::RenameTyped(text));
+        }
         return Some(if valid {
-            FileListAction::RenameCommit
+            FileListAction::RenameCommit(text)
         } else {
             FileListAction::RenameCancel
         });
     }
+    // Focus lost without anyone taking it: the row scrolled out of view, and
+    // egui drops focus from a widget it stops seeing. Back on screen, the box
+    // takes it again — an open rename box that is not listening sends every
+    // keystroke to the shortcuts instead, where Delete moves files to the
+    // Trash.
+    if !first_frame
+        && !output.response.has_focus()
+        && ui.memory(|m| m.focused().is_none())
+    {
+        output.response.request_focus();
+    }
 
     (text != current).then_some(FileListAction::RenameTyped(text))
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+
+    #[test]
+    fn rename_focuses_and_commits_text_typed_with_enter_in_the_same_frame() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(300.0, ROW_HEIGHT));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert_eq!(rename_box(ui, &Palette::DARK, rect, "sample.txt", 1), None);
+        });
+        output.textures_delta.clear();
+        assert!(ctx.memory(|m| m.has_focus(rename_field_id(1))));
+
+        let mut result = None;
+        let mut output = ctx.run_ui(egui::RawInput {
+            events: vec![
+                egui::Event::Text("renamed".into()),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        }, |ui| {
+            result = rename_box(ui, &Palette::DARK, rect, "sample.txt", 1);
+        });
+        output.textures_delta.clear();
+        assert_eq!(result, Some(FileListAction::RenameCommit("renamed.txt".into())));
+    }
+
+    #[test]
+    fn enter_on_a_name_that_cannot_be_used_keeps_the_box_open() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(300.0, ROW_HEIGHT));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            rename_box(ui, &Palette::DARK, rect, "a/b", 1);
+        });
+        output.textures_delta.clear();
+
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut result = None;
+        let mut output = ctx.run_ui(egui::RawInput { events: vec![enter], ..Default::default() }, |ui| {
+            result = rename_box(ui, &Palette::DARK, rect, "a/b", 1);
+        });
+        output.textures_delta.clear();
+        assert_eq!(result, None, "the rename was closed");
+        // Still listening on the next frame.
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            rename_box(ui, &Palette::DARK, rect, "a/b", 1);
+        });
+        output.textures_delta.clear();
+        assert!(ctx.memory(|m| m.has_focus(rename_field_id(1))));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1054,18 +1155,6 @@ fn draw_row(
     if response.double_clicked() {
         return Some(FileListAction::Activate(idx));
     }
-    // The selection badge, from the second reference design: a filled accent
-    // disc with a tick, in the tile's top-right.
-    //
-    // Drawn last so it sits over the icon rather than under it. It is worth
-    // having in a grid and not in a list for one reason: a grid row has no
-    // left edge to carry an accent, and a tint spread across a whole tile is
-    // the weakest selection cue in the application.
-    if selected {
-        let badge = pos2(rect.right() - 15.0, rect.top() + 15.0);
-        ui.painter().circle_filled(badge, 9.0, p.accent);
-        icons::check(ui.painter(), badge, 9.0, Color32::WHITE);
-    }
 
     if response.clicked() {
         let mods = ui.input(|i| i.modifiers);
@@ -1138,7 +1227,7 @@ fn show_grid(
             let row = index / columns;
             let top = row as f32 * (TILE_H + TILE_GAP);
             let bottom = top + TILE_H + TILE_GAP;
-            let current = state.scroll_offset;
+            let current = scroll_offset(ui, "grid");
 
             let desired = if top < current {
                 Some(top)
@@ -1215,7 +1304,7 @@ fn show_grid(
         }
     });
 
-    state.scroll_offset = output.state.offset.y;
+    remember_scroll(ui, "grid", output.id);
 
     // See the list view: `show_rows` leaves no allocatable space after the
     // tiles, so the area below them has to be interacted with directly.
@@ -1346,6 +1435,16 @@ fn draw_tile(
         ),
     }
 
+    // Renaming: the box takes the name's place under the icon. Without it a
+    // rename started in the grid — F2, or New Folder — was open but invisible,
+    // could not be finished, and held back the tab's refreshes until it was.
+    let name_top = rect.top() + 14.0 + TILE_ICON + 8.0;
+    if let Some((text, generation)) = marks.rename_text(idx) {
+        let field = Rect::from_min_size(pos2(rect.left() + 6.0, name_top - 4.0), vec2(TILE_W - 12.0, 30.0));
+        // As in the list: while the box is open the tile is not a target.
+        return rename_box(ui, p, field, text, generation);
+    }
+
     // Name: up to two lines, centred, ellipsised. Two rather than one because a
     // grid of truncated names is unusable — the distinguishing part of a
     // filename is very often at the end.
@@ -1364,11 +1463,20 @@ fn draw_tile(
         overflow_character: Some('…'),
     };
     let galley = ui.painter().layout_job(job);
-    ui.painter().galley(
-        pos2(rect.center().x, rect.top() + 14.0 + TILE_ICON + 8.0),
-        galley,
-        colour,
-    );
+    ui.painter().galley(pos2(rect.center().x, name_top), galley, colour);
+
+    // The selection badge, from the second reference design: a filled accent
+    // disc with a tick, in the tile's top-right.
+    //
+    // Drawn last so it sits over the icon rather than under it. It is worth
+    // having in a grid and not in a list for one reason: a grid row has no
+    // left edge to carry an accent, and a tint spread across a whole tile is
+    // the weakest selection cue in the application.
+    if selected {
+        let badge = pos2(rect.right() - 15.0, rect.top() + 15.0);
+        ui.painter().circle_filled(badge, 9.0, p.accent);
+        icons::check(ui.painter(), badge, 9.0, Color32::WHITE);
+    }
 
     if response.double_clicked() {
         return Some(FileListAction::Activate(idx));
@@ -1456,7 +1564,7 @@ pub fn split_extension(name: &str, kind: EntryKind) -> Option<(&str, &str)> {
 /// folder of forty photographs the extension is the same forty times, and it
 /// costs the same reading weight as the part that differs.
 #[allow(clippy::too_many_arguments)]
-fn draw_name_text(
+pub(crate) fn draw_name_text(
     ui: &Ui,
     cell: Rect,
     name: &str,
@@ -1508,6 +1616,125 @@ pub fn kind_label(kind: EntryKind, name: &str) -> String {
 /// Number of rows that fit in `height` — used to size PageUp/PageDown.
 pub fn rows_per_page(height: f32) -> usize {
     ((height / ROW_HEIGHT).floor() as usize).max(1)
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use neutron_core::entry::{Entry, SyncState};
+
+    /// Drives the list the way the app does: each frame draws from a clone of
+    /// a state the owner keeps, and the owner clears `scroll_to` once drawn.
+    struct Harness {
+        ctx: egui::Context,
+        state: FileListState,
+        list: EntryList,
+        selection: Selection,
+        /// Seconds since the first frame. Advanced a quarter-second a frame, so
+        /// two clicks a few frames apart are two clicks and not a double-click.
+        time: f64,
+    }
+
+    impl Harness {
+        fn new(rows: usize) -> Self {
+            let mut list: EntryList = (0..rows)
+                .map(|i| Entry {
+                    name: format!("file{i:04}.txt"),
+                    kind: EntryKind::File,
+                    size: 0,
+                    modified: 0,
+                    created: 0,
+                    attrs: 0,
+                    sync: SyncState::None,
+                })
+                .collect();
+            neutron_core::sort::apply(&mut list, SortSpec::default(), true);
+            Harness {
+                ctx: egui::Context::default(),
+                state: FileListState::default(),
+                list,
+                selection: Selection::new(),
+                time: 0.0,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> Option<FileListAction> {
+            let mut view = self.state.clone();
+            let mut action = None;
+            let marks = Marks { selection: &self.selection, cut: None, rename: None };
+            self.time += 0.25;
+            let mut output = self.ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                    time: Some(self.time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| action = show(ui, &mut view, &self.list, &marks, &Palette::LIGHT, None),
+            );
+            output.textures_delta.clear();
+            // What the app does after drawing.
+            self.state.scroll_to = None;
+            action
+        }
+
+        /// The storage index of the row drawn at `y`, found by clicking it.
+        fn row_at(&mut self, y: f32) -> usize {
+            let at = pos2(300.0, y);
+            let press = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            match self.frame(vec![egui::Event::PointerMoved(at), press(true), press(false)]) {
+                Some(FileListAction::Select { idx, .. }) => idx,
+                other => panic!("expected a row at y={y}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bringing_a_visible_row_into_view_leaves_the_list_where_it_is() {
+        let mut h = Harness::new(400);
+        h.frame(Vec::new());
+
+        // Far down the listing, as a keyboard walk to row 200 would leave it.
+        h.state.scroll_to = Some(h.list.at(200));
+        h.frame(Vec::new());
+        h.frame(Vec::new());
+        let before = h.row_at(300.0);
+        assert!(h.list.rank(before).unwrap() > 150, "the list did not scroll to row 200");
+
+        // Row 195 is on screen already. Nothing should move — measuring from
+        // an offset of zero, as before, scrolled the list so it sat at the
+        // bottom edge.
+        h.state.scroll_to = Some(h.list.at(195));
+        h.frame(Vec::new());
+        h.frame(Vec::new());
+        assert_eq!(h.row_at(300.0), before);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_away_from_a_row_brought_into_view() {
+        let mut h = Harness::new(400);
+        h.frame(Vec::new());
+        h.state.scroll_to = Some(h.list.at(200));
+        h.frame(Vec::new());
+
+        h.frame(vec![egui::Event::PointerMoved(pos2(300.0, 300.0))]);
+        h.frame(vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, 100_000.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        }]);
+        for _ in 0..60 {
+            h.frame(Vec::new());
+        }
+        let top = h.row_at(120.0);
+        assert!(h.list.rank(top).unwrap() < 5, "the list snapped back to row 200");
+    }
 }
 
 #[cfg(test)]

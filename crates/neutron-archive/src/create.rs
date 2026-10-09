@@ -15,13 +15,46 @@ use crate::{ArchiveError, Continue, Progress, Summary};
 ///
 /// Directories are walked; the walk does not follow reparse points, so a
 /// junction pointing at `C:\` cannot turn a small folder into the whole disk.
+///
+/// On failure the partly written archive is removed. A zip is only readable
+/// once its central directory is written at the very end, so whatever was on
+/// disk at the moment of failure is a file with the right name and size that
+/// no tool can open — the worst kind of leftover, because it looks like the
+/// thing that was asked for.
 pub fn zip(
     sources: &[PathBuf],
     base: &Path,
     output: &Path,
-    mut on_progress: impl FnMut(Progress) -> Continue,
+    on_progress: impl FnMut(Progress) -> Continue,
 ) -> Result<Summary, ArchiveError> {
     let file = fs::File::create(output)?;
+    let written = write_zip(file, sources, base, on_progress);
+    if written.is_err() {
+        let _ = fs::remove_file(output);
+    }
+    written
+}
+
+/// Whether a member of `len` bytes needs the ZIP64 extension.
+///
+/// The classic zip header holds sizes in 32 bits, and the `zip` crate does not
+/// switch to ZIP64 by itself: a member that crosses 4 GiB without
+/// `large_file` set fails the write partway through. So it is set from the
+/// size on disk — with headroom, since the *compressed* size is what has to
+/// fit too, and deflate makes incompressible data very slightly larger. Not
+/// set for everything, because ZIP64 members cost a few bytes each and, more
+/// to the point, some old extractors refuse them outright.
+fn needs_zip64(len: u64) -> bool {
+    const HEADROOM: u64 = 64 * 1024 * 1024;
+    len >= u64::from(u32::MAX) - HEADROOM
+}
+
+fn write_zip(
+    file: fs::File,
+    sources: &[PathBuf],
+    base: &Path,
+    mut on_progress: impl FnMut(Progress) -> Continue,
+) -> Result<Summary, ArchiveError> {
     let mut writer = zip::ZipWriter::new(io::BufWriter::new(file));
     let base_options: zip::write::FileOptions<'_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
@@ -76,7 +109,7 @@ pub fn zip(
         }
 
         writer
-            .start_file(&name, options)
+            .start_file(&name, options.large_file(needs_zip64(meta.len())))
             .map_err(|e| ArchiveError::Unreadable(e.to_string()))?;
 
         let mut source = match fs::File::open(&path) {
@@ -169,6 +202,37 @@ pub fn suggested_name(sources: &[PathBuf], base: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_member_near_or_over_four_gigabytes_is_written_as_zip64() {
+        assert!(!needs_zip64(0));
+        assert!(!needs_zip64(1024 * 1024 * 1024));
+        assert!(needs_zip64(u64::from(u32::MAX)));
+        assert!(needs_zip64(5 * 1024 * 1024 * 1024));
+        // Inside the headroom: small enough to fit uncompressed, close enough
+        // that deflate's overhead on incompressible data could push it over.
+        assert!(needs_zip64(u64::from(u32::MAX) - 1024));
+    }
+
+    #[test]
+    fn a_failed_zip_leaves_no_partial_archive_behind() {
+        // The same file named twice is a duplicate member, which the zip
+        // writer refuses partway through — after the first copy has already
+        // been written to disk. Any mid-write failure takes the same path;
+        // this is simply the one a test can cause on demand.
+        let dir = std::env::temp_dir()
+            .join(format!("neutron-archive-create-{}-partial", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("a.txt");
+        fs::write(&source, vec![b'a'; 100_000]).unwrap();
+        let output = dir.join("out.zip");
+
+        let outcome = zip(&[source.clone(), source], &dir, &output, |_| Continue::Yes);
+
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert!(!output.exists(), "the partial archive was left behind");
+    }
 
     #[test]
     fn one_file_names_the_archive_after_it_without_its_extension() {

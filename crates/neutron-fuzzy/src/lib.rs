@@ -7,6 +7,7 @@
 //!
 //! Filled in at M5.
 
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// A scored match with the character positions that matched, in ascending
@@ -24,7 +25,15 @@ pub struct FuzzyMatcher {
     /// Scratch for UTF-32 conversion, reused across calls to avoid a per-item
     /// allocation when scoring hundreds of thousands of candidates.
     haystack_buf: Vec<char>,
-    needle_buf: Vec<char>,
+    /// The needle as nucleo wants it, and the text it was built from.
+    ///
+    /// nucleo folds case and strips accents from the haystack but expects the
+    /// needle prepared the same way by the caller. Passing it raw made any
+    /// capital in the query match only that same capital — "Readme" found
+    /// nothing in `readme.md` — and an accented letter match nothing at all.
+    /// An `Atom` does that preparation; it is kept between calls because the
+    /// same needle is scored against every candidate.
+    atom: Option<(String, Atom)>,
 }
 
 impl FuzzyMatcher {
@@ -34,7 +43,7 @@ impl FuzzyMatcher {
         Self {
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             haystack_buf: Vec::new(),
-            needle_buf: Vec::new(),
+            atom: None,
         }
     }
 
@@ -49,12 +58,23 @@ impl FuzzyMatcher {
             });
         }
 
-        let hay = Utf32Str::new(haystack, &mut self.haystack_buf);
-        let nee = Utf32Str::new(needle, &mut self.needle_buf);
+        if self.atom.as_ref().is_none_or(|(text, _)| text != needle) {
+            let atom = Atom::new(
+                needle,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+                false,
+            );
+            self.atom = Some((needle.to_owned(), atom));
+        }
+        let Some((_, atom)) = &self.atom else {
+            return None;
+        };
 
+        let hay = Utf32Str::new(haystack, &mut self.haystack_buf);
         let mut positions = Vec::new();
-        self.matcher
-            .fuzzy_indices(hay, nee, &mut positions)
+        atom.indices(hay, &mut self.matcher, &mut positions)
             // nucleo scores are u16; widened here so callers can sum or scale
             // them (blending index rank with match quality) without overflow.
             .map(|score| Match {
@@ -93,6 +113,15 @@ mod tests {
     fn empty_needle_matches_everything() {
         let mut m = FuzzyMatcher::new();
         assert!(m.score("anything", "").is_some());
+    }
+
+    #[test]
+    fn a_capital_in_the_query_matches_either_case() {
+        let mut m = FuzzyMatcher::new();
+        assert!(m.score("readme.md", "Readme").is_some());
+        assert!(m.score("New folder", "new").is_some());
+        assert!(m.score("new folder", "New").is_some());
+        assert!(m.score("Öl.txt", "öL").is_some());
     }
 
     #[test]

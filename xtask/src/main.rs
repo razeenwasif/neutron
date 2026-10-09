@@ -18,6 +18,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 /// Everything the install copies.
 ///
 /// `neutron-indexer.exe` is not optional. `index_client::helper_path` looks for
@@ -25,6 +28,7 @@ use std::process::Command;
 /// file that is not there — so an install of the main binary alone produces a
 /// program whose search is permanently broken, and says so only when you use
 /// it.
+#[cfg(not(target_os = "macos"))]
 const ARTIFACTS: &[&str] = &["neutron.exe", "neutron-indexer.exe"];
 
 fn main() {
@@ -34,6 +38,8 @@ fn main() {
 
     let result = match command.as_str() {
         "install" => install(&rest),
+        #[cfg(target_os = "macos")]
+        "bundle" => macos::bundle(&rest).map(|_| ()),
         "uninstall" => uninstall(),
         "where" => show_paths(),
         other => {
@@ -54,6 +60,7 @@ fn main() {
 const USAGE: &str = "\
 cargo xtask <command>
 
+  bundle [--debug]    build target/<profile>/Neutron.app (macOS)
   install [--debug]   build and copy Neutron into %LOCALAPPDATA%\\Programs\\Neutron
   uninstall           remove that folder
   where               print the paths involved and what is currently installed";
@@ -64,6 +71,7 @@ cargo xtask <command>
 /// executables and their future company are an application, not a pair of
 /// strays — and because uninstalling is then one directory rather than a list
 /// that has to stay in step with what was copied.
+#[cfg(not(target_os = "macos"))]
 fn install_dir() -> Result<PathBuf, String> {
     let base = std::env::var_os("LOCALAPPDATA")
         .ok_or("LOCALAPPDATA is not set; this is a Windows-only install")?;
@@ -72,7 +80,10 @@ fn install_dir() -> Result<PathBuf, String> {
 
 fn target_dir(debug: bool) -> PathBuf {
     let profile = if debug { "debug" } else { "release" };
-    workspace_root().join("target").join(profile)
+    let base = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"));
+    let base = if base.is_absolute() { base } else { workspace_root().join(base) };
+    base.join(profile)
 }
 
 /// The workspace root, from this crate's manifest rather than the current
@@ -84,6 +95,7 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn install(args: &[String]) -> Result<(), String> {
     let debug = args.iter().any(|a| a == "--debug");
     let dest = install_dir()?;
@@ -145,7 +157,7 @@ fn copy(from: &Path, to: &Path) -> Result<(), String> {
     match std::fs::copy(from, to) {
         Ok(_) => Ok(()),
         Err(e)
-            if matches!(e.raw_os_error(), Some(ACCESS_DENIED | SHARING_VIOLATION)) =>
+            if cfg!(windows) && matches!(e.raw_os_error(), Some(ACCESS_DENIED | SHARING_VIOLATION)) =>
         {
             Err(format!(
                 "{} is in use. Close the running copy and try again.",
@@ -156,6 +168,7 @@ fn copy(from: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn uninstall() -> Result<(), String> {
     let dest = install_dir()?;
     if !dest.exists() {
@@ -175,6 +188,7 @@ fn uninstall() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn show_paths() -> Result<(), String> {
     let dest = install_dir()?;
     println!("workspace   {}", workspace_root().display());
@@ -190,3 +204,10 @@ fn show_paths() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+fn install(args: &[String]) -> Result<(), String> { macos::install(args) }
+#[cfg(target_os = "macos")]
+fn uninstall() -> Result<(), String> { macos::uninstall() }
+#[cfg(target_os = "macos")]
+fn show_paths() -> Result<(), String> { macos::show_paths() }

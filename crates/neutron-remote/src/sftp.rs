@@ -28,13 +28,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use neutron_core::entry::EntryKind;
 use russh::keys::PublicKeyOrCertificate;
-use russh::keys::HashAlg;
+use russh::keys::agent::AgentIdentity;
+use russh::keys::agent::client::{AgentClient, AgentStream};
+use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
 use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::hostkey::{self, Decision};
 use crate::path;
-use crate::site::Site;
+use crate::site::{Auth, Site};
 use crate::transport::{CHUNK, CONNECT_TIMEOUT, Continue, RemoteEntry, RemoteError, Transport};
 
 /// A connected SFTP session, and the runtime driving it.
@@ -147,7 +149,10 @@ impl SftpTransport {
         } else {
             site.username.clone()
         };
-        let password = password.to_owned();
+        // Read before anything is dialled: a missing key file or a forgotten
+        // passphrase is a problem on this machine, and finding out about it
+        // should not cost a round trip and a key exchange.
+        let login = Login::prepare(site, password, &address)?;
         let address_for_task = address.clone();
 
         let (ssh, session) = runtime.block_on(async move {
@@ -181,16 +186,7 @@ impl SftpTransport {
                 }
             };
 
-            let authenticated = ssh
-                .authenticate_password(&username, &password)
-                .await
-                .map_err(|e| RemoteError::Connect {
-                    address: address_for_task.clone(),
-                    reason: e.to_string(),
-                })?;
-            if !authenticated.success() {
-                return Err(RemoteError::Auth { address: address_for_task.clone() });
-            }
+            login.authenticate(&mut ssh, &username, &address_for_task).await?;
 
             let channel = ssh
                 .channel_open_session()
@@ -234,6 +230,225 @@ impl SftpTransport {
             address,
             new_fingerprint,
         })
+    }
+}
+
+/// How this connection will prove who it is, resolved before dialling.
+enum Login {
+    Password(String),
+    Key(Arc<PrivateKey>),
+    Agent,
+}
+
+impl Login {
+    fn prepare(site: &Site, secret: &str, address: &str) -> Result<Login, RemoteError> {
+        Ok(match &site.auth {
+            Auth::Password => Login::Password(secret.to_owned()),
+            Auth::Key { path } => Login::Key(Arc::new(load_key(path, secret, address)?)),
+            Auth::Agent => Login::Agent,
+        })
+    }
+
+    async fn authenticate(
+        self,
+        ssh: &mut russh::client::Handle<Client>,
+        username: &str,
+        address: &str,
+    ) -> Result<(), RemoteError> {
+        let failed = |e: &dyn std::fmt::Display| RemoteError::Connect {
+            address: address.to_owned(),
+            reason: e.to_string(),
+        };
+
+        let accepted = match self {
+            Login::Password(password) => ssh
+                .authenticate_password(username, password)
+                .await
+                .map_err(|e| failed(&e))?
+                .success(),
+            Login::Key(key) => {
+                let hash = rsa_hash(ssh, key.public_key().algorithm()).await;
+                ssh.authenticate_publickey(username, PrivateKeyWithHashAlg::new(key, hash))
+                    .await
+                    .map_err(|e| failed(&e))?
+                    .success()
+            }
+            Login::Agent => {
+                let mut agent = agent().await.map_err(|reason| RemoteError::Connect {
+                    address: address.to_owned(),
+                    reason,
+                })?;
+                let identities = agent
+                    .request_identities()
+                    .await
+                    .map_err(|e| failed(&format!("the SSH agent did not answer: {e}")))?;
+                if identities.is_empty() {
+                    return Err(failed(&"the SSH agent holds no keys — add one with ssh-add"));
+                }
+
+                // Offered one at a time, as OpenSSH does. A server counts each
+                // as an attempt, so an agent holding more keys than the
+                // server's MaxAuthTries can be cut off before reaching the
+                // right one — the same limit `ssh` itself runs into, and the
+                // reason a key file is the better choice for that setup.
+                let mut accepted = false;
+                for identity in identities {
+                    let outcome = match identity {
+                        AgentIdentity::PublicKey { key, .. } => {
+                            let hash = rsa_hash(ssh, key.algorithm()).await;
+                            ssh.authenticate_publickey_with(username, key, hash, &mut agent)
+                                .await
+                        }
+                        AgentIdentity::Certificate { certificate, .. } => {
+                            let hash = rsa_hash(ssh, certificate.algorithm()).await;
+                            ssh.authenticate_certificate_with(
+                                username,
+                                certificate,
+                                hash,
+                                &mut agent,
+                            )
+                            .await
+                        }
+                    };
+                    match outcome {
+                        Ok(result) if result.success() => {
+                            accepted = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        // An agent that refuses to sign — a hardware key nobody
+                        // touched, a confirmation declined — is one identity
+                        // failing, not the whole login.
+                        Err(e) => tracing::debug!(%address, "agent identity not usable: {e}"),
+                    }
+                }
+                accepted
+            }
+        };
+
+        if accepted {
+            Ok(())
+        } else {
+            Err(RemoteError::Auth { address: address.to_owned() })
+        }
+    }
+}
+
+/// Which signature hash to use with an RSA key, or `None` for every other kind.
+///
+/// Only asked for RSA, because asking can wait up to a second for the server's
+/// extension list. A server that sends no list is offered SHA-256 anyway:
+/// OpenSSH has refused SHA-1 RSA signatures by default since 8.8, so falling
+/// back to it would fail against exactly the servers most likely to be running.
+async fn rsa_hash(
+    ssh: &russh::client::Handle<Client>,
+    algorithm: russh::keys::Algorithm,
+) -> Option<HashAlg> {
+    if !algorithm.is_rsa() {
+        return None;
+    }
+    match ssh.best_supported_rsa_hash().await {
+        Ok(Some(hash)) => hash,
+        Ok(None) | Err(_) => Some(HashAlg::Sha256),
+    }
+}
+
+type Agent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
+
+/// The running SSH agent, wherever this platform keeps it.
+#[cfg(unix)]
+async fn agent() -> Result<Agent, String> {
+    match AgentClient::connect_env().await {
+        Ok(agent) => Ok(agent.dynamic()),
+        Err(russh::keys::Error::EnvVar(_)) => {
+            Err("no SSH agent is running (SSH_AUTH_SOCK is not set)".to_owned())
+        }
+        Err(e) => Err(format!("could not reach the SSH agent: {e}")),
+    }
+}
+
+/// The running SSH agent, wherever this platform keeps it.
+///
+/// Windows has two in common use: the OpenSSH agent service, on a named pipe,
+/// and PuTTY's Pageant. `SSH_AUTH_SOCK` is honoured first for anyone who has
+/// pointed it at a pipe of their own, then OpenSSH's well-known pipe, then
+/// Pageant.
+#[cfg(windows)]
+async fn agent() -> Result<Agent, String> {
+    if let Ok(pipe) = std::env::var("SSH_AUTH_SOCK") {
+        if let Ok(agent) = AgentClient::connect_named_pipe(pipe).await {
+            return Ok(agent.dynamic());
+        }
+    }
+    if let Ok(agent) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+        return Ok(agent.dynamic());
+    }
+    match AgentClient::connect_pageant().await {
+        Ok(agent) => Ok(agent.dynamic()),
+        Err(_) => Err(
+            "no SSH agent is running — start the OpenSSH Authentication Agent service or Pageant"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Reads a private key file, decrypting it with `passphrase` if it needs one.
+///
+/// An unencrypted key is tried without the passphrase first: a site that
+/// switched from a password to a key may still have the old password saved,
+/// and some key formats refuse to parse when handed a passphrase they do not
+/// need.
+fn load_key(path: &str, passphrase: &str, address: &str) -> Result<PrivateKey, RemoteError> {
+    let unusable = |reason: String| RemoteError::Key {
+        path: path.to_owned(),
+        reason,
+    };
+    let text = std::fs::read_to_string(expand_home(path)).map_err(|e| unusable(e.to_string()))?;
+
+    let first = match russh::keys::decode_secret_key(&text, None) {
+        Ok(key) => return Ok(key),
+        Err(e) => e,
+    };
+    let encrypted = matches!(first, russh::keys::Error::KeyIsEncrypted)
+        || text.contains("ENCRYPTED")
+        || text.contains("Encryption: aes");
+
+    if passphrase.is_empty() {
+        return Err(if encrypted {
+            // The same error as a missing password, because the fix is the
+            // same: open the site and type the secret in.
+            RemoteError::NoPassword { address: address.to_owned() }
+        } else {
+            unusable(first.to_string())
+        });
+    }
+    russh::keys::decode_secret_key(&text, Some(passphrase)).map_err(|e| {
+        unusable(if encrypted {
+            "the saved passphrase does not decrypt it".to_owned()
+        } else {
+            e.to_string()
+        })
+    })
+}
+
+/// `~/.ssh/id_ed25519` → the real path. Key paths are written this way by
+/// hand far more often than not, and the OS will not expand them.
+fn expand_home(path: &str) -> std::path::PathBuf {
+    let rest = match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => rest,
+        _ => return path.into(),
+    };
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    match home {
+        Some(home) => {
+            let mut full = std::path::PathBuf::from(home);
+            let rest = rest.trim_start_matches(['/', '\\']);
+            if !rest.is_empty() {
+                full.push(rest);
+            }
+            full
+        }
+        None => path.into(),
     }
 }
 
@@ -459,6 +674,8 @@ mod tests {
             username: String::new(),
             path: None,
             fingerprint: None,
+            auth: Default::default(),
+            trusted_cert: None,
         }
     }
 

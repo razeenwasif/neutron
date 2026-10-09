@@ -235,6 +235,59 @@ fn one_endless_line_does_not_grow_without_limit() {
 }
 
 #[test]
+fn a_line_that_never_ends_is_refused_promptly_rather_than_at_the_deadline() {
+    // No newline, ever. The cap has to fire while the line is still being
+    // read; a reader that waited for the newline would buffer until the
+    // deadline killed the plugin, holding everything it had read so far.
+    let root = scratch("endless");
+    let set = install(&root, r#"while true; do printf '%01000d' 0; done"#, "folder", 20_000);
+
+    let started = Instant::now();
+    let out = run(&set, "/tmp", &[]);
+
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    let error = out.error.expect("an over-long line is a plugin error");
+    assert!(error.contains("longer than"), "{error}");
+}
+
+#[test]
+fn a_plugin_that_logs_heavily_to_stderr_is_not_cut_off() {
+    // Far more than the kept tail and more than a pipe buffer. The stderr
+    // reader used to stop after 8 KB and drop the pipe, so the next write
+    // killed the plugin with SIGPIPE before it could answer.
+    let root = scratch("chatty");
+    let set = install(
+        &root,
+        r#"i=0
+           while [ $i -lt 400 ]; do printf '%01000d\n' $i >&2; i=$((i+1)); done
+           echo '{"type":"status","text":"done"}'"#,
+        "folder",
+        10_000,
+    );
+
+    let out = run(&set, "/tmp", &[]);
+    assert_eq!(out.error, None, "{out:?}");
+    assert_eq!(out.status.as_deref(), Some("done"), "{out:?}");
+}
+
+#[test]
+fn a_failing_plugin_reports_the_end_of_its_stderr_not_the_beginning() {
+    let root = scratch("tail");
+    let set = install(
+        &root,
+        r#"i=0
+           while [ $i -lt 100 ]; do printf 'noise %01000d\n' $i >&2; i=$((i+1)); done
+           echo "the actual cause" >&2
+           exit 2"#,
+        "folder",
+        10_000,
+    );
+
+    let error = run(&set, "/tmp", &[]).error.expect("must report");
+    assert!(error.contains("the actual cause"), "{error}");
+}
+
+#[test]
 fn a_control_character_in_a_status_line_cannot_reach_the_status_bar() {
     let root = scratch("sanitised");
     // A real carriage return, written by the plugin through printf, not the

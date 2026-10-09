@@ -56,6 +56,20 @@ const SELF_ICONED: &[&str] = &[
     "exe", "lnk", "ico", "cur", "ani", "url", "scr", "msc", "cpl",
 ];
 
+/// The macOS equivalents: an application's icon is in its bundle, and an
+/// `.icns` file *is* an icon. `fs_macos` reports packages as files, so a
+/// `.app` arrives here with `is_dir == false` and is keyed by path.
+#[cfg(target_os = "macos")]
+const SELF_ICONED_MACOS: &[&str] = &["app", "icns", "prefpane", "appex", "saver"];
+
+fn self_iconed(ext: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    if SELF_ICONED_MACOS.contains(&ext) {
+        return true;
+    }
+    SELF_ICONED.contains(&ext)
+}
+
 impl IconKey {
     /// The key for one directory entry.
     pub fn for_entry(name: &str, is_dir: bool) -> IconKey {
@@ -69,7 +83,7 @@ impl IconKey {
 
         match extension(name) {
             None => IconKey::Extensionless,
-            Some(ext) if SELF_ICONED.contains(&ext.as_str()) => {
+            Some(ext) if self_iconed(&ext) => {
                 // Resolved by the caller against the real path.
                 IconKey::Path(PathBuf::from(name))
             }
@@ -115,7 +129,15 @@ pub struct IconImage {
 fn bgra_to_rgba(pixels: &mut [u8]) {
     for px in pixels.chunks_exact_mut(4) {
         px.swap(0, 2);
+    }
+    unpremultiply(pixels);
+}
 
+/// In-place RGBA-premultiplied to RGBA-straight. AppKit renders into a
+/// premultiplied bitmap already in RGBA order, so macOS needs only this half.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn unpremultiply(pixels: &mut [u8]) {
+    for px in pixels.chunks_exact_mut(4) {
         let a = px[3];
         if a == 0 {
             // Fully transparent pixels carry arbitrary colour under
@@ -347,9 +369,105 @@ mod win32 {
 #[cfg(windows)]
 pub use win32::resolve;
 
-/// Non-Windows placeholder, so the portable key logic above can be built and
+// --- AppKit resolution -----------------------------------------------------
+
+#[cfg(target_os = "macos")]
+mod appkit {
+    use super::*;
+
+    use objc2::AnyThread;
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2_app_kit::{
+        NSBitmapFormat, NSBitmapImageRep, NSColorSpace, NSCompositingOperation,
+        NSDeviceRGBColorSpace, NSGraphicsContext, NSImage, NSImageInterpolation, NSWorkspace,
+    };
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+
+    /// Resolves `key` to pixels.
+    ///
+    /// Safe on any thread: `NSWorkspace`'s icon lookups are documented as
+    /// thread-safe, and drawing goes into a private bitmap context that is
+    /// made current on this thread only. The icon pool calls it from workers.
+    ///
+    /// Only [`IconKey::Path`] asks about a real file. Everything else is
+    /// answered from the type alone, which never reads (or, for an iCloud
+    /// placeholder, downloads) anything.
+    pub fn resolve(key: &IconKey) -> Option<IconImage> {
+        autoreleasepool(|_| {
+            let workspace = NSWorkspace::sharedWorkspace();
+            let image = match key {
+                IconKey::Path(path) => workspace.iconForFile(&NSString::from_str(path.to_str()?)),
+                // `iconForFileType:` takes an extension or a UTI. Its
+                // replacement, `iconForContentType:`, needs a `UTType`, which
+                // would add a framework binding to answer the same question.
+                #[allow(deprecated)]
+                IconKey::Extension(ext) => workspace.iconForFileType(&NSString::from_str(ext)),
+                #[allow(deprecated)]
+                IconKey::Extensionless => workspace.iconForFileType(&NSString::from_str("public.data")),
+                #[allow(deprecated)]
+                IconKey::Directory => workspace.iconForFileType(&NSString::from_str("public.folder")),
+            };
+            render(&image)
+        })
+    }
+
+    /// Draws `image` into an `ICON_PX` square and returns straight RGBA.
+    fn render(image: &NSImage) -> Option<IconImage> {
+        let px = ICON_PX as isize;
+        // SAFETY: a null plane pointer asks AppKit to allocate and own the
+        // buffer; the geometry describes one interleaved 8-bit RGBA plane.
+        // Format 0 is premultiplied, alpha last — the only layout a bitmap
+        // graphics context accepts, hence `unpremultiply` below.
+        let rep = unsafe {
+            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
+                NSBitmapImageRep::alloc(), std::ptr::null_mut(), px, px, 8, 4, true, false,
+                NSDeviceRGBColorSpace, NSBitmapFormat::empty(), px * 4, 32,
+            )
+        }?;
+        // Tagged sRGB so the icon's colours are converted to what egui's
+        // texture expects, rather than to whatever "device" means today.
+        let rep: Retained<NSBitmapImageRep> =
+            rep.bitmapImageRepByRetaggingWithColorSpace(&NSColorSpace::sRGBColorSpace())?;
+        // One point per pixel, so the image picks its 32px representation.
+        rep.setSize(NSSize::new(ICON_PX as f64, ICON_PX as f64));
+
+        let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
+        NSGraphicsContext::saveGraphicsState_class();
+        NSGraphicsContext::setCurrentContext(Some(&context));
+        context.setImageInterpolation(NSImageInterpolation::High);
+        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(ICON_PX as f64, ICON_PX as f64));
+        image.drawInRect_fromRect_operation_fraction(
+            rect, NSRect::ZERO, NSCompositingOperation::SourceOver, 1.0,
+        );
+        context.flushGraphics();
+        NSGraphicsContext::restoreGraphicsState_class();
+
+        let data = rep.bitmapData();
+        let stride = rep.bytesPerRow() as usize;
+        let row = (ICON_PX * 4) as usize;
+        if data.is_null() || stride < row {
+            return None;
+        }
+        let mut rgba = Vec::with_capacity(row * ICON_PX as usize);
+        for y in 0..ICON_PX as usize {
+            // SAFETY: the rep owns `stride * ICON_PX` bytes at `data`, and
+            // `rep` is alive for the whole loop.
+            let line = unsafe { std::slice::from_raw_parts(data.add(y * stride), row) };
+            rgba.extend_from_slice(line);
+        }
+        unpremultiply(&mut rgba);
+        // A fully transparent result means nothing was drawn; the row's glyph
+        // is a better answer than an invisible icon.
+        rgba.chunks_exact(4).any(|p| p[3] != 0).then_some(IconImage { rgba })
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use appkit::resolve;
+
+/// Placeholder elsewhere, so the portable key logic above can be built and
 /// tested on Linux. See `fs_stub` for why these exist.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn resolve(_key: &IconKey) -> Option<IconImage> {
     None
 }
@@ -451,6 +569,22 @@ mod tests {
         let mut px = vec![200u8, 100, 50, 0];
         bgra_to_rgba(&mut px);
         assert_eq!(px, vec![0, 0, 0, 0]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn appkit_resolves_folder_and_text_icons() {
+        // From a test thread, which is not the main thread — the icon pool's
+        // situation exactly.
+        for key in [IconKey::Directory, IconKey::Extension("txt".into()), IconKey::Extensionless] {
+            let image = resolve(&key).unwrap_or_else(|| panic!("{key:?} resolved to nothing"));
+            assert_eq!(image.rgba.len(), (ICON_PX * ICON_PX * 4) as usize, "{key:?}");
+            let opaque = image.rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
+            assert!(opaque > 64, "{key:?} is almost entirely transparent");
+            assert!(image.rgba.chunks_exact(4).any(|p| p[3] > 0 && p[..3] != [0, 0, 0]), "{key:?} is black");
+        }
+        let app = IconKey::Path(PathBuf::from("/System/Applications/Calculator.app"));
+        assert!(resolve(&app).is_some());
     }
 
     #[test]

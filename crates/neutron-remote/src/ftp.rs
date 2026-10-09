@@ -27,16 +27,48 @@
 //! Active mode asks the server to open a connection back to the client, which
 //! has not worked through a home router without deliberate configuration for
 //! twenty years. `suppaftp` defaults to passive; this leaves it there.
+//!
+//! Within passive mode, `EPSV` (RFC 2428) is used whenever `FEAT` offers it,
+//! and `PASV` otherwise. `EPSV` answers with a port only, so the data
+//! connection necessarily goes to the host the control connection reached —
+//! and it is the only form that works over IPv6 at all. When the server only
+//! speaks `PASV`, the address in its reply is ignored and the port is used
+//! against the control connection's peer instead. That is the usual NAT
+//! workaround — a server behind a router routinely advertises its private
+//! `192.168.x.y` address, which is unreachable from here — and it also closes
+//! the old FTP bounce trick, where a hostile server's `PASV` reply points the
+//! client's data connection at some third machine of the server's choosing.
+//!
+//! # Whose certificates FTPS trusts
+//!
+//! The bundled Mozilla roots from `webpki-roots` — not the platform's trust
+//! store, so a corporate root installed in Keychain or the Windows store is not
+//! honoured here — plus, per site, one exact certificate the user chose to
+//! trust. See [`crate::certificate`] for why that is a pin the user sets rather
+//! than something recorded on first contact.
+//!
+//! # Every socket has a deadline
+//!
+//! The connect timeout covers only the handshake. A server that accepts and
+//! then stalls would leave a blocking read waiting forever, and every remote
+//! tab shares one loader thread, so the whole feature would freeze behind it.
+//! The control connection and every data connection therefore carry read and
+//! write timeouts — see [`IO_TIMEOUT`].
 
 use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
 
 use neutron_core::entry::EntryKind;
 use suppaftp::list::{File, ListParser};
 use suppaftp::{ImplFtpStream, RustlsConnector, RustlsFtpStream, TlsStream};
 
+use crate::certificate;
 use crate::path;
 use crate::site::{Protocol, Site};
-use crate::transport::{CHUNK, CONNECT_TIMEOUT, Continue, RemoteEntry, RemoteError, Transport};
+use crate::transport::{
+    CHUNK, CONNECT_TIMEOUT, Continue, IO_TIMEOUT, RemoteEntry, RemoteError, Transport,
+};
 
 /// A connected FTP or FTPS session.
 ///
@@ -55,58 +87,190 @@ enum Stream {
     Tls(Box<RustlsFtpStream>),
 }
 
+/// The deadlines one session runs under.
+///
+/// A value rather than the two constants used directly, so the tests can make
+/// a stalled server fail in a fraction of a second instead of a minute.
+#[derive(Debug, Clone, Copy)]
+struct Timeouts {
+    connect: Duration,
+    io: Duration,
+}
+
+impl Timeouts {
+    const DEFAULT: Timeouts = Timeouts {
+        connect: CONNECT_TIMEOUT,
+        io: IO_TIMEOUT,
+    };
+}
+
 impl FtpTransport {
     /// Connects, logs in, and switches to binary mode.
     pub fn connect(site: &Site, password: &str) -> Result<FtpTransport, RemoteError> {
-        let address = site.address();
-        let endpoint = resolve(&site.host, site.port(), &address)?;
+        connect_with(site, password, Timeouts::DEFAULT)
+    }
+}
 
-        // An empty username means anonymous FTP, which is a real and common
-        // configuration. The convention is any e-mail-shaped string as the
-        // password, and servers that check want *something* rather than
-        // nothing.
-        let (user, password) = if site.username.is_empty() {
-            ("anonymous", "neutron@example.invalid")
-        } else {
-            (site.username.as_str(), password)
-        };
+fn connect_with(
+    site: &Site,
+    password: &str,
+    timeouts: Timeouts,
+) -> Result<FtpTransport, RemoteError> {
+    let address = site.address();
+    let control = open_control(&site.host, site.port(), &address, timeouts)?;
 
-        // FTPS is not a plain connection that is later upgraded in the type
-        // system: `suppaftp` parameterises the whole stream by its TLS
-        // implementation, so a secure session has to be built as one from the
-        // start. It is still plain TCP on the wire until `AUTH TLS`.
-        let (stream, mlsd) = match site.protocol {
-            Protocol::Ftps => {
-                let plain = RustlsFtpStream::connect_timeout(endpoint, CONNECT_TIMEOUT)
-                    .map_err(|e| RemoteError::Connect {
+    // An empty username means anonymous FTP, which is a real and common
+    // configuration. The convention is any e-mail-shaped string as the
+    // password, and servers that check want *something* rather than
+    // nothing.
+    let (user, password) = if site.username.is_empty() {
+        ("anonymous", "neutron@example.invalid")
+    } else {
+        (site.username.as_str(), password)
+    };
+
+    let unreachable = |e: suppaftp::FtpError| RemoteError::Connect {
+        address: address.clone(),
+        reason: describe_connect_error(&e, timeouts),
+    };
+
+    // FTPS is not a plain connection that is later upgraded in the type
+    // system: `suppaftp` parameterises the whole stream by its TLS
+    // implementation, so a secure session has to be built as one from the
+    // start. It is still plain TCP on the wire until `AUTH TLS`.
+    //
+    // Either way the session is built on a socket opened here rather than by
+    // `suppaftp`, because that is the only way to put a read timeout on it
+    // before the first read — the server's greeting, which is exactly where a
+    // half-dead server stalls.
+    let (stream, features) = match site.protocol {
+        Protocol::Ftps => {
+            let mut plain = RustlsFtpStream::connect_with_stream(control)
+                .map_err(unreachable)?
+                .passive_stream_builder(data_connector(timeouts));
+            plain.set_passive_nat_workaround(true);
+            let trusted = site.trusted_cert.as_deref();
+            let (config, refused) =
+                certificate::client_config(trusted).map_err(|reason| RemoteError::Connect {
+                    address: address.clone(),
+                    reason: format!("TLS could not be set up: {reason}"),
+                })?;
+            let connector = RustlsConnector::from(std::sync::Arc::new(config));
+            let mut secure = plain.into_secure(connector, &site.host).map_err(|e| {
+                // rustls has reduced a refused certificate to a generic
+                // handshake failure by the time it gets here. The verifier
+                // kept what the server presented, which is what the user
+                // needs in order to decide whether to trust it.
+                match refused.lock().take() {
+                    Some(refusal) => RemoteError::UntrustedCertificate {
+                        message: certificate::untrusted_message(&address, trusted, &refusal),
+                        fingerprint: refusal.fingerprint,
+                    },
+                    None => RemoteError::Connect {
                         address: address.clone(),
-                        reason: e.to_string(),
-                    })?;
-                let connector = RustlsConnector::from(std::sync::Arc::new(tls_config()));
-                let mut secure =
-                    plain
-                        .into_secure(connector, &site.host)
-                        .map_err(|e| RemoteError::Connect {
-                            address: address.clone(),
-                            reason: format!("TLS could not be established: {e}"),
-                        })?;
-                let mlsd = prepare(&mut secure, user, password, &address)?;
-                (Stream::Tls(Box::new(secure)), mlsd)
-            }
-            // Sftp never reaches here; the dispatcher sends it elsewhere.
-            _ => {
-                let mut plain = suppaftp::FtpStream::connect_timeout(endpoint, CONNECT_TIMEOUT)
-                    .map_err(|e| RemoteError::Connect {
-                        address: address.clone(),
-                        reason: e.to_string(),
-                    })?;
-                let mlsd = prepare(&mut plain, user, password, &address)?;
-                (Stream::Plain(plain), mlsd)
-            }
-        };
+                        reason: format!("TLS could not be established: {e}"),
+                    },
+                }
+            })?;
+            let features = prepare(&mut secure, user, password, &address)?;
+            (Stream::Tls(Box::new(secure)), features)
+        }
+        // Sftp never reaches here; the dispatcher sends it elsewhere.
+        _ => {
+            let mut plain = suppaftp::FtpStream::connect_with_stream(control)
+                .map_err(unreachable)?
+                .passive_stream_builder(data_connector(timeouts));
+            plain.set_passive_nat_workaround(true);
+            let features = prepare(&mut plain, user, password, &address)?;
+            (Stream::Plain(plain), features)
+        }
+    };
 
-        tracing::debug!(%address, mlsd, "ftp connected");
-        Ok(FtpTransport { stream, mlsd })
+    tracing::debug!(%address, mlsd = features.mlsd, epsv = features.epsv, "ftp connected");
+    Ok(FtpTransport {
+        stream,
+        mlsd: features.mlsd,
+    })
+}
+
+/// Opens the control connection, with its deadlines already in place.
+///
+/// Every address the name resolves to is tried in turn, each with its own
+/// connect timeout. A host with both an IPv6 and an IPv4 address, where only
+/// one of the two actually routes from here, is common — keeping only the
+/// first address made such a server unreachable for no reason the user could
+/// see.
+fn open_control(
+    host: &str,
+    port: u16,
+    address: &str,
+    timeouts: Timeouts,
+) -> Result<TcpStream, RemoteError> {
+    let mut last = None;
+    for endpoint in resolve(host, port, address)? {
+        match TcpStream::connect_timeout(&endpoint, timeouts.connect) {
+            Ok(stream) => {
+                set_deadlines(&stream, timeouts.io).map_err(|e| RemoteError::Connect {
+                    address: address.to_owned(),
+                    reason: e.to_string(),
+                })?;
+                return Ok(stream);
+            }
+            Err(e) => {
+                tracing::debug!(%address, %endpoint, "ftp connect failed: {e}");
+                last = Some(e);
+            }
+        }
+    }
+    Err(RemoteError::Connect {
+        address: address.to_owned(),
+        reason: last.map_or_else(|| "resolved to no addresses".to_owned(), |e| e.to_string()),
+    })
+}
+
+/// How data connections are opened: with a connect timeout, and with the same
+/// read and write deadlines as the control connection.
+///
+/// `suppaftp`'s default builder is a bare `TcpStream::connect`, which has
+/// neither — a data port that never answers, or a server that stops sending
+/// halfway through a file, would block the transfer for as long as the OS
+/// cares to wait, which for a read is forever. TLS, when there is any, wraps
+/// this same socket, so the deadlines hold for FTPS data too.
+fn data_connector(
+    timeouts: Timeouts,
+) -> impl Fn(SocketAddr) -> Result<TcpStream, suppaftp::FtpError> + Send + Sync + 'static {
+    move |endpoint| {
+        let stream = TcpStream::connect_timeout(&endpoint, timeouts.connect)
+            .map_err(suppaftp::FtpError::ConnectionError)?;
+        set_deadlines(&stream, timeouts.io).map_err(suppaftp::FtpError::ConnectionError)?;
+        Ok(stream)
+    }
+}
+
+fn set_deadlines(stream: &TcpStream, io: Duration) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(io))?;
+    stream.set_write_timeout(Some(io))
+}
+
+/// Why a connection did not come up, in words.
+///
+/// A read that times out surfaces as `WouldBlock` on Unix ("Resource
+/// temporarily unavailable") and `TimedOut` on Windows, neither of which says
+/// what actually happened: the server let us in and then went quiet.
+fn describe_connect_error(error: &suppaftp::FtpError, timeouts: Timeouts) -> String {
+    match error {
+        suppaftp::FtpError::ConnectionError(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            format!(
+                "the server accepted the connection but did not answer within {}s",
+                timeouts.io.as_secs_f32()
+            )
+        }
+        other => other.to_string(),
     }
 }
 
@@ -177,6 +341,27 @@ impl Transport for FtpTransport {
 
 }
 
+/// What `FEAT` said the server can do, as far as this client cares.
+#[derive(Debug, Clone, Copy, Default)]
+struct Features {
+    /// `MLSD` listings — see the module docs.
+    mlsd: bool,
+    /// `EPSV` data connections — see the module docs.
+    epsv: bool,
+}
+
+impl Features {
+    fn from_feat(features: &suppaftp::types::Features) -> Features {
+        // `FEAT` keys are the verbs as the server spelled them. RFC 2389 says
+        // they are case-insensitive, and a few servers do answer in lower case.
+        let offers = |verb: &str| features.keys().any(|k| k.trim().eq_ignore_ascii_case(verb));
+        Features {
+            mlsd: offers("MLST") || offers("MLSD"),
+            epsv: offers("EPSV"),
+        }
+    }
+}
+
 /// Logs in, switches to binary mode, and asks what the server can do.
 ///
 /// Generic over the stream's TLS type so the FTP and FTPS paths are the same
@@ -186,7 +371,7 @@ fn prepare<T: TlsStream>(
     user: &str,
     password: &str,
     address: &str,
-) -> Result<bool, RemoteError> {
+) -> Result<Features, RemoteError> {
     stream
         .login(user, password)
         .map_err(|e| classify_login(address, &e.to_string()))?;
@@ -200,13 +385,24 @@ fn prepare<T: TlsStream>(
             reason: format!("could not switch to binary mode: {e}"),
         })?;
 
-    // One FEAT per connection rather than one per listing.
-    let mlsd = stream
+    // One FEAT per connection rather than one per listing. A server that does
+    // not understand FEAT at all is old enough to be assumed to offer neither.
+    let features = stream
         .feat()
-        .map(|features| features.contains_key("MLST") || features.contains_key("MLSD"))
-        .unwrap_or(false);
+        .map(|features| Features::from_feat(&features))
+        .unwrap_or_default();
 
-    Ok(mlsd)
+    // Decided from FEAT rather than by trying EPSV and falling back on a
+    // refusal: a failed EPSV happens in the middle of a transfer, where
+    // retrying means repeating whatever command it was attached to. Every
+    // mainstream server that implements EPSV lists it.
+    stream.set_mode(if features.epsv {
+        suppaftp::Mode::ExtendedPassive
+    } else {
+        suppaftp::Mode::Passive
+    });
+
+    Ok(features)
 }
 
 fn list_on<T: TlsStream>(
@@ -405,31 +601,26 @@ fn download_on<T: TlsStream>(
     Ok(total)
 }
 
-/// Resolves the host to one address, so the connect timeout applies to a single
-/// attempt rather than to a list of them.
-fn resolve(host: &str, port: u16, address: &str) -> Result<std::net::SocketAddr, RemoteError> {
+/// Resolves the host to every address it has, in the resolver's order.
+///
+/// Returned as a list so [`open_control`] can try each in turn, each attempt
+/// with its own connect timeout.
+fn resolve(host: &str, port: u16, address: &str) -> Result<Vec<SocketAddr>, RemoteError> {
     use std::net::ToSocketAddrs;
-    (host, port)
+    let endpoints: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|e| RemoteError::Connect {
             address: address.to_owned(),
             reason: format!("could not be resolved: {e}"),
         })?
-        .next()
-        .ok_or_else(|| RemoteError::Connect {
+        .collect();
+    if endpoints.is_empty() {
+        return Err(RemoteError::Connect {
             address: address.to_owned(),
             reason: "resolved to no addresses".to_owned(),
-        })
-}
-
-/// The TLS settings for FTPS: the platform's own trust store where it can be
-/// read, and the bundled roots otherwise.
-fn tls_config() -> suppaftp::rustls::ClientConfig {
-    let mut roots = suppaftp::rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    suppaftp::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth()
+        });
+    }
+    Ok(endpoints)
 }
 
 /// Whether a login failure was the credentials or something else.
@@ -624,6 +815,90 @@ mod tests {
             panic!("should have parsed");
         };
         assert_eq!(file.name(), "my holiday photos.tar.gz");
+    }
+
+    fn site_at(addr: SocketAddr) -> Site {
+        Site {
+            id: "stall".into(),
+            label: String::new(),
+            protocol: Protocol::Ftp,
+            host: addr.ip().to_string(),
+            port: Some(addr.port()),
+            username: String::new(),
+            path: None,
+            fingerprint: None,
+            auth: Default::default(),
+            trusted_cert: None,
+        }
+    }
+
+    #[test]
+    fn a_server_that_accepts_and_then_says_nothing_is_given_up_on() {
+        // The failure the read deadline exists for: the TCP handshake
+        // succeeds, so the connect timeout is satisfied, and then the greeting
+        // never comes. Without a read timeout this blocked forever.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Detached: it outlives the assertion on purpose, holding the socket
+        // open and silent for longer than the client is willing to wait.
+        std::thread::spawn(move || {
+            let held = listener.accept();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(held);
+        });
+
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(2),
+            io: Duration::from_millis(300),
+        };
+        let started = std::time::Instant::now();
+        let outcome = connect_with(&site_at(addr), "", timeouts);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        let Err(RemoteError::Connect { reason, .. }) = outcome else {
+            panic!("a silent server should fail to connect: {:?}", outcome.err());
+        };
+        assert!(reason.contains("did not answer"), "{reason}");
+    }
+
+    #[test]
+    fn data_connections_carry_the_same_deadlines_as_the_control_connection() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(2),
+            io: Duration::from_millis(1234),
+        };
+
+        let stream = data_connector(timeouts)(addr).expect("should connect");
+        assert_eq!(stream.read_timeout().unwrap(), Some(timeouts.io));
+        assert_eq!(stream.write_timeout().unwrap(), Some(timeouts.io));
+    }
+
+    #[test]
+    fn every_resolved_address_is_kept() {
+        // `localhost` commonly resolves to both ::1 and 127.0.0.1; whatever it
+        // resolves to here, nothing may be dropped on the way through.
+        use std::net::ToSocketAddrs;
+        let expected: Vec<SocketAddr> = ("localhost", 21).to_socket_addrs().unwrap().collect();
+        assert_eq!(resolve("localhost", 21, "localhost:21").unwrap(), expected);
+    }
+
+    #[test]
+    fn feat_verbs_are_matched_without_regard_to_case() {
+        let mut feat = suppaftp::types::Features::new();
+        feat.insert("epsv".to_owned(), None);
+        feat.insert("MLST".to_owned(), Some("type*;size*;".to_owned()));
+        let features = Features::from_feat(&feat);
+        assert!(features.epsv);
+        assert!(features.mlsd);
+
+        let none = Features::from_feat(&suppaftp::types::Features::new());
+        assert!(!none.epsv && !none.mlsd);
     }
 
     #[test]

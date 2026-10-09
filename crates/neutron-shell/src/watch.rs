@@ -55,6 +55,10 @@ pub struct Watcher {
     /// and so this end can cancel the read the worker is blocked in.
     #[cfg(windows)]
     directory: Arc<windows_impl::Directory>,
+    /// The worker's kqueue, shared for the same reason: so `Drop` can wake the
+    /// `kevent` wait without racing the worker closing the descriptor.
+    #[cfg(target_os = "macos")]
+    queue: Arc<kqueue_impl::Queue>,
 }
 
 impl Watcher {
@@ -77,6 +81,11 @@ impl Drop for Watcher {
         // actually ends the wait.
         #[cfg(windows)]
         windows_impl::cancel(&self.directory);
+        // The same problem on macOS: the worker sleeps in `kevent` until the
+        // directory changes or the metadata poll is due. A user event in the
+        // same queue ends the wait now.
+        #[cfg(target_os = "macos")]
+        kqueue_impl::wake(&self.queue);
     }
 }
 
@@ -91,7 +100,7 @@ pub fn watch(dir: &Path, on_change: impl Fn() + Send + 'static) -> Option<Watche
     windows_impl::watch(dir, on_change)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn watch(_dir: &Path, _on_change: impl Fn() + Send + 'static) -> Option<Watcher> {
     None
 }
@@ -248,5 +257,236 @@ mod windows_impl {
             // costing one directory re-read per file.
             std::thread::sleep(QUIET_PERIOD);
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn watch(dir: &Path, on_change: impl Fn() + Send + 'static) -> Option<Watcher> {
+    kqueue_impl::watch(dir, on_change)
+}
+
+/// macOS: a kqueue on the directory itself.
+///
+/// `EVFILT_VNODE` on a directory fires when an entry is added, removed or
+/// renamed — the directory's own contents change — so those are reported as
+/// quickly as on Windows. What it cannot see is a file inside being rewritten
+/// in place: that changes the file, not the directory. A slow metadata poll
+/// ([`METADATA_POLL`]) covers that case, so a growing download or a saved
+/// document still updates its size and date, just not instantly.
+///
+/// FSEvents would see both, but delivers through a run loop or dispatch queue
+/// and coalesces with its own latency; for the one or few folders on screen,
+/// a kqueue per folder is simpler and faster.
+#[cfg(target_os = "macos")]
+mod kqueue_impl {
+    use super::*;
+    use std::os::fd::RawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::Instant;
+
+    /// How often in-place changes to the entries are looked for.
+    const METADATA_POLL: Duration = Duration::from_secs(5);
+    /// The `EVFILT_USER` identifier `Drop` triggers.
+    const WAKE: usize = 1;
+
+    /// The kqueue and the watched directory's descriptor, closed together
+    /// when the last of the watcher and its worker lets go.
+    pub(in super) struct Queue {
+        kq: RawFd,
+        dir: RawFd,
+    }
+
+    impl Drop for Queue {
+        fn drop(&mut self) {
+            // SAFETY: both were opened by `watch` and are closed only here.
+            unsafe {
+                libc::close(self.kq);
+                libc::close(self.dir);
+            }
+        }
+    }
+
+    fn change(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kevent {
+        libc::kevent { ident, filter, flags, fflags, data: 0, udata: std::ptr::null_mut() }
+    }
+
+    pub(in super) fn wake(queue: &Queue) {
+        let trigger = change(WAKE, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER);
+        // SAFETY: `kq` is open while `queue` is borrowed; one change, no events.
+        unsafe { libc::kevent(queue.kq, &trigger, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+    }
+
+    pub(in super) fn watch(dir: &Path, on_change: impl Fn() + Send + 'static) -> Option<Watcher> {
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // O_EVTONLY: opened only to be notified about. Unlike an ordinary
+        // descriptor it does not stop the volume being ejected — holding one
+        // per visible pane would otherwise make every USB stick "in use".
+        // SAFETY: `c_path` is NUL-terminated and outlives the call.
+        let dir_fd = unsafe {
+            libc::open(c_path.as_ptr(), libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        };
+        if dir_fd < 0 {
+            return None;
+        }
+        // SAFETY: no arguments; the result is checked.
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            // SAFETY: opened above and not shared.
+            unsafe { libc::close(dir_fd) };
+            return None;
+        }
+        let queue = Arc::new(Queue { kq, dir: dir_fd });
+
+        let changes = [
+            // EV_CLEAR: one event stands for everything since the last read,
+            // which is the collapse the quiet period relies on.
+            change(dir_fd as usize, libc::EVFILT_VNODE, libc::EV_ADD | libc::EV_CLEAR,
+                libc::NOTE_WRITE | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_EXTEND
+                    | libc::NOTE_ATTRIB | libc::NOTE_REVOKE),
+            change(WAKE, libc::EVFILT_USER, libc::EV_ADD | libc::EV_CLEAR, 0),
+        ];
+        // SAFETY: `kq` is open and `changes` is a valid array of its length.
+        let registered = unsafe {
+            libc::kevent(kq, changes.as_ptr(), changes.len() as i32, std::ptr::null_mut(), 0, std::ptr::null())
+        };
+        if registered < 0 {
+            return None;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_queue = Arc::clone(&queue);
+        let worker_path = dir.to_path_buf();
+        std::thread::Builder::new()
+            .name("neutron-watch".into())
+            .spawn(move || run(&worker_queue, &worker_stop, &worker_path, on_change))
+            .ok()?;
+
+        Some(Watcher { stop, path: dir.to_path_buf(), queue })
+    }
+
+    enum Wake {
+        /// The deadline passed with nothing to report.
+        Timeout,
+        /// The directory changed. `gone` when it was deleted, renamed away
+        /// or its volume unmounted — there is nothing more to watch.
+        Changed { gone: bool },
+        /// The watcher was dropped, or the queue failed.
+        Stop,
+    }
+
+    /// Waits until `deadline` for something to happen.
+    fn wait(queue: &Queue, deadline: Instant) -> Wake {
+        let mut events = [change(0, 0, 0, 0); 4];
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let timeout = libc::timespec {
+                tv_sec: left.as_secs() as libc::time_t,
+                tv_nsec: left.subsec_nanos() as libc::c_long,
+            };
+            // SAFETY: `kq` is open while `queue` is borrowed, and `events` is
+            // writable for the length passed.
+            let n = unsafe {
+                libc::kevent(queue.kq, std::ptr::null(), 0, events.as_mut_ptr(), events.len() as i32, &timeout)
+            };
+            if n < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Wake::Stop;
+            }
+            if n == 0 {
+                return Wake::Timeout;
+            }
+            let mut result = Wake::Timeout;
+            for event in &events[..n as usize] {
+                if event.filter == libc::EVFILT_USER || event.flags & libc::EV_ERROR != 0 {
+                    return Wake::Stop;
+                }
+                let gone = event.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE) != 0;
+                result = match result {
+                    Wake::Changed { gone: was } => Wake::Changed { gone: was || gone },
+                    _ => Wake::Changed { gone },
+                };
+            }
+            return result;
+        }
+    }
+
+    fn run(queue: &Queue, stop: &AtomicBool, path: &Path, on_change: impl Fn()) {
+        let mut baseline = snapshot(path);
+        let mut next_poll = Instant::now() + METADATA_POLL;
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut gone = match wait(queue, next_poll) {
+                Wake::Stop => return,
+                Wake::Changed { gone } => gone,
+                Wake::Timeout => {
+                    next_poll = Instant::now() + METADATA_POLL;
+                    let next = snapshot(path);
+                    if next == baseline {
+                        continue;
+                    }
+                    // A directory that can no longer be read (unmounted
+                    // without a revoke, permissions withdrawn) is reported
+                    // once and then left alone, rather than re-reported on
+                    // every poll.
+                    next.is_none()
+                }
+            };
+            // Reported first, waited after, exactly as on Windows: the first
+            // change is instant, and a burst collapses into one report per
+            // quiet period because EV_CLEAR folds the queued events into one.
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                // Taken before the report, so the app's re-read can only be
+                // newer than the baseline; at worst the poll reports once more.
+                baseline = snapshot(path);
+                on_change();
+                if gone || baseline.is_none() {
+                    return;
+                }
+                match settle(queue) {
+                    None => return,
+                    Some(None) => break,
+                    Some(Some(again)) => gone = again,
+                }
+            }
+            next_poll = Instant::now() + METADATA_POLL;
+        }
+    }
+
+    /// Waits out the quiet period. `None` to stop, `Some(None)` if nothing
+    /// happened meanwhile, and `Some(Some(gone))` if something did.
+    fn settle(queue: &Queue) -> Option<Option<bool>> {
+        let deadline = Instant::now() + QUIET_PERIOD;
+        let mut changed: Option<bool> = None;
+        loop {
+            match wait(queue, deadline) {
+                Wake::Stop => return None,
+                Wake::Timeout => return Some(changed),
+                Wake::Changed { gone } => changed = Some(changed.unwrap_or(false) || gone),
+            }
+        }
+    }
+
+    /// A fingerprint of every entry's name, size, date and writability. Only
+    /// the slow poll needs it; adds, removes and renames come from the queue.
+    fn snapshot(dir: &Path) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            if let Ok(meta) = entry.path().symlink_metadata() {
+                entries.push((entry.file_name(), meta.len(), meta.modified().ok(), meta.permissions().readonly()));
+            }
+        }
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        entries.hash(&mut hash);
+        Some(hash.finish())
     }
 }

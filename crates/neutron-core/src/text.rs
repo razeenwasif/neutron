@@ -10,15 +10,21 @@
 /// `needle_lower` must already be lowercased; the caller does it once per query
 /// rather than once per candidate.
 ///
-/// # Case folding is ASCII-only on the haystack side
+/// # Unicode only when the needle needs it
 ///
 /// Filenames are overwhelmingly ASCII, and folding Unicode properly means
-/// allocating a lowercased copy of every candidate — which is the entire
-/// budget, spent on a case that almost never arises. A non-ASCII needle still
-/// matches non-ASCII names exactly.
+/// allocating a lowercased copy of every candidate — the entire budget, spent
+/// on a case that almost never arises. So an ASCII needle takes the fast path,
+/// which is exact for it: a non-ASCII byte in a name can never equal an ASCII
+/// one. Only a needle with a non-ASCII letter in it pays for folding each name,
+/// and it has to — the caller lowercased it with Unicode rules, so `Öl` arrives
+/// as `öl`, and an ASCII-only fold of `Öl.txt` never produces that.
 pub fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
+    }
+    if !needle_lower.is_ascii() {
+        return haystack.to_lowercase().contains(needle_lower);
     }
     let (hay, nee) = (haystack.as_bytes(), needle_lower.as_bytes());
     if nee.len() > hay.len() {
@@ -67,6 +73,16 @@ mod tests {
     #[test]
     fn case_is_ignored_on_both_sides() {
         assert!(contains_ignore_ascii_case("README.MD", "readme"));
+    }
+
+    #[test]
+    fn a_non_ascii_letter_matches_in_either_case() {
+        // The needle arrives lowercased with Unicode rules, as every caller
+        // lowercases it.
+        assert!(contains_ignore_ascii_case("Öl.txt", &"Öl".to_lowercase()));
+        assert!(contains_ignore_ascii_case("öl.txt", &"ÖL".to_lowercase()));
+        assert!(contains_ignore_ascii_case("Résumé.pdf", "résumé"));
+        assert!(!contains_ignore_ascii_case("Ol.txt", "öl"));
     }
 
     #[test]

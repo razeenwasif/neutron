@@ -15,3 +15,6 @@ secrets.toml
 # WSL surfaces NTFS alternate data streams as separate files. These appear
 # beside anything downloaded on the Windows side and are pure noise.
 *:Zone.Identifier
+
+# Development-only icon renderer dependencies
+/scripts/node_modules/

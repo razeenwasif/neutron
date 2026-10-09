@@ -480,6 +480,11 @@ fn read(path: &Path, is_dir: bool) -> Preview {
     }
 
     let size = match std::fs::metadata(path) {
+        // Only an ordinary file is opened. Opening a named pipe blocks until
+        // something writes to it — forever, usually — and a device or socket
+        // has no contents to show. Any of them left the one preview worker
+        // stuck, and every preview after it read "Reading…" for good.
+        Ok(meta) if !meta.is_file() => return Preview::Opaque,
         Ok(meta) => meta.len(),
         Err(e) => return Preview::Unreadable(e.to_string()),
     };
@@ -639,6 +644,21 @@ mod tests {
 
     /// Bytes fetched over a connection take a different route into the pane
     /// than a local file, and this is where the two rejoin.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_is_not_opened() {
+        let dir = std::env::temp_dir().join(format!("neutron-preview-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+
+        // Returns at all: opening the pipe would block this thread forever.
+        assert!(matches!(read(&fifo, false), Preview::Opaque));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn fetched_text_is_shown_as_text() {
         let Preview::Text { text, truncated } =

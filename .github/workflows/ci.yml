@@ -27,6 +27,33 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test native backends and workspace
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build application bundle
+        run: cargo xtask bundle
+      - name: Verify bundle
+        run: |
+          plutil -lint target/release/Neutron.app/Contents/Info.plist
+          codesign --verify --deep --strict target/release/Neutron.app
+          target/release/Neutron.app/Contents/MacOS/neutron --bench . 1
+      - name: Archive application
+        run: ditto -c -k --sequesterRsrc --keepParent target/release/Neutron.app target/release/Neutron-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Neutron-macOS
+          path: target/release/Neutron-macOS.zip
+
   windows:
     name: Windows (the shipped target)
     runs-on: windows-latest

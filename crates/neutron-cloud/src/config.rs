@@ -43,6 +43,9 @@ impl GoogleConfig {
 
 /// `%APPDATA%\Neutron\google.json`, beside the workspace state eframe writes.
 pub fn config_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support").into_os_string();
+    #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .or_else(|| std::env::var_os("HOME"))?;

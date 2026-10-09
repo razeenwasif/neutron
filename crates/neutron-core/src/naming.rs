@@ -25,10 +25,43 @@ const RESERVED: &[&str] = &[
 ///
 /// The message is shown to the user, so it says what to do rather than what
 /// went wrong.
+///
+/// The rules are this platform's. A Mac takes `10:30 notes`, `v1.` and
+/// `aux.txt` without complaint, and refusing them there — with a message about
+/// Windows — was refusing names the user's own system accepts.
 pub fn rejection(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         return Some("A name cannot be empty");
     }
+    if cfg!(windows) {
+        windows_rejection(name)
+    } else {
+        posix_rejection(name)
+    }
+}
+
+/// The Mac's and every other Unix's: no separator, no NUL, not `.` or `..`,
+/// and at most 255 bytes — the limit APFS and most Unix filesystems set, in
+/// bytes of UTF-8 rather than in characters.
+fn posix_rejection(name: &str) -> Option<&'static str> {
+    if name.contains('/') {
+        return Some("A name cannot contain /");
+    }
+    // NUL is the one character the system cannot take at all; the rest are
+    // refused for the reason given for Windows below.
+    if name.chars().any(|c| c.is_control()) {
+        return Some("A name cannot contain control characters");
+    }
+    if name == "." || name == ".." {
+        return Some("That name is reserved");
+    }
+    if name.len() > 255 {
+        return Some("That name is too long");
+    }
+    None
+}
+
+fn windows_rejection(name: &str) -> Option<&'static str> {
     if name.chars().any(|c| FORBIDDEN.contains(&c)) {
         return Some(r#"A name cannot contain \ / : * ? " < > |"#);
     }
@@ -115,17 +148,21 @@ mod tests {
 
     #[test]
     fn path_separators_are_refused() {
-        // The commonest mistake is pasting a whole path into the box.
+        // The commonest mistake is pasting a whole path into the box. A
+        // backslash is a separator only on Windows; on a Mac it is a character.
+        #[cfg(windows)]
         assert!(rejection(r"C:\Users\thing").is_some());
         assert!(rejection("a/b").is_some());
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_colon_is_refused() {
         // Typing a time into a name is the other common one.
         assert!(rejection("meeting 12:30").is_some());
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_trailing_space_or_dot_is_refused() {
         // Windows strips these silently, so the saved name is not the typed one.
@@ -133,6 +170,7 @@ mod tests {
         assert!(rejection("notes.").is_some());
     }
 
+    #[cfg(windows)]
     #[test]
     fn device_names_are_refused_with_or_without_an_extension() {
         assert!(rejection("CON").is_some());
@@ -145,6 +183,17 @@ mod tests {
         // "CONTENTS" is not "CON", and refusing it would be maddening.
         assert!(is_valid("CONTENTS"));
         assert!(is_valid("COM10"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn names_the_mac_accepts_are_accepted() {
+        assert!(is_valid("10:30 notes"));
+        assert!(is_valid("v1."));
+        assert!(is_valid("aux.txt"));
+        assert!(is_valid("what?.txt"));
+        assert!(rejection("..").is_some());
+        assert!(rejection(&"é".repeat(128)).is_some(), "256 bytes is over the limit");
     }
 
     #[test]

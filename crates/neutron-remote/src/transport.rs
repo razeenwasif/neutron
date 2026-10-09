@@ -70,13 +70,25 @@ pub enum RemoteError {
     #[error("{address} rejected the username or password")]
     Auth { address: String },
 
-    /// No password stored, and this server wants one.
-    #[error("no password saved for {address} — connect to it again to enter one")]
+    /// No password stored, and this server wants one — or the site's key file
+    /// is encrypted and no passphrase is stored for it.
+    #[error("no password saved for {address} — edit the server to enter one")]
     NoPassword { address: String },
 
     /// The site's recorded SSH host key does not match the one presented.
     #[error("{0}")]
     HostKeyChanged(String),
+
+    /// An FTPS certificate no authority vouches for and the site has not
+    /// pinned, or one that differs from the pin. `fingerprint` is what the
+    /// server presented, carried separately so the app can offer to trust it
+    /// without parsing the message.
+    #[error("{message}")]
+    UntrustedCertificate { fingerprint: String, message: String },
+
+    /// The site's private key file could not be read or decrypted.
+    #[error("the key file {path} could not be used: {reason}")]
+    Key { path: String, reason: String },
 
     /// The server refused an operation, in its own words.
     #[error("{path}: {reason}")]
@@ -178,6 +190,16 @@ pub trait Transport: Send {
 /// bounded, because a tab stuck on a dead host with no error is worse than a
 /// slow one.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long an established connection may sit silent before it is given up on.
+///
+/// The connect timeout only covers the handshake. A server that accepts and
+/// then never says anything — a half-dead daemon, a NAT box that dropped the
+/// mapping mid-transfer — would otherwise block the one worker thread that
+/// serves every remote tab, forever, with nothing on screen to say why. A
+/// minute is long past any honest pause, including a server computing a
+/// listing of a huge directory before it sends the first line.
+pub const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Transfer chunk. Large enough that the syscall overhead disappears, small
 /// enough that progress moves visibly inside one big file.

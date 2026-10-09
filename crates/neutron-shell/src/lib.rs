@@ -12,47 +12,51 @@
 //!
 //! # Platform selection
 //!
-//! Each module has a Windows implementation and a non-Windows stub selected by
-//! `#[path]`, so the module name is the same on both. The stubs exist purely so
-//! that `neutron-core`, `neutron-ui` and the portable halves of this crate can
-//! be built and tested on Linux, which is a far faster inner loop than
-//! cross-compiling. They are never shipped.
-//!
-//! Filled in at M1 (fast enumeration), M2 (sidebar places) and M3 (icons, file
-//! launching, context menus).
+//! Windows and macOS select their native backends at compile time. Other
+//! platforms retain stubs for portable unit tests.
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 #[cfg_attr(windows, path = "backdrop.rs")]
 #[cfg_attr(not(windows), path = "backdrop_stub.rs")]
 pub mod backdrop;
 
 #[cfg_attr(windows, path = "fs.rs")]
-#[cfg_attr(not(windows), path = "fs_stub.rs")]
+#[cfg_attr(target_os = "macos", path = "fs_macos.rs")]
+#[cfg_attr(not(any(windows, target_os = "macos")), path = "fs_stub.rs")]
 pub mod fs;
 
 #[cfg_attr(windows, path = "places.rs")]
-#[cfg_attr(not(windows), path = "places_stub.rs")]
+#[cfg_attr(target_os = "macos", path = "places_macos.rs")]
+#[cfg_attr(not(any(windows, target_os = "macos")), path = "places_stub.rs")]
 pub mod places;
 
 #[cfg_attr(windows, path = "open.rs")]
-#[cfg_attr(not(windows), path = "open_stub.rs")]
+#[cfg_attr(target_os = "macos", path = "open_macos.rs")]
+#[cfg_attr(not(any(windows, target_os = "macos")), path = "open_stub.rs")]
 pub mod open;
 
 #[cfg_attr(windows, path = "fileops.rs")]
-#[cfg_attr(not(windows), path = "fileops_stub.rs")]
+#[cfg_attr(target_os = "macos", path = "fileops_macos.rs")]
+#[cfg_attr(not(any(windows, target_os = "macos")), path = "fileops_stub.rs")]
 pub mod fileops;
 
 #[cfg_attr(windows, path = "clipboard.rs")]
-#[cfg_attr(not(windows), path = "clipboard_stub.rs")]
+#[cfg_attr(target_os = "macos", path = "clipboard_macos.rs")]
+#[cfg_attr(not(any(windows, target_os = "macos")), path = "clipboard_stub.rs")]
 pub mod clipboard;
 
 pub mod watch;
 
 #[cfg_attr(windows, path = "dragout.rs")]
-#[cfg_attr(not(windows), path = "dragout_stub.rs")]
+#[cfg_attr(target_os = "macos", path = "dragout_macos.rs")]
+#[cfg_attr(not(any(windows, target_os = "macos")), path = "dragout_stub.rs")]
 pub mod dragout;
 
 #[cfg_attr(windows, path = "pastekey.rs")]
-#[cfg_attr(not(windows), path = "pastekey_stub.rs")]
+#[cfg_attr(target_os = "macos", path = "pastekey_macos.rs")]
+#[cfg_attr(not(any(windows, target_os = "macos")), path = "pastekey_stub.rs")]
 pub mod pastekey;
 
 // Unlike its neighbours this needs no `_stub`: the Win32 half is already behind
@@ -61,7 +65,8 @@ pub mod pastekey;
 pub mod snaplayout;
 
 #[cfg_attr(windows, path = "menu.rs")]
-#[cfg_attr(not(windows), path = "menu_stub.rs")]
+#[cfg_attr(target_os = "macos", path = "menu_macos.rs")]
+#[cfg_attr(not(any(windows, target_os = "macos")), path = "menu_stub.rs")]
 pub mod menu;
 
 #[cfg_attr(windows, path = "shell_ns.rs")]
@@ -74,6 +79,10 @@ pub mod shell_ns;
 pub mod icons;
 
 pub mod sta;
+
+/// Documents macOS asks Neutron to open (Finder's Open With, the Dock icon).
+/// One file: the non-macOS half is a one-line no-op.
+pub mod open_requests;
 
 /// Launching a terminal and a second window. One file rather than a `#[path]`
 /// pair: only the process-creation flags differ by platform.

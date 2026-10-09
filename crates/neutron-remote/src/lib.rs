@@ -12,6 +12,7 @@
 //! | [`site`] | saved servers, and where the password is not kept |
 //! | [`path`] | POSIX remote paths, and the check that a listed name cannot escape a local folder |
 //! | [`hostkey`] | whether to trust an SSH server's key |
+//! | [`certificate`] | whether to trust an FTPS server's certificate |
 //! | [`transport`] | what both protocols look like from outside |
 //! | [`ftp`] | FTP and FTPS |
 //! | [`sftp`] | SFTP, over SSH |
@@ -28,6 +29,7 @@
 //! silent reconnection is how a client ends up re-authenticating in a loop
 //! against a server that is rate-limiting it.
 
+pub mod certificate;
 pub mod ftp;
 pub mod hostkey;
 pub mod path;
@@ -35,7 +37,7 @@ pub mod sftp;
 pub mod site;
 pub mod transport;
 
-pub use site::{Protocol, Site, Sites};
+pub use site::{Auth, Protocol, Site, Sites};
 pub use transport::{Continue, RemoteEntry, RemoteError, Transport};
 
 /// Reads the password saved for a site, if there is one.
@@ -62,15 +64,18 @@ pub fn forget_password(site: &Site) -> Result<(), String> {
 /// and has none saved fails with [`RemoteError::NoPassword`] rather than trying
 /// an empty password — some servers count that as a failed login attempt, and a
 /// file manager should not be spending the user's lockout budget guessing.
+///
+/// A site that logs in with an SSH key file is passed whatever secret is saved
+/// as the key's passphrase, or nothing; one that uses the agent never touches
+/// the credential store at all.
 pub fn connect(site: &Site) -> Result<Box<dyn Transport>, RemoteError> {
-    let password = password_for(site);
-
-    // Anonymous FTP is a real configuration, and it is the one case where
-    // having no password is correct rather than missing.
-    let anonymous = site.username.is_empty() && !matches!(site.protocol, Protocol::Sftp);
+    let password = match site.auth {
+        Auth::Agent if site.protocol == Protocol::Sftp => None,
+        _ => password_for(site),
+    };
     let password = match password {
         Some(password) => password,
-        None if anonymous => String::new(),
+        None if !site.needs_password() => String::new(),
         None => {
             return Err(RemoteError::NoPassword { address: site.address() });
         }
@@ -100,6 +105,8 @@ mod tests {
             username: username.into(),
             path: None,
             fingerprint: None,
+            auth: Auth::Password,
+            trusted_cert: None,
         }
     }
 

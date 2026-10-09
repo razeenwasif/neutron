@@ -89,7 +89,10 @@ impl GoogleDrive {
         // Both, because the secret is required at redemption and finding that
         // out only after consent is a poor trade for one extra check here.
         let configured = flow::client_id().is_ok() && flow::client_secret().is_ok();
-        classify(configured, credentials::load().is_some())
+        // Short-circuited: with nothing configured there is no reason to touch
+        // the credential store, and on the Mac that is a Keychain lookup
+        // through a helper process, which can prompt.
+        classify(configured, configured && credentials::load().is_some())
     }
 
     /// Runs the interactive flow and stores the refresh token.

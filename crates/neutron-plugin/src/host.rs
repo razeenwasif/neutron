@@ -52,8 +52,11 @@ pub const MAX_SELECTION: usize = 1024;
 /// Most `open` requests honoured from one run, so a bug cannot launch a hundred
 /// windows.
 pub const MAX_OPENS: usize = 8;
-/// How much of a failing plugin's stderr is kept for the message.
-const STDERR_TAIL: usize = 2048;
+/// How much of a plugin's stderr is held while it runs: the most recent this
+/// many bytes. Far more than the status bar can show, so the shown tail is
+/// cut from flattened text rather than from raw bytes that may be mostly
+/// whitespace and escape sequences.
+const STDERR_KEEP: usize = 8 * 1024;
 /// How often the wait wakes to check for a Stop.
 const POLL: Duration = Duration::from_millis(50);
 
@@ -161,7 +164,7 @@ pub fn invoke_with_cancel(
     };
 
     let deadline = Instant::now() + command.timeout();
-    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<Result<String, LineError>>();
 
     // stdin: its own thread, because `write_all` on a full pipe blocks until
     // the plugin reads, and a plugin that never reads must not hold this
@@ -182,13 +185,10 @@ pub fn invoke_with_cancel(
 
     // stderr is drained unconditionally, even when nothing goes wrong: an
     // undrained pipe eventually blocks the plugin writing to it.
-    let stderr = child.stderr.take().map(|stderr| {
-        std::thread::spawn(move || {
-            let mut buffer = Vec::new();
-            let _ = stderr.take((STDERR_TAIL * 4) as u64).read_to_end(&mut buffer);
-            String::from_utf8_lossy(&buffer).into_owned()
-        })
-    });
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stderr| std::thread::spawn(move || drain_tail(stderr, STDERR_KEEP)));
 
     let mut outcome = Outcome::default();
     let mut seen = 0usize;
@@ -238,9 +238,29 @@ pub fn invoke_with_cancel(
                     }
                 }
             }
-            // The reader hit a line it could not deliver — too long, or not
-            // text. Stop listening; the exit status is still worth reporting.
-            Ok(Err(e)) => {
+            // The reader hit a line it could not deliver. Stop listening.
+            Ok(Err(LineError::TooLong)) => {
+                // Not a stray line but a plugin that has stopped speaking the
+                // protocol, and one that may still be pouring out output
+                // nobody will read. Killed rather than waited on: the reader
+                // has already let go of stdout, so its next write fails
+                // anyway, and a plugin ignoring that would otherwise run to
+                // the deadline.
+                tracing::warn!(plugin = %plugin.id(), "a response line exceeded {MAX_LINE} bytes");
+                let _ = child.kill();
+                let _ = child.wait();
+                if outcome.error.is_none() {
+                    outcome.error = Some(sanitize::status(&format!(
+                        "{} wrote a response line longer than {} KB",
+                        plugin.manifest.name,
+                        MAX_LINE / 1024
+                    )));
+                }
+                return outcome;
+            }
+            // Could not be read at all. The exit status is still worth
+            // reporting.
+            Ok(Err(LineError::Read(e))) => {
                 tracing::warn!(plugin = %plugin.id(), "{e}");
                 unparsed += 1;
                 break;
@@ -274,16 +294,21 @@ fn failure(
     stderr: &str,
 ) -> Option<String> {
     let tail = || {
-        let text = stderr.trim();
-        // The last lines, not the first: a traceback's useful end is at the
-        // bottom, and a crash dump's beginning is boilerplate.
-        let want = text.len().saturating_sub(STDERR_TAIL);
-        // Walk forward to a character boundary rather than slicing blind: the
-        // tail of a UTF-8 traceback lands mid-character often enough.
-        let start = (want..=text.len())
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(text.len());
-        sanitize::status(&text[start..])
+        // The last words, not the first: a traceback's useful end is at the
+        // bottom, and a crash dump's beginning is boilerplate. Flattened
+        // first and then cut from the *front* — `sanitize::status` on its own
+        // keeps the start and drops the end, which turned "the end of stderr"
+        // into whatever happened to come 8 KB before it.
+        // Capped at its own length, which no text in characters exceeds, so
+        // this flattens without truncating.
+        let flat = sanitize::text(stderr, stderr.len());
+        let count = flat.chars().count();
+        if count <= sanitize::MAX_STATUS {
+            return flat;
+        }
+        // One character fewer, for the ellipsis that says it was cut.
+        let rest: String = flat.chars().skip(count - (sanitize::MAX_STATUS - 1)).collect();
+        format!("…{}", rest.trim_start())
     };
 
     match status {
@@ -381,20 +406,32 @@ fn wait_until(child: &mut Child, deadline: Instant) -> Option<std::process::Exit
     }
 }
 
+/// Why the stdout reader stopped short of the end.
+#[derive(Debug)]
+enum LineError {
+    /// A line grew past [`MAX_LINE`] without a newline.
+    TooLong,
+    /// The pipe itself failed.
+    Read(String),
+}
+
 /// Reads newline-delimited lines, refusing one that grows past [`MAX_LINE`].
 ///
-/// `read_until` rather than `BufRead::lines`, because `lines` will happily
-/// buffer a gigabyte if the plugin never writes a newline.
-fn read_lines(stdout: std::process::ChildStdout, tx: &std::sync::mpsc::Sender<Result<String, String>>) {
+/// The cap is enforced *while* reading, not checked afterwards: each line is
+/// read through a `take` of one byte more than the limit, so a plugin that
+/// writes gigabytes without a newline costs this side at most `MAX_LINE + 1`
+/// bytes before it is refused. `read_until` on its own would buffer the lot
+/// and only then notice, by which point the memory is already gone.
+fn read_lines(stdout: impl Read, tx: &std::sync::mpsc::Sender<Result<String, LineError>>) {
     let mut reader = BufReader::new(stdout);
     let mut buffer = Vec::new();
     loop {
         buffer.clear();
-        match reader.read_until(b'\n', &mut buffer) {
+        match (&mut reader).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buffer) {
             Ok(0) => return,
             Ok(_) => {
                 if buffer.len() > MAX_LINE {
-                    let _ = tx.send(Err(format!("a response line exceeded {MAX_LINE} bytes")));
+                    let _ = tx.send(Err(LineError::TooLong));
                     return;
                 }
                 let text = String::from_utf8_lossy(&buffer).trim().to_owned();
@@ -406,11 +443,41 @@ fn read_lines(stdout: std::process::ChildStdout, tx: &std::sync::mpsc::Sender<Re
                 }
             }
             Err(e) => {
-                let _ = tx.send(Err(format!("could not be read: {e}")));
+                let _ = tx.send(Err(LineError::Read(format!("could not be read: {e}"))));
                 return;
             }
         }
     }
+}
+
+/// Reads `stderr` until the plugin closes it, keeping only the last `keep`
+/// bytes.
+///
+/// It has to read to the end. Stopping after the first few kilobytes — which
+/// an earlier version did — dropped the pipe while the plugin was still
+/// writing to it, so a chatty plugin died of `SIGPIPE` (or saw `EPIPE`) for
+/// the crime of logging, and the "tail" shown in the error was really the
+/// head. The last bytes are the ones worth keeping: a traceback's useful end
+/// is at the bottom.
+fn drain_tail(mut stderr: impl Read, keep: usize) -> String {
+    let mut tail = std::collections::VecDeque::with_capacity(keep);
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = &chunk[..n];
+                // Only the last `keep` of this chunk can survive anyway.
+                let chunk = &chunk[chunk.len().saturating_sub(keep)..];
+                let overflow = (tail.len() + chunk.len()).saturating_sub(keep);
+                tail.drain(..overflow);
+                tail.extend(chunk);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(tail.make_contiguous()).into_owned()
 }
 
 /// Starts the plugin process with all three pipes captured.
@@ -437,4 +504,46 @@ fn spawn(program: &Path, args: &[String], dir: &Path) -> std::io::Result<Child> 
     }
 
     command.spawn()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stderr_is_read_to_the_end_and_only_its_tail_is_kept() {
+        let mut input = vec![b'x'; 100_000];
+        input.extend_from_slice(b"the real reason");
+        let tail = drain_tail(&input[..], 64);
+        assert_eq!(tail.len(), 64);
+        assert!(tail.ends_with("the real reason"), "{tail}");
+    }
+
+    #[test]
+    fn short_stderr_is_kept_whole() {
+        assert_eq!(drain_tail(&b"oops"[..], 64), "oops");
+    }
+
+    #[test]
+    fn a_line_longer_than_the_cap_is_refused_without_reading_past_it() {
+        // An endless source: if the reader buffered until a newline, this
+        // would never return.
+        let endless = std::io::repeat(b'a');
+        let (tx, rx) = std::sync::mpsc::channel();
+        read_lines(endless, &tx);
+        assert!(matches!(rx.recv(), Ok(Err(LineError::TooLong))));
+    }
+
+    #[test]
+    fn a_line_exactly_at_the_cap_is_still_delivered() {
+        let mut input = vec![b'a'; MAX_LINE - 1];
+        input.push(b'\n');
+        input.extend_from_slice(b"next\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        read_lines(&input[..], &tx);
+        drop(tx);
+        let got: Vec<_> = rx.iter().collect();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(matches!(&got[1], Ok(line) if line == "next"));
+    }
 }

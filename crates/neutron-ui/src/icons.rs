@@ -52,6 +52,8 @@ pub enum Glyph {
     Grid,
     /// Stacked lines — switch to the list view.
     List,
+    /// Three side-by-side panels — switch to the column view.
+    Columns,
     /// A saved FTP/SFTP server — drawn as a globe, because what distinguishes
     /// it from a drive is that it is somewhere else.
     Server,
@@ -90,6 +92,7 @@ pub fn draw(painter: &Painter, centre: Pos2, glyph: Glyph, colour: Color32) {
         Glyph::Diamond => diamond(painter, centre, stroke),
         Glyph::Grid => grid(painter, centre, stroke),
         Glyph::List => list_rows(painter, centre, stroke),
+        Glyph::Columns => column_panels(painter, centre, stroke),
         Glyph::Copy => copy_pages(painter, centre, stroke),
         Glyph::Cut => cut_scissors(painter, centre, stroke),
         Glyph::Paste => paste_board(painter, centre, stroke),
@@ -516,6 +519,16 @@ fn list_rows(painter: &Painter, c: Pos2, stroke: Stroke) {
         // A leading dot per row, as a list marker does.
         painter.circle_filled(pos2(c.x - 5.6, y), 1.1, stroke.color);
         painter.line_segment([pos2(c.x - 2.6, y), pos2(c.x + 6.5, y)], stroke);
+    }
+}
+
+fn column_panels(painter: &Painter, c: Pos2, stroke: Stroke) {
+    // One frame split into three, the way the view itself reads: panes of a
+    // path laid side by side.
+    let frame = Rect::from_center_size(c, vec2(14.0, 11.0));
+    painter.rect_stroke(frame, 1.6, stroke, egui::StrokeKind::Inside);
+    for x in [frame.left() + frame.width() / 3.0, frame.left() + frame.width() * 2.0 / 3.0] {
+        painter.line_segment([pos2(x, frame.top()), pos2(x, frame.bottom())], stroke);
     }
 }
 

@@ -1,0 +1,6 @@
+{
+  "name": "neutron-assets",
+  "private": true,
+  "scripts": { "render-icon": "node render-icon.cjs" },
+  "devDependencies": { "@resvg/resvg-js": "2.6.2" }
+}

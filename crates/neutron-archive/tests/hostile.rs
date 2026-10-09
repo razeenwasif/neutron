@@ -200,3 +200,61 @@ fn modification_times_survive_a_round_trip() {
         "expected about {b}, got {a} — the timestamp did not survive"
     );
 }
+
+#[test]
+fn an_entry_that_cannot_be_written_costs_only_itself() {
+    // `a` is a file, so `a/b` has nowhere to go. That used to end the whole
+    // extraction at the first failure, losing every entry after it.
+    let root = scratch("unwritable");
+    let archive = root.join("clash.zip");
+    let destination = root.join("out");
+    hostile_zip(&archive, &["a", "a/b", "after.txt"]);
+
+    let summary = extract(&archive, &destination, Format::Zip, |_| Continue::Yes)
+        .expect("one bad entry should not fail the extraction");
+
+    assert_eq!(summary.files, 2, "{summary:?}");
+    assert_eq!(summary.refused.len(), 1, "{:?}", summary.refused);
+    assert!(summary.refused[0].starts_with("a/b"), "{:?}", summary.refused);
+    assert_eq!(fs::read(destination.join("a")).unwrap(), b"payload");
+    assert_eq!(fs::read(destination.join("after.txt")).unwrap(), b"payload");
+}
+
+#[test]
+fn a_pax_global_header_is_not_reported_as_a_skipped_entry() {
+    // Every `git archive` tarball begins with one. It is metadata about the
+    // archive, and listing it as a refused file put a warning on the most
+    // ordinary tarball there is.
+    let root = scratch("pax");
+    let archive = root.join("src.tar");
+    let destination = root.join("out");
+    {
+        let mut builder = tar::Builder::new(fs::File::create(&archive).unwrap());
+
+        let comment = b"52 comment=0123456789abcdef0123456789abcdef01234567\n";
+        let mut global = tar::Header::new_ustar();
+        global.set_path("pax_global_header").unwrap();
+        global.set_entry_type(tar::EntryType::XGlobalHeader);
+        global.set_size(comment.len() as u64);
+        global.set_mode(0o644);
+        global.set_cksum();
+        builder.append(&global, &comment[..]).unwrap();
+
+        let body = b"fn main() {}\n";
+        let mut file = tar::Header::new_ustar();
+        file.set_path("src/main.rs").unwrap();
+        file.set_entry_type(tar::EntryType::Regular);
+        file.set_size(body.len() as u64);
+        file.set_mode(0o644);
+        file.set_cksum();
+        builder.append(&file, &body[..]).unwrap();
+
+        builder.finish().unwrap();
+    }
+
+    let summary = extract(&archive, &destination, Format::Tar, |_| Continue::Yes).unwrap();
+    assert!(summary.refused.is_empty(), "{:?}", summary.refused);
+    assert_eq!(summary.files, 1);
+    assert!(!destination.join("pax_global_header").exists());
+    assert_eq!(fs::read(destination.join("src/main.rs")).unwrap(), b"fn main() {}\n");
+}

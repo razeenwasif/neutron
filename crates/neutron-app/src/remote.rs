@@ -142,24 +142,55 @@ impl Sessions {
         if let Some(site) = self.sites.sites.iter_mut().find(|s| s.id == site_id) {
             site.fingerprint = Some(fingerprint.to_owned());
         }
+        record_host_key(site_id, fingerprint);
+    }
+}
 
-        let mut on_disk = match site::load() {
-            Ok(sites) => sites,
-            Err(e) => {
-                tracing::warn!("could not record the host key: {e}");
-                return;
-            }
-        };
-        let Some(site) = on_disk.sites.iter_mut().find(|s| s.id == site_id) else {
+/// Writes a newly-seen host key into the site's entry in `sites.json`.
+///
+/// Re-reads the file first rather than writing any one thread's copy of it:
+/// the dialog may have added a site since, and clobbering it would lose a
+/// server the user just created.
+fn record_host_key(site_id: &str, fingerprint: &str) {
+    let mut on_disk = match site::load() {
+        Ok(sites) => sites,
+        Err(e) => {
+            tracing::warn!("could not record the host key: {e}");
             return;
-        };
-        site.fingerprint = Some(fingerprint.to_owned());
+        }
+    };
+    let Some(site) = on_disk.sites.iter_mut().find(|s| s.id == site_id) else {
+        return;
+    };
+    site.fingerprint = Some(fingerprint.to_owned());
 
-        match site::save(&on_disk) {
-            Ok(path) => tracing::info!(site = site_id, "host key recorded in {}", path.display()),
-            Err(e) => tracing::warn!("could not record the host key: {e}"),
+    match site::save(&on_disk) {
+        Ok(path) => tracing::info!(site = site_id, "host key recorded in {}", path.display()),
+        Err(e) => tracing::warn!("could not record the host key: {e}"),
+    }
+}
+
+/// Opens a connection of its own to `site`, for work off the loader thread —
+/// a download, or a write.
+///
+/// The caller's copy of the site was taken on the UI thread, which never hears
+/// about a host key the listing connection has just recorded. Without the
+/// saved key this connection would be a first contact, and accept whatever key
+/// the server presented before sending the password. So the key is read back
+/// from disk first, and a newly seen one is recorded the same way listings do.
+pub fn connect_checked(site: &neutron_remote::Site) -> Result<Box<dyn Transport>, String> {
+    let mut site = site.clone();
+    if let Ok(saved) = site::load() {
+        if let Some(fingerprint) = saved.get(&site.id).and_then(|s| s.fingerprint.clone()) {
+            site.fingerprint = Some(fingerprint);
         }
     }
+
+    let transport = neutron_remote::connect(&site).map_err(|e| e.to_string())?;
+    if let Some(fingerprint) = transport.new_fingerprint() {
+        record_host_key(&site.id, fingerprint);
+    }
+    Ok(transport)
 }
 
 /// Downloads a remote file to `destination`, on its own connection.
@@ -173,7 +204,7 @@ pub fn download(
     destination: &std::path::Path,
     on_progress: &mut dyn FnMut(u64) -> neutron_remote::Continue,
 ) -> Result<u64, String> {
-    let mut transport = neutron_remote::connect(site).map_err(|e| e.to_string())?;
+    let mut transport = connect_checked(site)?;
 
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;

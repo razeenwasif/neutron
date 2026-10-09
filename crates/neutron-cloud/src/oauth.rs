@@ -176,9 +176,11 @@ impl std::error::Error for AuthError {}
 /// Parses the request line of the loopback redirect, e.g.
 /// `GET /?code=abc&state=xyz HTTP/1.1`.
 ///
-/// `expected_state` is compared in full; a mismatch is an error rather than a
-/// warning, because the whole point of the parameter is to reject a redirect
-/// this process did not initiate.
+/// `expected_state` is compared in full, and before anything else in the
+/// request is looked at; a mismatch is an error rather than a warning, because
+/// the whole point of the parameter is to reject a redirect this process did
+/// not initiate. A missing `state` is a mismatch too — Google echoes it on
+/// every redirect, errors included.
 pub fn parse_redirect(request_line: &str, expected_state: &str) -> Result<Redirect, AuthError> {
     let target = request_line
         .split_whitespace()
@@ -202,6 +204,14 @@ pub fn parse_redirect(request_line: &str, expected_state: &str) -> Result<Redire
         }
     }
 
+    // Compared before anything else is acted on — the code, and the error
+    // too. A redirect that fails this is not ours and nothing in it should be
+    // used; acting on its `error` first meant any process on the machine
+    // could abort a sign-in with `/?error=access_denied`, no state required.
+    let Some(state) = state.filter(|s| s == expected_state) else {
+        return Err(AuthError::StateMismatch);
+    };
+
     if let Some(error) = error {
         // Google's spelling for "the user pressed Cancel". Distinguished so the
         // UI can say so plainly instead of reporting a failure.
@@ -210,13 +220,6 @@ pub fn parse_redirect(request_line: &str, expected_state: &str) -> Result<Redire
         } else {
             AuthError::Provider(error)
         });
-    }
-
-    let state = state.ok_or_else(|| AuthError::Malformed("no state".to_owned()))?;
-    // Compared before the code is even read: a redirect that fails this is not
-    // ours, and nothing in it should be used.
-    if state != expected_state {
-        return Err(AuthError::StateMismatch);
     }
 
     let code = code.ok_or_else(|| AuthError::Malformed("no code".to_owned()))?;
@@ -399,6 +402,20 @@ mod tests {
         // reveals which check failed first.
         let got = parse_redirect("GET /?state=attacker HTTP/1.1", "ours");
         assert_eq!(got, Err(AuthError::StateMismatch));
+    }
+
+    #[test]
+    fn an_error_without_the_right_state_is_not_acted_on() {
+        // Otherwise anything on the machine that finds the port can cancel
+        // the user's sign-in by sending a fake decline.
+        assert_eq!(
+            parse_redirect("GET /?error=access_denied HTTP/1.1", "ours"),
+            Err(AuthError::StateMismatch)
+        );
+        assert_eq!(
+            parse_redirect("GET /?error=access_denied&state=guess HTTP/1.1", "ours"),
+            Err(AuthError::StateMismatch)
+        );
     }
 
     #[test]

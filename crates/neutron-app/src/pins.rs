@@ -30,6 +30,10 @@ pub const MAX: usize = 24;
 pub struct Pins {
     #[serde(default)]
     pub folders: Vec<PathBuf>,
+    /// Bumped by every change, so a stale save cannot overwrite a newer one.
+    /// See `crate::persist`.
+    #[serde(skip)]
+    pub revision: u64,
 }
 
 impl Pins {
@@ -38,6 +42,7 @@ impl Pins {
     pub fn toggle(&mut self, path: &Path) -> Toggled {
         if let Some(at) = self.folders.iter().position(|p| p == path) {
             self.folders.remove(at);
+            self.revision += 1;
             return Toggled::Unpinned;
         }
         if self.folders.len() >= MAX {
@@ -46,6 +51,7 @@ impl Pins {
         // Newest first: a pin made just now is the one most likely to be
         // wanted next, and the list is read from the top.
         self.folders.insert(0, path.to_path_buf());
+        self.revision += 1;
         Toggled::Pinned
     }
 }
@@ -63,6 +69,9 @@ pub enum Toggled {
 /// The fallbacks match the rest of the application's config handling and are
 /// what let this be exercised away from Windows.
 pub fn path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support").into_os_string();
+    #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .or_else(|| std::env::var_os("HOME"))?;
@@ -80,7 +89,10 @@ pub fn load() -> Result<Pins, String> {
         return Ok(Pins::default());
     };
     match std::fs::read_to_string(&file) {
-        Ok(text) => parse(&text),
+        Ok(text) => parse(&text).map_err(|e| match crate::persist::set_aside(&file) {
+            Some(kept) => format!("{e}; the file was kept as {}", kept.display()),
+            None => e,
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Pins::default()),
         Err(e) => Err(e.to_string()),
     }
@@ -102,11 +114,8 @@ pub fn save(pins: &Pins) -> Result<PathBuf, String> {
     let Some(file) = path() else {
         return Err("there is no %APPDATA% to save pins in".to_owned());
     };
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
     let json = serde_json::to_string_pretty(pins).map_err(|e| e.to_string())?;
-    std::fs::write(&file, json).map_err(|e| e.to_string())?;
+    crate::persist::write(&file, &json, pins.revision)?;
     Ok(file)
 }
 

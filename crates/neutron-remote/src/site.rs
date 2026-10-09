@@ -105,9 +105,55 @@ pub struct Site {
     ///
     /// Recorded on the first connection and checked on every one after, which
     /// is what makes a swapped server a hard failure rather than a silent
-    /// success. SFTP only. See [`crate::known_hosts`].
+    /// success. SFTP only. See [`crate::hostkey`].
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// How to log in to an SFTP server. Ignored by FTP, which only has
+    /// passwords. Absent means a password, which is what every site saved
+    /// before this existed was using.
+    #[serde(default, skip_serializing_if = "Auth::is_password")]
+    pub auth: Auth,
+    /// The SHA-256 fingerprint of an FTPS certificate the user has chosen to
+    /// trust although no recognised authority signed it — the self-signed
+    /// certificate a NAS generates for itself on first boot. FTPS only.
+    ///
+    /// Unlike [`Site::fingerprint`] this is never recorded automatically. An
+    /// SSH host key has no other way to be trusted, so trust on first use is
+    /// the best anyone can do; a TLS certificate *does*, and silently pinning
+    /// whatever turned up would quietly downgrade every server whose
+    /// certificate failed for a reason worth hearing about. So the first
+    /// connection is refused, naming the fingerprint, and the user puts it
+    /// here. See [`crate::certificate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_cert: Option<String>,
+}
+
+/// How an SFTP connection authenticates.
+///
+/// ```json
+/// "auth": { "method": "key", "path": "~/.ssh/id_ed25519" }
+/// "auth": { "method": "agent" }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "lowercase")]
+pub enum Auth {
+    /// The password saved in the credential store.
+    #[default]
+    Password,
+    /// A private key file. If it is encrypted, the secret saved for the site
+    /// is its passphrase — the same slot a password would occupy, because a
+    /// site only ever needs one of the two and a second slot would be one more
+    /// thing to leave behind in the credential store.
+    Key { path: String },
+    /// Whatever keys the running SSH agent holds: `SSH_AUTH_SOCK` on macOS,
+    /// OpenSSH's agent pipe or Pageant on Windows. Nothing is saved at all.
+    Agent,
+}
+
+impl Auth {
+    pub fn is_password(&self) -> bool {
+        matches!(self, Auth::Password)
+    }
 }
 
 impl Site {
@@ -135,6 +181,20 @@ impl Site {
         format!("Neutron/Site/{}", self.id)
     }
 
+    /// Whether connecting needs a secret from the credential store before the
+    /// first byte is sent.
+    ///
+    /// A key file's passphrase is not counted: whether the key is encrypted is
+    /// only known once it has been read, and an unencrypted key needs nothing.
+    pub fn needs_password(&self) -> bool {
+        match self.protocol {
+            // Anonymous FTP is a real configuration, and it is the one case
+            // where having no password is correct rather than missing.
+            Protocol::Ftp | Protocol::Ftps => !self.username.is_empty(),
+            Protocol::Sftp => self.auth.is_password(),
+        }
+    }
+
     /// What the sidebar shows.
     pub fn display(&self) -> &str {
         if self.label.is_empty() {
@@ -158,6 +218,8 @@ pub enum Invalid {
     ZeroPort,
     #[error("two sites share the id {id:?}")]
     DuplicateId { id: String },
+    #[error("{0:?} is not a SHA-256 fingerprint — expected 64 hexadecimal digits")]
+    NotAFingerprint(String),
 }
 
 /// Longest id accepted. It ends up in a credential name and in a saved layout.
@@ -185,6 +247,9 @@ impl Sites {
 /// The fallbacks match the rest of the application's config handling and are
 /// what let this be exercised on Linux.
 pub fn sites_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support").into_os_string();
+    #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .or_else(|| std::env::var_os("HOME"))?;
@@ -264,6 +329,24 @@ pub fn validate(site: &mut Site) -> Result<(), Invalid> {
         return Err(Invalid::ZeroPort);
     }
 
+    if let Auth::Key { path } = &mut site.auth {
+        *path = path.trim().to_owned();
+        if path.is_empty() {
+            return Err(Invalid::Empty { field: "key file" });
+        }
+    }
+
+    // Stored in one canonical spelling, so a fingerprint pasted from
+    // `openssl x509 -fingerprint` and one copied out of Neutron's own error
+    // message are the same string in the file.
+    if let Some(text) = site.trusted_cert.take() {
+        if !text.trim().is_empty() {
+            let canonical = crate::certificate::normalize(&text)
+                .ok_or_else(|| Invalid::NotAFingerprint(text.trim().to_owned()))?;
+            site.trusted_cert = Some(canonical);
+        }
+    }
+
     site.label = site.label.trim().to_owned();
     site.path = Some(site.start_path());
 
@@ -284,6 +367,8 @@ mod tests {
             username: "razeen".into(),
             path: Some("/volume1/media".into()),
             fingerprint: None,
+            auth: Auth::Password,
+            trusted_cert: None,
         }
     }
 
@@ -399,6 +484,79 @@ mod tests {
         let mut s = site();
         s.port = Some(0);
         assert_eq!(validate(&mut s), Err(Invalid::ZeroPort));
+    }
+
+    #[test]
+    fn a_site_saved_before_auth_existed_logs_in_with_a_password() {
+        // Every sites.json written before key login existed has no "auth"
+        // key at all, and must keep loading as it always did.
+        let text = r#"{"sites":[{"id":"nas","protocol":"sftp","host":"nas.local","username":"r"}]}"#;
+        let site = &parse(text).expect("should parse").sites[0];
+        assert_eq!(site.auth, Auth::Password);
+        assert_eq!(site.trusted_cert, None);
+    }
+
+    #[test]
+    fn a_password_site_is_written_without_an_auth_key() {
+        // So saving through the dialog does not churn every existing entry.
+        let text = serde_json::to_string(&site()).unwrap();
+        assert!(!text.contains("auth"), "{text}");
+        assert!(!text.contains("trusted_cert"), "{text}");
+    }
+
+    #[test]
+    fn key_and_agent_auth_round_trip() {
+        for auth in [Auth::Key { path: "~/.ssh/id_ed25519".into() }, Auth::Agent] {
+            let mut s = site();
+            s.auth = auth.clone();
+            let text = serde_json::to_string(&Sites { sites: vec![s] }).unwrap();
+            assert_eq!(parse(&text).expect("should parse").sites[0].auth, auth, "{text}");
+        }
+        let text = r#"{"sites":[{"id":"nas","protocol":"sftp","host":"h","username":"r",
+                      "auth":{"method":"key","path":"/k"}}]}"#;
+        assert_eq!(
+            parse(text).unwrap().sites[0].auth,
+            Auth::Key { path: "/k".into() }
+        );
+    }
+
+    #[test]
+    fn a_key_login_needs_a_key_file() {
+        let mut s = site();
+        s.auth = Auth::Key { path: "  ".into() };
+        assert_eq!(validate(&mut s), Err(Invalid::Empty { field: "key file" }));
+    }
+
+    #[test]
+    fn only_a_password_login_needs_a_saved_password_up_front() {
+        let mut s = site();
+        assert!(s.needs_password());
+        s.auth = Auth::Agent;
+        assert!(!s.needs_password());
+        s.auth = Auth::Key { path: "/k".into() };
+        assert!(!s.needs_password());
+
+        s.protocol = Protocol::Ftp;
+        assert!(s.needs_password(), "FTP ignores the SSH login method");
+        s.username.clear();
+        assert!(!s.needs_password(), "anonymous FTP has no password");
+    }
+
+    #[test]
+    fn a_trusted_certificate_is_stored_in_one_spelling() {
+        let mut s = site();
+        s.trusted_cert = Some(format!("sha256 Fingerprint={}", "ab".repeat(32)));
+        validate(&mut s).unwrap();
+        let expected = vec!["AB"; 32].join(":");
+        assert_eq!(s.trusted_cert.as_deref(), Some(expected.as_str()));
+
+        s.trusted_cert = Some("not a fingerprint".into());
+        assert!(matches!(validate(&mut s), Err(Invalid::NotAFingerprint(_))));
+
+        // Blank means not set, rather than a malformed fingerprint.
+        s.trusted_cert = Some("  ".into());
+        validate(&mut s).unwrap();
+        assert_eq!(s.trusted_cert, None);
     }
 
     #[test]

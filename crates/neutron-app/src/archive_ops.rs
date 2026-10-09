@@ -44,6 +44,7 @@ enum Message {
 /// A background archive job.
 pub struct ArchiveJob {
     pub state: JobState,
+    pub directory: PathBuf,
     cancel: Arc<AtomicBool>,
     messages: Receiver<Message>,
 }
@@ -83,7 +84,8 @@ pub fn extract(archive: PathBuf, format: Format, ctx: egui::Context) -> ArchiveJ
         "Extracting {}",
         archive.file_name().unwrap_or_default().to_string_lossy()
     );
-    spawn(label.clone(), ctx, move |report| {
+    let directory = archive.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+    spawn(label.clone(), directory, ctx, move |report| {
         let destination = neutron_archive::destination_for(&archive, |p| p.exists())
             .ok_or_else(|| {
                 std::io::Error::other("that archive is not in a folder to extract into")
@@ -106,7 +108,7 @@ pub fn compress(sources: Vec<PathBuf>, base: PathBuf, ctx: egui::Context) -> Arc
         ),
         n => format!("Compressing {n} items"),
     };
-    spawn(label.clone(), ctx, move |report| {
+    spawn(label.clone(), base.clone(), ctx, move |report| {
         let name = neutron_archive::create::suggested_name(&sources, &base);
         let chosen = neutron_core::naming::next_available(name.trim_end_matches(".zip"), |c| {
             base.join(format!("{c}.zip")).exists()
@@ -116,7 +118,7 @@ pub fn compress(sources: Vec<PathBuf>, base: PathBuf, ctx: egui::Context) -> Arc
     })
 }
 
-fn spawn<F>(label: String, ctx: egui::Context, work: F) -> ArchiveJob
+fn spawn<F>(label: String, directory: PathBuf, ctx: egui::Context, work: F) -> ArchiveJob
 where
     F: FnOnce(&mut dyn FnMut(Progress) -> Continue) -> Result<Summary, neutron_archive::ArchiveError>
         + Send
@@ -155,6 +157,7 @@ where
         .expect("failed to spawn archive thread");
 
     ArchiveJob {
+        directory,
         state: JobState {
             label,
             progress: Progress::default(),

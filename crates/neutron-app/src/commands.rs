@@ -38,6 +38,9 @@ pub enum CommandId {
 
     ToggleHidden,
     ToggleView,
+    ListView,
+    GridView,
+    ColumnView,
     TogglePreview,
     ToggleTheme,
 
@@ -109,16 +112,23 @@ pub const ALL: &[CommandDef] = &[
     CommandDef { id: CommandId::Compress, title: "Compress to a zip", hint: "" },
     CommandDef {
         id: CommandId::DeleteSelection,
-        title: "Delete to Recycle Bin",
+        title: if cfg!(target_os = "macos") { "Move to Trash" } else { "Delete to Recycle Bin" },
         hint: "Delete",
     },
 
-    CommandDef { id: CommandId::ToggleHidden, title: "Show hidden files", hint: "Ctrl+H" },
+    CommandDef {
+        id: CommandId::ToggleHidden,
+        title: "Show hidden files",
+        hint: if cfg!(target_os = "macos") { "Cmd+Shift+." } else { "Ctrl+H" },
+    },
     CommandDef {
         id: CommandId::ToggleView,
-        title: "Switch list / grid view",
+        title: "Switch to the next view",
         hint: "Ctrl+Shift+L",
     },
+    CommandDef { id: CommandId::ListView, title: "Show as a list", hint: "" },
+    CommandDef { id: CommandId::GridView, title: "Show as a grid", hint: "" },
+    CommandDef { id: CommandId::ColumnView, title: "Show in columns", hint: "" },
     CommandDef {
         id: CommandId::TogglePreview,
         title: "Show the preview pane",
@@ -137,7 +147,7 @@ pub const ALL: &[CommandDef] = &[
     // changed since.
     CommandDef {
         id: CommandId::RefreshIndex,
-        title: "Rebuild the search index",
+        title: if cfg!(target_os = "macos") { "Reconnect search" } else { "Rebuild the search index" },
         hint: "",
     },
     // The only way to stop the elevated helper from inside the application.
@@ -145,7 +155,7 @@ pub const ALL: &[CommandDef] = &[
     // Task Manager — which is exactly what happened during development.
     CommandDef {
         id: CommandId::StopIndexer,
-        title: "Stop the search indexer",
+        title: if cfg!(target_os = "macos") { "Pause search" } else { "Stop the search indexer" },
         hint: "",
     },
 
@@ -166,7 +176,9 @@ pub const ALL: &[CommandDef] = &[
     CommandDef {
         id: CommandId::OpenTerminal,
         title: "Open a terminal here",
-        hint: "Ctrl+`",
+        // Spelled out on the Mac so the Ctrl-to-Cmd rewrite below leaves it
+        // alone: this one really is the Control key there.
+        hint: if cfg!(target_os = "macos") { "Control+`" } else { "Ctrl+`" },
     },
     CommandDef { id: CommandId::NewWindow, title: "Open a new window", hint: "Ctrl+N" },
 
@@ -245,7 +257,7 @@ pub fn catalogue(plugins: &[(crate::plugins::Ref, String, String)]) -> Vec<Entry
         .map(|c| Entry {
             invoke: Invoke::Builtin(c.id),
             title: c.title.to_owned(),
-            hint: c.hint.to_owned(),
+            hint: if cfg!(target_os = "macos") { c.hint.replace("Ctrl+", "Cmd+") } else { c.hint.to_owned() },
         })
         .collect();
 

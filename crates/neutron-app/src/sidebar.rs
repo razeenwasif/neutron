@@ -24,7 +24,7 @@ use egui::{Color32, Rect, Sense, Ui, pos2, vec2};
 use neutron_core::NodeId;
 use neutron_core::places::{Place, PlaceKind};
 use neutron_ui::icons::{self, Glyph};
-use neutron_ui::theme::{self, Palette, NAV_HEIGHT, RADIUS_CONTROL, RADIUS_SMALL, ThemeMode, micro_caps};
+use neutron_ui::theme::{Palette, NAV_HEIGHT, RADIUS_CONTROL, RADIUS_SMALL, ThemeMode, micro_caps};
 
 /// Space reserved at the bottom for the storage panel and the theme toggle.
 const FOOTER_HEIGHT: f32 = 96.0;
@@ -33,18 +33,16 @@ const FOOTER_HEIGHT: f32 = 96.0;
 pub fn brand(ui: &mut Ui, p: &Palette) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
 
-    // The brand mark: rounded square with glowing purple gradient, folder glyph, and subtle glass highlight.
-    let mark = Rect::from_min_size(pos2(rect.left() + 2.0, rect.center().y - 13.0), vec2(26.0, 26.0));
-    let mark_shadow = egui::epaint::Shadow {
-        offset: [0, 2],
-        blur: 14,
-        spread: 0,
-        color: p.selection,
-    };
-    ui.painter().add(mark_shadow.as_shape(mark, egui::CornerRadius::same(7)));
-    ui.painter().rect_filled(mark, 7.0, p.accent_pressed);
-    theme::glass_highlight(ui.painter(), mark, egui::CornerRadius::same(7));
-    icons::draw(ui.painter(), mark.center(), Glyph::Folder, Color32::WHITE);
+    let mark = Rect::from_min_size(pos2(rect.left() - 2.0, rect.center().y - 18.0), vec2(36.0, 36.0));
+    // Cache the texture once; the sidebar, Dock, and executable share one mark.
+    let texture: egui::TextureHandle = ui.ctx().data(|data| data.get_temp(egui::Id::new("neutron-brand-icon")))
+        .unwrap_or_else(|| {
+            let image = egui::ColorImage::from_rgba_unmultiplied([256, 256], include_bytes!("../../../assets/icon_256.rgba"));
+            let texture = ui.ctx().load_texture("neutron-brand", image, egui::TextureOptions::LINEAR);
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neutron-brand-icon"), texture.clone()));
+            texture
+        });
+    ui.painter().image(texture.id(), mark, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
 
     ui.painter().text(
         pos2(mark.right() + 10.0, rect.center().y),

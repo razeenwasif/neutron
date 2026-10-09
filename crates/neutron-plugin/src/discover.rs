@@ -78,6 +78,9 @@ pub struct PluginSet {
 /// The fallbacks match the rest of the application's state handling, and are
 /// what let this be exercised on Linux.
 pub fn plugins_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support").into_os_string();
+    #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .or_else(|| std::env::var_os("HOME"))?;

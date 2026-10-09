@@ -136,6 +136,9 @@ impl Tab {
             self.view.show_hidden,
             &self.view.filter,
         );
+        // Entries the filter now hides cannot stay selected, or the next
+        // Delete would reach files the user cannot see.
+        self.selection.retain_visible(&self.list);
         self.view.scroll_to = self.selection.cursor();
     }
 
@@ -153,6 +156,24 @@ pub struct Group {
 }
 
 impl Group {
+    /// Takes `tab` out of the strip, keeping the same tab in front.
+    ///
+    /// Closing a tab to the left of the active one shifts every index after
+    /// it down by one, so the active index has to follow — clamping alone
+    /// silently brought the *next* tab to the front. When the active tab
+    /// itself goes, the one that slides into its slot takes over, which is
+    /// what every tabbed UI does.
+    fn remove_tab(&mut self, tab: TabId) {
+        let Some(position) = self.tabs.iter().position(|t| *t == tab) else {
+            return;
+        };
+        self.tabs.remove(position);
+        if position < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+    }
+
     pub fn active_tab(&self) -> Option<TabId> {
         self.tabs.get(self.active).copied()
     }
@@ -217,6 +238,21 @@ impl Workspace {
         self.tabs.get_mut(&id)
     }
 
+    /// Clears the scroll request of every tab on screen, once a frame has
+    /// drawn them.
+    ///
+    /// Panes draw from a clone of each tab's view state, so the widget's own
+    /// "consumed once" never reaches the tab. Left standing, a request pins
+    /// the listing to that row and the wheel cannot move it. Background tabs
+    /// keep theirs until they are shown.
+    pub fn consume_scroll_requests(&mut self) {
+        for group in self.groups.values() {
+            if let Some(tab) = group.active_tab().and_then(|id| self.tabs.get_mut(&id)) {
+                tab.view.scroll_to = None;
+            }
+        }
+    }
+
     /// Opens a tab in `group` and focuses it. Returns the new tab's id.
     pub fn open_tab(&mut self, group: GroupId, location: NodeId, view: FileListState) -> TabId {
         let id = TabId(self.next_tab);
@@ -246,12 +282,9 @@ impl Workspace {
         let Some(group) = self.groups.get_mut(&group_id) else {
             return true;
         };
-        group.tabs.retain(|t| *t != tab);
+        group.remove_tab(tab);
 
         if !group.tabs.is_empty() {
-            // Keep the active index in range; prefer the tab that took the
-            // closed one's slot, which is what every tabbed UI does.
-            group.active = group.active.min(group.tabs.len() - 1);
             return true;
         }
 
@@ -313,8 +346,7 @@ impl Workspace {
         }
 
         if let Some(g) = self.groups.get_mut(&source) {
-            g.tabs.retain(|t| *t != tab);
-            g.active = g.active.min(g.tabs.len().saturating_sub(1));
+            g.remove_tab(tab);
         }
         if let Some(g) = self.groups.get_mut(&target) {
             g.tabs.push(tab);
@@ -329,6 +361,23 @@ impl Workspace {
             if let Some(remaining) = layout.remove(source) {
                 self.layout = remaining;
             }
+        }
+    }
+
+    /// Moves the tab at `from` to `to` within one pane, keeping the same tab
+    /// in front.
+    pub fn reorder_tab(&mut self, group: GroupId, from: usize, to: usize) {
+        let Some(g) = self.groups.get_mut(&group) else {
+            return;
+        };
+        if from >= g.tabs.len() || to >= g.tabs.len() || from == to {
+            return;
+        }
+        let front = g.active_tab();
+        let tab = g.tabs.remove(from);
+        g.tabs.insert(to, tab);
+        if let Some(front) = front {
+            g.active = g.tabs.iter().position(|t| *t == front).unwrap_or(0);
         }
     }
 
@@ -406,6 +455,10 @@ pub struct PersistedPrefs {
     pub show_hidden: bool,
     #[serde(default)]
     pub grid: bool,
+    /// The column view. Its own flag rather than a change to `grid`, so a
+    /// session saved by an older build still reads.
+    #[serde(default)]
+    pub columns: bool,
     /// One of `name`, `size`, `modified`, `created`, `kind`. An unknown value
     /// reads as `name` rather than failing the whole session.
     #[serde(default)]
@@ -500,6 +553,16 @@ impl PersistedLocation {
 pub struct PersistedSplit {
     /// Index into `panes` of the pane being split.
     pub target: usize,
+    /// Index into `panes` of the pane the split creates — the first pane on
+    /// its second side.
+    ///
+    /// Needed because splits are replayed in tree order while panes are saved
+    /// in screen order, and the two differ whenever a split's first side is
+    /// itself split. Without it the new pane was assumed to be the next index,
+    /// and tabs came back in the wrong panes. `None` in sessions saved before
+    /// it existed, which fall back to that assumption.
+    #[serde(default)]
+    pub creates: Option<usize>,
     /// `true` for a side-by-side split.
     pub horizontal: bool,
     pub ratio: f32,
@@ -513,17 +576,29 @@ impl Workspace {
         let panes = order
             .iter()
             .filter_map(|gid| self.groups.get(gid))
-            .map(|g| PersistedPane {
-                tabs: g
+            .map(|g| {
+                // Every kind of location, not just paths. Dropping shell tabs
+                // here would silently delete a "This PC" tab on restart.
+                let kept: Vec<(usize, PersistedLocation)> = g
                     .tabs
                     .iter()
-                    .filter_map(|t| self.tabs.get(t))
-                    // Every kind of location, not just paths. Dropping shell
-                    // tabs here would silently delete a "This PC" tab on
-                    // restart *and* shift `active` past the tab it names.
-                    .filter_map(|t| PersistedLocation::from_node(t.location()))
-                    .collect(),
-                active: g.active,
+                    .enumerate()
+                    .filter_map(|(i, t)| Some((i, self.tabs.get(t)?)))
+                    .filter_map(|(i, t)| Some((i, PersistedLocation::from_node(t.location())?)))
+                    .collect();
+                // The active index counts only the tabs that are kept, or a
+                // dropped Drive tab before it put a different tab in front.
+                let active = kept
+                    .iter()
+                    .position(|(i, _)| *i >= g.active)
+                    .unwrap_or(kept.len().saturating_sub(1));
+                let mut tabs: Vec<PersistedLocation> = kept.into_iter().map(|(_, l)| l).collect();
+                // A pane of nothing but Drive tabs still has to come back —
+                // an empty first pane made the whole saved layout unusable.
+                if tabs.is_empty() {
+                    tabs.push(PersistedLocation::Home);
+                }
+                PersistedPane { tabs, active }
             })
             .collect();
 
@@ -572,6 +647,7 @@ impl Workspace {
             light_theme: false,
             show_hidden: tab.view.show_hidden,
             grid: tab.view.view == neutron_ui::file_list::ViewMode::Grid,
+            columns: tab.view.view == neutron_ui::file_list::ViewMode::Columns,
             sort: String::new(),
             descending: tab.view.sort.order == neutron_core::SortOrder::Descending,
         };
@@ -592,10 +668,13 @@ impl Workspace {
         let root = ws.layout.groups()[0];
 
         // Replay splits to rebuild the tree shape, mapping saved pane indices
-        // to the groups they become.
-        let mut group_for_index = vec![root];
+        // to the groups they become. In tree order, so a split's target always
+        // exists by the time it is replayed: it is the first pane of the
+        // split's subtree, created by the split above it (or the root).
+        let mut group_for_index: HashMap<usize, GroupId> = HashMap::from([(0, root)]);
+        let mut next_index = 1;
         for split in &saved.splits {
-            let Some(&target) = group_for_index.get(split.target) else {
+            let Some(&target) = group_for_index.get(&split.target) else {
                 continue;
             };
             let new_group = GroupId(ws.next_group);
@@ -607,6 +686,8 @@ impl Workspace {
                 Axis::Vertical
             };
             if ws.layout.split(target, axis, new_group) {
+                // Just split, so `target` and the new pane are this split's two
+                // children and `set_ratio` cannot reach a different one.
                 ws.layout.set_ratio(target, split.ratio);
                 ws.groups.insert(
                     new_group,
@@ -616,14 +697,15 @@ impl Workspace {
                         active: 0,
                     },
                 );
-                group_for_index.push(new_group);
+                group_for_index.insert(split.creates.unwrap_or(next_index), new_group);
+                next_index += 1;
             }
         }
 
         // Fill panes with their tabs. The first tab of the first pane already
         // exists from `Workspace::new`.
         for (index, pane) in saved.panes.iter().enumerate() {
-            let Some(&gid) = group_for_index.get(index) else {
+            let Some(&gid) = group_for_index.get(&index) else {
                 continue;
             };
             let skip = usize::from(index == 0);
@@ -647,7 +729,9 @@ impl Workspace {
             },
             ..Default::default()
         };
-        let mode = if saved.prefs.grid {
+        let mode = if saved.prefs.columns {
+            neutron_ui::file_list::ViewMode::Columns
+        } else if saved.prefs.grid {
             neutron_ui::file_list::ViewMode::Grid
         } else {
             neutron_ui::file_list::ViewMode::List
@@ -688,10 +772,11 @@ fn collect_splits(layout: &Layout, order: &[GroupId], out: &mut Vec<PersistedSpl
     {
         // Record against the first leaf of the left subtree, which is the pane
         // `split` would have been called on.
-        if let (Some(target), Some(_)) = (first.groups().first(), second.groups().first()) {
+        if let (Some(target), Some(created)) = (first.groups().first(), second.groups().first()) {
             if let Some(index) = order.iter().position(|g| g == target) {
                 out.push(PersistedSplit {
                     target: index,
+                    creates: order.iter().position(|g| g == created),
                     horizontal: *axis == Axis::Horizontal,
                     ratio: *ratio,
                 });
@@ -786,6 +871,93 @@ mod tests {
             ..Default::default()
         };
         w
+    }
+
+    #[test]
+    fn reordering_a_tab_keeps_the_same_tab_in_front() {
+        let mut w = ws();
+        let group = w.focused_group().expect("a group").id;
+        let a = w.active_tab_id().unwrap();
+        let b = w.open_tab(group, NodeId::path("/b"), FileListState::default());
+        let c = w.open_tab(group, NodeId::path("/c"), FileListState::default());
+        // C is in front; move A to the end.
+        w.reorder_tab(group, 0, 2);
+        assert_eq!(w.groups[&group].tabs, [b, c, a]);
+        assert_eq!(w.active_tab_id(), Some(c));
+    }
+
+    #[test]
+    fn nested_panes_come_back_where_they_were() {
+        // Split right, then split the left pane down: [[A / B] | C]. Panes are
+        // saved left to right — A, B, C — but splits replay root first, so the
+        // right-hand pane is created before the bottom-left one.
+        let mut w = ws();
+        let a = w.focused_group().expect("a group").id;
+        w.split(Axis::Horizontal);
+        let c = w.focused;
+        w.tabs.values_mut().find(|t| w.groups[&c].tabs.contains(&t.id)).unwrap().history = History::new(NodeId::path("/c"));
+        w.focused = a;
+        w.split(Axis::Vertical);
+        let b = w.focused;
+        let b_tab = w.groups[&b].tabs[0];
+        w.tabs.get_mut(&b_tab).unwrap().history = History::new(NodeId::path("/b"));
+
+        let restored = Workspace::restore(&w.persist()).expect("should restore");
+        let where_is = |path: &str| {
+            let order = restored.layout.groups();
+            order.iter().position(|g| {
+                restored.groups[g].tabs.iter().any(|t| restored.tabs[t].location() == &NodeId::path(path))
+            })
+        };
+        assert_eq!(where_is("/start"), Some(0));
+        assert_eq!(where_is("/b"), Some(1), "B's tabs moved");
+        assert_eq!(where_is("/c"), Some(2), "C's tabs moved");
+    }
+
+    #[test]
+    fn a_dropped_drive_tab_does_not_move_which_tab_is_in_front() {
+        let mut w = ws();
+        let group = w.focused_group().expect("a group").id;
+        w.open_tab(group, NodeId::cloud(neutron_core::namespace::CloudProviderId::GoogleDrive, "id", "Drive"), FileListState::default());
+        w.open_tab(group, NodeId::path("/third"), FileListState::default());
+        // The third tab is in front; the Drive tab before it is not saved.
+        let saved = w.persist();
+        assert_eq!(saved.panes[0].tabs.len(), 2);
+        assert_eq!(saved.panes[0].tabs[saved.panes[0].active], PersistedLocation::Path("/third".into()));
+    }
+
+    #[test]
+    fn closing_a_tab_left_of_the_active_one_keeps_the_active_one_in_front() {
+        let mut w = ws();
+        let mut loader = Loader::spawn(egui::Context::default());
+        let group = w.focused_group().expect("a group").id;
+        let a = w.active_tab_id().expect("a tab");
+        let b = w.open_tab(group, NodeId::path("/b"), FileListState::default());
+        let c = w.open_tab(group, NodeId::path("/c"), FileListState::default());
+        w.groups.get_mut(&group).unwrap().active = 1;
+        assert_eq!(w.active_tab_id(), Some(b));
+
+        w.close_tab(a, &mut loader);
+        assert_eq!(w.active_tab_id(), Some(b), "closing A brought C to the front");
+
+        // Closing the active tab hands over to the one that slides into its slot.
+        w.close_tab(b, &mut loader);
+        assert_eq!(w.active_tab_id(), Some(c));
+    }
+
+    #[test]
+    fn a_scroll_request_is_spent_once_drawn_but_a_background_tab_keeps_its_own() {
+        let mut w = ws();
+        let group = w.focused_group().expect("a group").id;
+        let first = w.active_tab_id().expect("a tab");
+        w.tabs.get_mut(&first).unwrap().view.scroll_to = Some(7);
+        let second = w.open_tab(group, NodeId::path("/second"), FileListState::default());
+        w.tabs.get_mut(&second).unwrap().view.scroll_to = Some(3);
+
+        w.consume_scroll_requests();
+
+        assert_eq!(w.tabs[&second].view.scroll_to, None, "the tab on screen keeps pinning");
+        assert_eq!(w.tabs[&first].view.scroll_to, Some(7), "a hidden tab lost its request");
     }
 
     #[test]

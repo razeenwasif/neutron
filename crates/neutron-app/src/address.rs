@@ -67,11 +67,46 @@ pub fn resolve(input: &str, current: &NodeId, home: Option<&Path>) -> Option<Nod
     // Absolute already, or relative to wherever the pane is. A relative path is
     // what makes typing `docs` useful, and it only means anything when the pane
     // has a path of its own.
-    if is_absolute(&expanded) {
-        return Some(NodeId::Path(PathBuf::from(expanded)));
+    let path = if is_absolute(&expanded) {
+        PathBuf::from(expanded)
+    } else {
+        current.as_path()?.join(expanded)
+    };
+    Some(NodeId::Path(normalize(&path)))
+}
+
+/// Folds `.` and `..` away and rebuilds the path with the platform's own
+/// separator, without touching the disk.
+///
+/// The loader hands Windows a `\\?\` path, and that form turns off Windows'
+/// own handling of both: `C:/Users/me`, `docs/sub` or `..` typed into the field
+/// reached the filesystem literally and failed to open. On the Mac `..` did
+/// open, but the location kept it — the tab was titled `..` and Up went back
+/// down into the folder just left.
+///
+/// Lexical, so `..` after a symlink goes to the parent of the link rather than
+/// of its target — the same answer a shell's `cd ..` gives.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Only a real folder name is undone. At the root there is
+                // nowhere further up, and a leading `..` on a path that is
+                // still relative has nothing to cancel.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
     }
-    let base = current.as_path()?;
-    Some(NodeId::Path(base.join(expanded)))
+    out
 }
 
 /// Expands `~` and `%VAR%`.
@@ -81,7 +116,13 @@ pub fn resolve(input: &str, current: &NodeId, home: Option<&Path>) -> Option<Nod
 /// its name is not what someone typing `%FOO%` meant, and the error it produces
 /// would name a path they never typed.
 fn expand(text: &str, home: Option<&Path>) -> Option<String> {
-    let text = if let Some(rest) = text.strip_prefix('~') {
+    // `~` alone or followed by a separator. `~bob` is a name like any other —
+    // Neutron does not look up other users' homes, and quietly turning it into
+    // a folder called `bob` inside yours would be worse than not expanding.
+    let tilde = text
+        .strip_prefix('~')
+        .filter(|rest| rest.is_empty() || rest.starts_with(['/', '\\']));
+    let text = if let Some(rest) = tilde {
         let home = home?;
         let rest = rest.trim_start_matches(['/', '\\']);
         if rest.is_empty() {
@@ -93,7 +134,10 @@ fn expand(text: &str, home: Option<&Path>) -> Option<String> {
         text.to_owned()
     };
 
-    if !text.contains('%') {
+    // `%VAR%` is Windows syntax. Elsewhere a percent sign is just a character,
+    // and a folder like `50% off 100%` has to survive the round trip from the
+    // field's own text and back.
+    if !cfg!(windows) || !text.contains('%') {
         return Some(text);
     }
 
@@ -160,7 +204,7 @@ mod tests {
     fn a_relative_path_hangs_off_the_current_folder() {
         assert_eq!(
             resolve("Neutron", &here(), None),
-            Some(NodeId::path(r"C:\Users\Razeen\Projects\Neutron"))
+            Some(NodeId::path(here().as_path().unwrap().join("Neutron")))
         );
     }
 
@@ -191,7 +235,7 @@ mod tests {
         );
         assert_eq!(
             resolve(r"~\Downloads", &here(), Some(&home())),
-            Some(NodeId::path(r"C:\Users\Razeen\Downloads"))
+            Some(NodeId::path(home().join("Downloads")))
         );
     }
 
@@ -202,6 +246,7 @@ mod tests {
         assert_eq!(resolve("~", &here(), None), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_environment_variable_expands() {
         unsafe { std::env::set_var("NEUTRON_TEST_DIR", r"C:\somewhere") };
@@ -214,6 +259,7 @@ mod tests {
     /// Refused rather than left literal: navigating to a folder called
     /// `%NOPE%` is not what someone typing that meant, and the error would name
     /// a path they never typed.
+    #[cfg(windows)]
     #[test]
     fn an_unset_variable_resolves_to_nothing() {
         assert_eq!(resolve("%NEUTRON_NOT_SET_ANYWHERE%", &here(), None), None);
@@ -221,6 +267,7 @@ mod tests {
 
     /// A percent sign is a legal character in a folder name, so an unpaired one
     /// has to survive.
+    #[cfg(windows)]
     #[test]
     fn a_lone_percent_is_a_literal() {
         assert_eq!(
@@ -315,5 +362,46 @@ mod tests {
                 "{text} did not round trip"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    fn here() -> NodeId {
+        NodeId::path("/Users/test/Documents")
+    }
+
+    #[test]
+    fn dots_are_folded_away() {
+        assert_eq!(resolve("..", &here(), None), Some(NodeId::path("/Users/test")));
+        assert_eq!(resolve("../Music/./x", &here(), None), Some(NodeId::path("/Users/test/Music/x")));
+        assert_eq!(resolve("a/b/../c", &here(), None), Some(NodeId::path("/Users/test/Documents/a/c")));
+        // Nothing above the root.
+        assert_eq!(resolve("/../..", &here(), None), Some(NodeId::path("/")));
+    }
+
+    #[test]
+    fn percent_signs_are_ordinary_characters() {
+        assert_eq!(
+            resolve("/Users/test/50% off 100%", &here(), None),
+            Some(NodeId::path("/Users/test/50% off 100%"))
+        );
+    }
+
+    #[test]
+    fn a_tilde_that_starts_a_name_is_left_alone() {
+        let home = Path::new("/Users/test");
+        assert_eq!(resolve("~bob", &here(), Some(home)), Some(NodeId::path("/Users/test/Documents/~bob")));
+        assert_eq!(resolve("~/x", &here(), Some(home)), Some(NodeId::path("/Users/test/x")));
+    }
+
+    #[test]
+    fn unix_absolute_relative_and_home_paths_resolve() {
+        let current = NodeId::path("/Users/test/Documents");
+        assert_eq!(resolve("/Applications", &current, None), Some(NodeId::path("/Applications")));
+        assert_eq!(resolve("notes", &current, None), Some(NodeId::path("/Users/test/Documents/notes")));
+        assert_eq!(resolve("~/Downloads", &current, Some(Path::new("/Users/test"))), Some(NodeId::path("/Users/test/Downloads")));
     }
 }

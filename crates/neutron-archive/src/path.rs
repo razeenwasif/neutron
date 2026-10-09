@@ -28,6 +28,8 @@ pub enum Refusal {
     Traversal,
     /// A Windows device name, which cannot be created and is a trap besides.
     ReservedName,
+    /// Contains `:`, which on Windows names an NTFS alternate data stream.
+    Stream,
 }
 
 /// The path `entry` should be written to under `root`, or why it must not be.
@@ -60,6 +62,16 @@ pub fn safe_join(root: &Path, entry: &str) -> Result<PathBuf, Refusal> {
                 let name = part.to_string_lossy();
                 if is_reserved(&name) {
                     return Err(Refusal::ReservedName);
+                }
+                // `notes.txt:payload` is not a file called that on NTFS: it is
+                // a hidden second stream inside `notes.txt`, invisible to
+                // Explorer and to `dir`, and `x:Zone.Identifier` would rewrite
+                // a file's mark-of-the-web. A leading `C:` is already refused
+                // above as a drive; this catches the colon anywhere else.
+                // Windows only, because elsewhere `:` is an ordinary character
+                // that real archives from macOS and Linux do contain.
+                if cfg!(windows) && name.contains(':') {
+                    return Err(Refusal::Stream);
                 }
                 out.push(part);
             }
@@ -193,6 +205,24 @@ mod tests {
     fn a_name_that_merely_starts_like_a_device_is_allowed() {
         assert!(safe_join(&root(), "console.log").is_ok());
         assert!(safe_join(&root(), "COM10.txt").is_ok());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn an_alternate_data_stream_is_refused_on_windows() {
+        assert_eq!(safe_join(&root(), "notes.txt:hidden").unwrap_err(), Refusal::Stream);
+        assert_eq!(
+            safe_join(&root(), "docs/run.exe:Zone.Identifier").unwrap_err(),
+            Refusal::Stream
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_colon_is_an_ordinary_character_elsewhere() {
+        // macOS and Linux archives legitimately contain names like this, and
+        // refusing them there would cost files for no protection.
+        assert!(safe_join(&root(), "meeting 10:30.txt").is_ok());
     }
 
     #[test]

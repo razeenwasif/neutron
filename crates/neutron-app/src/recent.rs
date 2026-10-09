@@ -41,6 +41,10 @@ pub struct Visit {
 pub struct Recent {
     #[serde(default)]
     pub files: Vec<Visit>,
+    /// Bumped by every change, so a stale save cannot overwrite a newer one.
+    /// See `crate::persist`.
+    #[serde(skip)]
+    pub revision: u64,
 }
 
 impl Recent {
@@ -68,6 +72,7 @@ impl Recent {
             },
         );
         self.files.truncate(MAX);
+        self.revision += 1;
         true
     }
 
@@ -75,12 +80,17 @@ impl Recent {
     pub fn forget(&mut self, path: &Path) -> bool {
         let before = self.files.len();
         self.files.retain(|v| v.path != path);
-        before != self.files.len()
+        let changed = before != self.files.len();
+        self.revision += u64::from(changed);
+        changed
     }
 }
 
 /// `%APPDATA%\Neutron\recent.json`.
 pub fn path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support").into_os_string();
+    #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .or_else(|| std::env::var_os("HOME"))?;
@@ -92,7 +102,10 @@ pub fn load() -> Result<Recent, String> {
         return Ok(Recent::default());
     };
     match std::fs::read_to_string(&file) {
-        Ok(text) => parse(&text),
+        Ok(text) => parse(&text).map_err(|e| match crate::persist::set_aside(&file) {
+            Some(kept) => format!("{e}; the file was kept as {}", kept.display()),
+            None => e,
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Recent::default()),
         Err(e) => Err(e.to_string()),
     }
@@ -110,11 +123,8 @@ pub fn save(recent: &Recent) -> Result<(), String> {
     let Some(file) = path() else {
         return Err("there is no %APPDATA% to save recent files in".to_owned());
     };
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
     let json = serde_json::to_string_pretty(recent).map_err(|e| e.to_string())?;
-    std::fs::write(&file, json).map_err(|e| e.to_string())
+    crate::persist::write(&file, &json, recent.revision)
 }
 
 #[cfg(test)]

@@ -60,6 +60,7 @@ impl MaximiseButton {
         self.hovered.load(Ordering::Relaxed)
     }
 
+    #[cfg(any(windows, test))]
     fn contains(&self, x: i32, y: i32) -> bool {
         let (l, t) = (
             self.left.load(Ordering::Relaxed),

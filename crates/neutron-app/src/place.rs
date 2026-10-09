@@ -97,6 +97,8 @@ mod tests {
                 username: "razeen".to_owned(),
                 path: None,
                 fingerprint: None,
+                auth: Default::default(),
+                trusted_cert: None,
             }],
         }
     }

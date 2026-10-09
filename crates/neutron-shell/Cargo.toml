@@ -41,3 +41,27 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Threading",
 ]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `exception` so an Objective-C exception from AppKit (beginning a drag with
+# an unsuitable event, say) becomes an `Err` instead of unwinding through Rust.
+objc2 = { version = "0.6", features = ["exception"] }
+block2 = "0.6"
+libc = "0.2"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSDate", "NSEnumerator",
+    "NSError", "NSFileManager", "NSGeometry", "NSNotification", "NSObject", "NSProcessInfo", "NSString", "NSThread",
+    "NSURL", "NSValue",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std", "block2", "objc2-core-foundation", "NSApplication", "NSBitmapImageRep",
+    "NSColorSpace", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSGraphics",
+    "NSGraphicsContext", "NSImage", "NSImageRep", "NSPasteboard", "NSResponder",
+    "NSView", "NSWindow", "NSWorkspace",
+] }
+
+# Runs on the process's main thread, which AppKit-facing code requires and the
+# default test harness never provides.
+[[test]]
+name = "macos_main_thread"
+harness = false

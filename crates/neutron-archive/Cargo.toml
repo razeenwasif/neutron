@@ -16,6 +16,11 @@ zip = { version = "6", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
 
+# `getxattr`/`setxattr`, to carry the archive's quarantine flag onto what comes
+# out of it. Already in the tree through half a dozen other crates.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # The hostile-archive tests build their entries by hand, without the sanitising
 # a well-behaved writer would apply.

@@ -1,6 +1,7 @@
 //! The SFTP client against a real SSH server, over a real socket.
 //!
-//! The server is in this file, for the same reason the FTP one is: the failures
+//! The server is in `support/sftp_server.rs`, written by hand for the same
+//! reason the FTP one is: the failures
 //! worth catching are in the conversation, not in the parsing. And one of them
 //! cannot be tested any other way — a server that presents a *different host
 //! key* than the one recorded is the exact case host key checking exists for,
@@ -8,435 +9,13 @@
 //!
 //! So [`FakeSftp`] is an SSH server whose host key the test chooses.
 
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
-use std::sync::Arc;
+#[path = "support/sftp_server.rs"]
+mod support;
 
-use neutron_remote::site::{Protocol, Site};
+use neutron_remote::site::Auth;
 use neutron_remote::transport::{Continue, RemoteError, Transport};
 use russh::keys::{Algorithm, HashAlg, PrivateKey};
-use russh::server::{Auth, ChannelOpenHandle, Msg, Server as _, Session};
-use russh::{Channel, ChannelId};
-use russh_sftp::protocol::{
-    File, FileAttributes, Handle, Name, Status, StatusCode, Version,
-};
-use tokio::sync::Mutex;
-
-/// One file or directory the fake server serves.
-#[derive(Clone)]
-struct Item {
-    name: String,
-    contents: Vec<u8>,
-    is_dir: bool,
-}
-
-impl Item {
-    fn file(name: &str, contents: &[u8]) -> Item {
-        Item {
-            name: name.to_owned(),
-            contents: contents.to_vec(),
-            is_dir: false,
-        }
-    }
-
-    fn dir(name: &str) -> Item {
-        Item {
-            name: name.to_owned(),
-            contents: Vec::new(),
-            is_dir: true,
-        }
-    }
-
-    fn attributes(&self) -> FileAttributes {
-        let mut attrs = FileAttributes {
-            size: Some(self.contents.len() as u64),
-            mtime: Some(1_600_000_000),
-            ..FileAttributes::default()
-        };
-        if self.is_dir {
-            attrs.set_dir(true);
-        } else {
-            attrs.set_regular(true);
-        }
-        attrs
-    }
-}
-
-/// A running SSH server with an SFTP subsystem.
-struct FakeSftp {
-    addr: SocketAddr,
-    /// What the client should see, so a test can assert on the recorded value.
-    fingerprint: String,
-    /// Write requests the server received, as `"verb path"`.
-    writes: Arc<parking_lot::Mutex<Vec<String>>>,
-    /// Whatever `write` received, byte for byte.
-    written: Arc<parking_lot::Mutex<Vec<u8>>>,
-}
-
-impl FakeSftp {
-    /// Starts a server using `key` as its host key, serving `items` in `/`.
-    fn start(key: PrivateKey, items: Vec<Item>, password_ok: bool) -> FakeSftp {
-        let fingerprint = key
-            .public_key()
-            .fingerprint(HashAlg::Sha256)
-            .to_string();
-
-        // Bound here rather than inside the server so the port is known before
-        // this function returns and the test never races the listener.
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        listener.set_nonblocking(true).expect("nonblocking");
-
-        let writes: Arc<parking_lot::Mutex<Vec<String>>> = Arc::new(Default::default());
-        let written: Arc<parking_lot::Mutex<Vec<u8>>> = Arc::new(Default::default());
-        let server_writes = Arc::clone(&writes);
-        let server_written = Arc::clone(&written);
-
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime");
-
-            runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).expect("from_std");
-                let config = Arc::new(russh::server::Config {
-                    keys: vec![key],
-                    auth_rejection_time: std::time::Duration::from_millis(50),
-                    auth_rejection_time_initial: Some(std::time::Duration::ZERO),
-                    ..Default::default()
-                });
-                let mut server = Server {
-                    items: Arc::new(items),
-                    password_ok,
-                    writes: server_writes,
-                    written: server_written,
-                };
-                let running = server.run_on_socket(config, &listener);
-                let _ = running.await;
-            });
-        });
-
-        FakeSftp {
-            addr,
-            fingerprint,
-            writes,
-            written,
-        }
-    }
-
-    /// Every write request the server received, as `"verb path"`.
-    fn writes(&self) -> Vec<String> {
-        self.writes.lock().clone()
-    }
-
-    fn written(&self) -> Vec<u8> {
-        self.written.lock().clone()
-    }
-
-    fn site(&self, fingerprint: Option<&str>) -> Site {
-        Site {
-            id: "fake".into(),
-            label: String::new(),
-            protocol: Protocol::Sftp,
-            host: self.addr.ip().to_string(),
-            port: Some(self.addr.port()),
-            username: "razeen".into(),
-            path: None,
-            fingerprint: fingerprint.map(str::to_owned),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct Server {
-    items: Arc<Vec<Item>>,
-    password_ok: bool,
-    writes: Arc<parking_lot::Mutex<Vec<String>>>,
-    written: Arc<parking_lot::Mutex<Vec<u8>>>,
-}
-
-impl russh::server::Server for Server {
-    type Handler = SshSession;
-
-    fn new_client(&mut self, _: Option<SocketAddr>) -> SshSession {
-        SshSession {
-            channels: Arc::new(Mutex::new(HashMap::new())),
-            items: Arc::clone(&self.items),
-            password_ok: self.password_ok,
-            writes: Arc::clone(&self.writes),
-            written: Arc::clone(&self.written),
-        }
-    }
-}
-
-struct SshSession {
-    channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
-    items: Arc<Vec<Item>>,
-    password_ok: bool,
-    writes: Arc<parking_lot::Mutex<Vec<String>>>,
-    written: Arc<parking_lot::Mutex<Vec<u8>>>,
-}
-
-impl russh::server::Handler for SshSession {
-    type Error = russh::Error;
-
-    async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
-        if self.password_ok {
-            Ok(Auth::Accept)
-        } else {
-            Ok(Auth::reject())
-        }
-    }
-
-    async fn channel_open_session(
-        &mut self,
-        channel: Channel<Msg>,
-        reply: ChannelOpenHandle,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        self.channels.lock().await.insert(channel.id(), channel);
-        reply.accept().await;
-        Ok(())
-    }
-
-    async fn subsystem_request(
-        &mut self,
-        channel_id: ChannelId,
-        name: &str,
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        if name != "sftp" {
-            session.channel_failure(channel_id)?;
-            return Ok(());
-        }
-
-        let channel = self
-            .channels
-            .lock()
-            .await
-            .remove(&channel_id)
-            .expect("the channel should have been opened");
-        session.channel_success(channel_id)?;
-        russh_sftp::server::run(
-            channel.into_stream(),
-            SftpHandler {
-                items: Arc::clone(&self.items),
-                writes: Arc::clone(&self.writes),
-                written: Arc::clone(&self.written),
-                read_dirs: HashSet::new(),
-                read_files: HashSet::new(),
-            },
-        )
-        .await;
-        Ok(())
-    }
-}
-
-/// An SFTP server over a flat list of items in `/`.
-struct SftpHandler {
-    items: Arc<Vec<Item>>,
-    /// Every write request the server was asked to perform, as
-    /// `"verb path"`, in order. What a write test actually asserts is that the
-    /// right request reached the server with the right path — the client's own
-    /// return value cannot tell you that.
-    writes: Arc<parking_lot::Mutex<Vec<String>>>,
-    /// Whatever `write` received, so an upload can be checked byte for byte.
-    written: Arc<parking_lot::Mutex<Vec<u8>>>,
-    /// Directory handles already drained, so the second `readdir` says EOF.
-    read_dirs: HashSet<String>,
-    /// File handles already drained, likewise.
-    read_files: HashSet<String>,
-}
-
-impl SftpHandler {
-    fn find(&self, path: &str) -> Option<&Item> {
-        let name = path.trim_start_matches('/');
-        self.items.iter().find(|i| i.name == name)
-    }
-
-    fn note(&self, verb: &str, path: &str) {
-        self.writes.lock().push(format!("{verb} {path}"));
-    }
-
-    fn ok(&self, id: u32) -> Status {
-        Status {
-            id,
-            status_code: StatusCode::Ok,
-            error_message: "Ok".to_owned(),
-            language_tag: "en-US".to_owned(),
-        }
-    }
-}
-
-impl russh_sftp::server::Handler for SftpHandler {
-    type Error = StatusCode;
-
-    fn unimplemented(&self) -> StatusCode {
-        StatusCode::OpUnsupported
-    }
-
-    async fn init(
-        &mut self,
-        _version: u32,
-        _extensions: HashMap<String, String>,
-    ) -> Result<Version, Self::Error> {
-        Ok(Version::new())
-    }
-
-    async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
-        Ok(Status {
-            id,
-            status_code: StatusCode::Ok,
-            error_message: "Ok".to_owned(),
-            language_tag: "en-US".to_owned(),
-        })
-    }
-
-    async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
-        Ok(Name {
-            id,
-            files: vec![File::dummy(&path)],
-        })
-    }
-
-    async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
-        self.read_dirs.remove(&path);
-        Ok(Handle { id, handle: path })
-    }
-
-    async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
-        if !self.read_dirs.insert(handle) {
-            // Everything has been sent; EOF is how a listing ends.
-            return Err(StatusCode::Eof);
-        }
-        Ok(Name {
-            id,
-            files: self
-                .items
-                .iter()
-                .map(|item| File::new(&item.name, item.attributes()))
-                .collect(),
-        })
-    }
-
-
-    // --- the write half -----------------------------------------------------
-    //
-    // Each one records the request and succeeds. What these tests are for is
-    // the path: a client that sends the right verb to the wrong place has no
-    // way of noticing, because the server answers Ok either way.
-
-    async fn mkdir(
-        &mut self,
-        id: u32,
-        path: String,
-        _attrs: FileAttributes,
-    ) -> Result<Status, Self::Error> {
-        self.note("mkdir", &path);
-        Ok(self.ok(id))
-    }
-
-    async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
-        self.note("rmdir", &path);
-        Ok(self.ok(id))
-    }
-
-    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
-        self.note("remove", &filename);
-        Ok(self.ok(id))
-    }
-
-    async fn rename(
-        &mut self,
-        id: u32,
-        oldpath: String,
-        newpath: String,
-    ) -> Result<Status, Self::Error> {
-        self.note("rename", &format!("{oldpath} -> {newpath}"));
-        Ok(self.ok(id))
-    }
-
-    async fn write(
-        &mut self,
-        id: u32,
-        _handle: String,
-        _offset: u64,
-        data: Vec<u8>,
-    ) -> Result<Status, Self::Error> {
-        self.written.lock().extend_from_slice(&data);
-        Ok(self.ok(id))
-    }
-
-    async fn open(
-        &mut self,
-        id: u32,
-        filename: String,
-        flags: russh_sftp::protocol::OpenFlags,
-        _attrs: FileAttributes,
-    ) -> Result<Handle, Self::Error> {
-        // An upload opens a file that does not exist yet, which is exactly the
-        // case a read-only fake refuses. The flags are what distinguishes the
-        // two, and getting this wrong here would make every upload test fail
-        // for a reason that has nothing to do with the client.
-        if flags.contains(russh_sftp::protocol::OpenFlags::WRITE)
-            || flags.contains(russh_sftp::protocol::OpenFlags::CREATE)
-        {
-            self.note("open-write", &filename);
-            return Ok(Handle { id, handle: filename });
-        }
-        match self.find(&filename) {
-            Some(_) => {
-                self.read_files.remove(&filename);
-                Ok(Handle { id, handle: filename })
-            }
-            None => Err(StatusCode::NoSuchFile),
-        }
-    }
-
-    async fn read(
-        &mut self,
-        id: u32,
-        handle: String,
-        offset: u64,
-        len: u32,
-    ) -> Result<russh_sftp::protocol::Data, Self::Error> {
-        let item = self.find(&handle).ok_or(StatusCode::NoSuchFile)?;
-        let start = offset as usize;
-        if start >= item.contents.len() {
-            return Err(StatusCode::Eof);
-        }
-        let end = (start + len as usize).min(item.contents.len());
-        Ok(russh_sftp::protocol::Data {
-            id,
-            data: item.contents[start..end].to_vec(),
-        })
-    }
-
-    async fn fstat(&mut self, id: u32, handle: String) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
-        let item = self.find(&handle).ok_or(StatusCode::NoSuchFile)?;
-        Ok(russh_sftp::protocol::Attrs {
-            id,
-            attrs: item.attributes(),
-        })
-    }
-
-    async fn stat(&mut self, id: u32, path: String) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
-        let item = self.find(&path).ok_or(StatusCode::NoSuchFile)?;
-        Ok(russh_sftp::protocol::Attrs {
-            id,
-            attrs: item.attributes(),
-        })
-    }
-
-    async fn lstat(&mut self, id: u32, path: String) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
-        self.stat(id, path).await
-    }
-}
-
-fn key() -> PrivateKey {
-    PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("key")
-}
+use support::{FakeSftp, Item, key};
 
 // ---------------------------------------------------------------------------
 
@@ -712,4 +291,118 @@ fn progress_is_reported_and_an_upload_can_be_stopped() {
         server.written().len() < 300_000,
         "a stopped upload sent the whole file"
     );
+}
+
+// --- key login ---------------------------------------------------------------
+//
+// Every one of these servers refuses all passwords, so a connection that gets
+// in can only have done it with the key.
+
+/// A private key written to a file of its own, removed when the test ends.
+struct KeyFile(std::path::PathBuf);
+
+impl KeyFile {
+    fn write(key: &PrivateKey) -> KeyFile {
+        let text = key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .expect("serialise key");
+        let path = std::env::temp_dir().join(format!(
+            "neutron-test-key-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&path, text.as_bytes()).expect("write key");
+        KeyFile(path)
+    }
+
+    fn site(&self, server: &FakeSftp) -> neutron_remote::Site {
+        let mut site = server.site(None);
+        site.auth = Auth::Key {
+            path: self.0.to_string_lossy().into_owned(),
+        };
+        site
+    }
+}
+
+impl Drop for KeyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn client_key() -> PrivateKey {
+    PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("key")
+}
+
+#[test]
+fn an_unencrypted_key_file_logs_in() {
+    let client = client_key();
+    let server = FakeSftp::start_accepting(
+        key(),
+        vec![Item::file("a.txt", b"a")],
+        false,
+        Some(client.public_key().clone()),
+    );
+    let file = KeyFile::write(&client);
+
+    // No secret at all: an unencrypted key needs none.
+    let mut transport = neutron_remote::sftp::SftpTransport::connect(&file.site(&server), "")
+        .expect("the key should be accepted");
+    assert_eq!(transport.list("/", &mut Vec::new()).expect("list").len(), 1);
+}
+
+#[test]
+fn an_encrypted_key_file_is_opened_with_the_saved_secret() {
+    let client = client_key();
+    let server =
+        FakeSftp::start_accepting(key(), Vec::new(), false, Some(client.public_key().clone()));
+    let encrypted = client
+        .encrypt(&mut rand::rng(), "correct horse")
+        .expect("encrypt");
+    let file = KeyFile::write(&encrypted);
+    let site = file.site(&server);
+
+    neutron_remote::sftp::SftpTransport::connect(&site, "correct horse")
+        .expect("the passphrase should decrypt the key");
+
+    // No passphrase saved: the same error as a missing password, so the app
+    // sends the user to the same place to type one in — and nothing is dialled.
+    let Err(error) = neutron_remote::sftp::SftpTransport::connect(&site, "") else {
+        panic!("an encrypted key cannot be used without its passphrase");
+    };
+    assert!(matches!(error, RemoteError::NoPassword { .. }), "{error:?}");
+
+    let Err(error) = neutron_remote::sftp::SftpTransport::connect(&site, "wrong") else {
+        panic!("the wrong passphrase must not decrypt the key");
+    };
+    assert!(matches!(error, RemoteError::Key { .. }), "{error:?}");
+}
+
+#[test]
+fn a_key_the_server_does_not_know_is_an_authentication_failure() {
+    let server =
+        FakeSftp::start_accepting(key(), Vec::new(), false, Some(client_key().public_key().clone()));
+    let file = KeyFile::write(&client_key());
+
+    let Err(error) = neutron_remote::sftp::SftpTransport::connect(&file.site(&server), "") else {
+        panic!("an unknown key should not log in");
+    };
+    assert!(matches!(error, RemoteError::Auth { .. }), "{error:?}");
+}
+
+#[test]
+fn a_missing_key_file_is_reported_by_path_without_dialling() {
+    let server = FakeSftp::start(key(), Vec::new(), false);
+    let mut site = server.site(None);
+    site.auth = Auth::Key {
+        path: "/nonexistent/neutron/id_ed25519".into(),
+    };
+
+    let Err(error) = neutron_remote::sftp::SftpTransport::connect(&site, "") else {
+        panic!("there is no key to log in with");
+    };
+    let RemoteError::Key { path, .. } = &error else {
+        panic!("expected a key file error, got {error:?}");
+    };
+    assert_eq!(path, "/nonexistent/neutron/id_ed25519");
 }

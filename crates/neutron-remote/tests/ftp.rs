@@ -33,6 +33,12 @@ struct Config {
     /// A verb the server answers `550` to, so the client's handling of a
     /// refusal can be tested without a real permission problem.
     refuse: Option<String>,
+    /// Whether `FEAT` advertises EPSV and the server answers it.
+    epsv: bool,
+    /// The host the `PASV` reply advertises, in place of the address the
+    /// server is really listening on — what a server behind NAT sends, and
+    /// what a hostile one would send to aim the data connection elsewhere.
+    pasv_host: Option<[u8; 4]>,
 }
 
 impl Default for Config {
@@ -43,6 +49,8 @@ impl Default for Config {
             file: Vec::new(),
             password_ok: true,
             refuse: None,
+            epsv: false,
+            pasv_host: None,
         }
     }
 }
@@ -92,6 +100,8 @@ impl FakeFtp {
             username: username.into(),
             path: None,
             fingerprint: None,
+            auth: Default::default(),
+            trusted_cert: None,
         }
     }
 }
@@ -156,6 +166,9 @@ fn serve(
                 } else {
                     let _ = writer.write_all(b" UTF8\r\n");
                 }
+                if config.epsv {
+                    let _ = writer.write_all(b" EPSV\r\n");
+                }
                 say(&mut writer, "211 End");
             }
             "PWD" => say(&mut writer, "257 \"/\" is the current directory"),
@@ -164,13 +177,23 @@ fn serve(
                 let data = TcpListener::bind(("127.0.0.1", 0)).expect("bind data");
                 let port = data.local_addr().expect("addr").port();
                 pending_data = Some(data);
+                let [a, b, c, d] = config.pasv_host.unwrap_or([127, 0, 0, 1]);
                 say(
                     &mut writer,
                     &format!(
-                        "227 Entering Passive Mode (127,0,0,1,{},{})",
+                        "227 Entering Passive Mode ({a},{b},{c},{d},{},{})",
                         port >> 8,
                         port & 0xFF
                     ),
+                );
+            }
+            "EPSV" if config.epsv => {
+                let data = TcpListener::bind(("127.0.0.1", 0)).expect("bind data");
+                let port = data.local_addr().expect("addr").port();
+                pending_data = Some(data);
+                say(
+                    &mut writer,
+                    &format!("229 Entering Extended Passive Mode (|||{port}|)"),
                 );
             }
             "LIST" | "MLSD" => {
@@ -435,6 +458,72 @@ fn progress_is_reported_and_a_download_can_be_stopped() {
 }
 
 #[test]
+fn epsv_is_used_when_the_server_offers_it() {
+    // EPSV names only a port, so the data connection cannot be aimed anywhere
+    // but the server already connected to, and it is the only passive form
+    // that works over IPv6.
+    let server = FakeFtp::start(Config {
+        epsv: true,
+        file: vec![4, 5, 6],
+        ..Config::default()
+    });
+
+    let site = server.site("razeen");
+    let mut transport =
+        neutron_remote::ftp::FtpTransport::connect(&site, "hunter2").expect("should connect");
+    let mut sink = Vec::new();
+    transport
+        .download("/a.bin", &mut sink, &mut |_| Continue::Yes)
+        .expect("should download over EPSV");
+    assert_eq!(sink, [4, 5, 6]);
+
+    let commands = server.commands();
+    assert!(commands.iter().any(|c| c == "EPSV"), "{commands:?}");
+    assert!(!commands.iter().any(|c| c == "PASV"), "{commands:?}");
+}
+
+#[test]
+fn pasv_is_used_when_epsv_is_not_offered() {
+    let server = FakeFtp::start(Config {
+        file: vec![1],
+        ..Config::default()
+    });
+
+    let site = server.site("razeen");
+    let mut transport =
+        neutron_remote::ftp::FtpTransport::connect(&site, "hunter2").expect("should connect");
+    transport
+        .download("/a.bin", &mut Vec::new(), &mut |_| Continue::Yes)
+        .expect("should download over PASV");
+
+    let commands = server.commands();
+    assert!(commands.iter().any(|c| c == "PASV"), "{commands:?}");
+    assert!(!commands.iter().any(|c| c == "EPSV"), "{commands:?}");
+}
+
+#[test]
+fn the_address_in_a_pasv_reply_is_ignored_in_favour_of_the_server_itself() {
+    // 192.0.2.1 is TEST-NET-1: reserved for documentation, routed nowhere. A
+    // server behind NAT advertises its private address the same way, and a
+    // hostile one could advertise a third party's. Either way the only
+    // address worth connecting to is the one the control connection reached.
+    let server = FakeFtp::start(Config {
+        pasv_host: Some([192, 0, 2, 1]),
+        file: vec![9, 9, 9],
+        ..Config::default()
+    });
+
+    let site = server.site("razeen");
+    let mut transport =
+        neutron_remote::ftp::FtpTransport::connect(&site, "hunter2").expect("should connect");
+    let mut sink = Vec::new();
+    transport
+        .download("/a.bin", &mut sink, &mut |_| Continue::Yes)
+        .expect("the data connection should have gone to the server, not the advertised host");
+    assert_eq!(sink, [9, 9, 9]);
+}
+
+#[test]
 fn a_rejected_password_is_reported_as_an_authentication_failure() {
     let server = FakeFtp::start(Config {
         password_ok: false,
@@ -639,4 +728,195 @@ fn a_refused_write_reports_what_the_server_said() {
     let text = error.to_string();
     assert!(text.contains("/pub/locked.txt"), "{text}");
     assert!(text.contains("550") || text.contains("Permission"), "{text}");
+}
+
+// --- FTPS and self-signed certificates ---------------------------------------
+//
+// The certificate a NAS makes for itself on first boot: self-signed, valid for
+// 127.0.0.1, signed by nobody the bundled roots know. Generated once with
+//
+//     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+//         -nodes -days 36500 -subj "/CN=neutron-test-nas" \
+//         -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
+//
+// and embedded so the test needs no certificate generator. The fingerprint is
+// what `openssl x509 -noout -fingerprint -sha256` prints for it, which is the
+// point: the value Neutron shows must be checkable against the server.
+
+const SELF_SIGNED_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBqjCCAU+gAwIBAgIUIja8tx2eiMDhs0JE0VNeGjCLA1UwCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQbmV1dHJvbi10ZXN0LW5hczAgFw0yNjEwMDkwMTAzNTRaGA8y
+MTI2MDkxNTAxMDM1NFowGzEZMBcGA1UEAwwQbmV1dHJvbi10ZXN0LW5hczBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABJjcQT+QW4P7VXqNWQoRT+9u1uxunj170CiU
+vi5kOXXoMdCKfuwvuM4vtD1awssAbrLnW3gYF3wPawDs2bhOZdijbzBtMB0GA1Ud
+DgQWBBS+dBGk9lkEEgBYBQPTj/AMUSRl7DAfBgNVHSMEGDAWgBS+dBGk9lkEEgBY
+BQPTj/AMUSRl7DAPBgNVHRMBAf8EBTADAQH/MBoGA1UdEQQTMBGHBH8AAAGCCWxv
+Y2FsaG9zdDAKBggqhkjOPQQDAgNJADBGAiEAxHOeOKPtUzbSc3aWUPmfFPiqLHFi
+GVJ7uXzmTvUpRZsCIQCKO8FcNUyAz1hJIDloKd2AMmHlRO2IAnAWB0d/qVbhJg==
+-----END CERTIFICATE-----
+";
+
+const SELF_SIGNED_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgvUx57v5qif5PMQM9
+GtCusUgL5uPqCs0PYZYVLQ2u3RyhRANCAASY3EE/kFuD+1V6jVkKEU/vbtbsbp49
+e9AolL4uZDl16DHQin7sL7jOL7Q9WsLLAG6y51t4GBd8D2sA7Nm4TmXY
+-----END PRIVATE KEY-----
+";
+
+const SELF_SIGNED_FINGERPRINT: &str = "4A:E4:0B:3F:5D:87:1C:12:B1:0F:FE:A8:51:D7:9C:0B:\
+EE:BB:28:87:8B:66:B2:3C:C8:C0:25:AF:07:DA:B2:50";
+
+/// An explicit-FTPS server presenting [`SELF_SIGNED_CERT`]. Speaks only as much
+/// as a login needs, and records every command it reads *after* the handshake —
+/// so a `PASS` in the log is proof the password crossed an encrypted channel,
+/// and its absence is proof a refused certificate kept the password at home.
+struct FakeFtps {
+    addr: SocketAddr,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeFtps {
+    fn start() -> FakeFtps {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let worker_log = Arc::clone(&log);
+        std::thread::spawn(move || {
+            if let Ok((control, _)) = listener.accept() {
+                serve_tls(control, &worker_log);
+            }
+        });
+        FakeFtps { addr, log }
+    }
+
+    fn site(&self, trusted_cert: Option<&str>) -> Site {
+        Site {
+            id: "nas".into(),
+            label: String::new(),
+            protocol: Protocol::Ftps,
+            host: self.addr.ip().to_string(),
+            port: Some(self.addr.port()),
+            username: "razeen".into(),
+            path: None,
+            fingerprint: None,
+            auth: Default::default(),
+            trusted_cert: trusted_cert.map(str::to_owned),
+        }
+    }
+
+    fn saw_password(&self) -> bool {
+        self.log.lock().iter().any(|line| line.starts_with("PASS"))
+    }
+}
+
+fn serve_tls(mut control: TcpStream, log: &Mutex<Vec<String>>) {
+    use suppaftp::rustls;
+    use suppaftp::rustls::pki_types::pem::PemObject;
+    use suppaftp::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let _ = control.write_all(b"220 Fake FTPS ready\r\n");
+    let mut line = String::new();
+    {
+        let mut plain = BufReader::new(&control);
+        if plain.read_line(&mut line).is_err() || !line.to_ascii_uppercase().starts_with("AUTH TLS")
+        {
+            return;
+        }
+    }
+    let _ = control.write_all(b"234 Proceed with negotiation\r\n");
+
+    let cert = CertificateDer::from_pem_slice(SELF_SIGNED_CERT.as_bytes()).expect("cert");
+    let key = PrivateKeyDer::from_pem_slice(SELF_SIGNED_KEY.as_bytes()).expect("key");
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(vec![cert], key)
+    .expect("server config");
+    let connection = rustls::ServerConnection::new(Arc::new(config)).expect("connection");
+    let mut tls = BufReader::new(rustls::StreamOwned::new(connection, control));
+
+    loop {
+        let mut line = String::new();
+        // A client that refused the certificate aborts the handshake, which
+        // surfaces here as an error on the first read.
+        match tls.read_line(&mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let line = line.trim_end_matches(['\r', '\n']).to_owned();
+        log.lock().push(line.clone());
+        let verb = line.split(' ').next().unwrap_or("").to_ascii_uppercase();
+        let reply: &[u8] = match verb.as_str() {
+            "PBSZ" | "PROT" | "TYPE" => b"200 OK\r\n",
+            "USER" => b"331 Password required\r\n",
+            "PASS" => b"230 Logged in\r\n",
+            "FEAT" => b"211-Features:\r\n UTF8\r\n211 End\r\n",
+            "QUIT" => {
+                let _ = tls.get_mut().write_all(b"221 Goodbye\r\n");
+                return;
+            }
+            _ => b"502 Command not implemented\r\n",
+        };
+        let _ = tls.get_mut().write_all(reply);
+        let _ = tls.get_mut().flush();
+    }
+}
+
+#[test]
+fn a_certificate_fingerprint_matches_what_openssl_prints() {
+    use suppaftp::rustls::pki_types::CertificateDer;
+    use suppaftp::rustls::pki_types::pem::PemObject;
+    let der = CertificateDer::from_pem_slice(SELF_SIGNED_CERT.as_bytes()).expect("cert");
+    assert_eq!(
+        neutron_remote::certificate::fingerprint(der.as_ref()),
+        SELF_SIGNED_FINGERPRINT
+    );
+}
+
+#[test]
+fn a_self_signed_certificate_is_refused_on_first_contact_naming_its_fingerprint() {
+    let server = FakeFtps::start();
+
+    let Err(error) = neutron_remote::ftp::FtpTransport::connect(&server.site(None), "hunter2")
+    else {
+        panic!("an unvouched-for certificate must not be accepted silently");
+    };
+    let RemoteError::UntrustedCertificate { fingerprint, message } = &error else {
+        panic!("expected an untrusted certificate, got {error:?}");
+    };
+    assert_eq!(fingerprint, SELF_SIGNED_FINGERPRINT);
+    assert!(message.contains(SELF_SIGNED_FINGERPRINT), "{message}");
+    assert!(message.contains("trust"), "{message}");
+    assert!(!server.saw_password(), "the password was sent to an untrusted server");
+}
+
+#[test]
+fn a_pinned_self_signed_certificate_connects() {
+    let server = FakeFtps::start();
+    // Pasted the way OpenSSL prints it, label and all.
+    let pin = format!("sha256 Fingerprint={SELF_SIGNED_FINGERPRINT}");
+
+    neutron_remote::ftp::FtpTransport::connect(&server.site(Some(&pin)), "hunter2")
+        .expect("the pinned certificate should be trusted");
+    assert!(server.saw_password(), "the login did not happen over TLS");
+}
+
+#[test]
+fn a_certificate_that_differs_from_the_pin_is_refused_naming_both() {
+    let server = FakeFtps::start();
+    let old = neutron_remote::certificate::fingerprint(b"the certificate it used to have");
+
+    let Err(error) = neutron_remote::ftp::FtpTransport::connect(&server.site(Some(&old)), "hunter2")
+    else {
+        panic!("a changed certificate must not connect");
+    };
+    let RemoteError::UntrustedCertificate { message, .. } = &error else {
+        panic!("expected an untrusted certificate, got {error:?}");
+    };
+    assert!(message.contains(&old), "{message}");
+    assert!(message.contains(SELF_SIGNED_FINGERPRINT), "{message}");
+    assert!(!server.saw_password(), "the password was sent to a changed server");
 }

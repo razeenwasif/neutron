@@ -39,6 +39,7 @@ const TYPE_AHEAD_TIMEOUT: Duration = Duration::from_millis(900);
 const STORAGE_KEY: &str = "neutron.workspace";
 
 enum Action {
+    RunCommand(commands::CommandId),
     Navigate(NodeId),
     Back,
     Forward,
@@ -52,7 +53,17 @@ enum Action {
     Marquee { from: usize, to: usize, additive: bool },
     SelectAll,
     ToggleHidden,
+    /// Step to the next view: list, grid, columns.
     ToggleView,
+    /// Show the focused tab in this view.
+    SetView(file_list::ViewMode),
+    /// A click in a column other than the current one: go to `dir` and select
+    /// `entry`. See `neutron_ui::columns::ColumnAction::Pick`.
+    ColumnPick {
+        dir: PathBuf,
+        entry: Option<(String, neutron_core::EntryKind)>,
+        double: bool,
+    },
     ToggleTheme,
     /// Narrow the focused tab's listing. Empty clears the filter.
     SetFilter(String),
@@ -65,7 +76,7 @@ enum Action {
     /// The rename box's contents changed.
     RenameTyped(String),
     /// Apply the typed name, or do nothing if it is unchanged or invalid.
-    RenameCommit,
+    RenameCommit(String),
     /// Abandon the rename.
     RenameCancel,
     /// Make a folder in the focused tab, then rename it.
@@ -96,6 +107,12 @@ enum Action {
     ReloadSites,
     /// Stop the download that is running.
     CancelDownload,
+    /// Stop the running server write.
+    CancelRemoteJob,
+    /// Delete the selection from a server, once confirmed. See `ask`.
+    DeleteOnServer,
+    /// Open the connect dialog on this saved server.
+    EditSite(String),
     /// Clear the status line.
     DismissNotice,
     /// Open a terminal at the focused tab's folder.
@@ -146,7 +163,8 @@ enum Action {
     SignOutDrive,
     ForgetServer,
     MoveCursor { delta: isize, extend: bool },
-    /// One tile left or right. Ignored outside the grid.
+    /// One tile left or right in the grid; out of or into a folder in the
+    /// column view. Ignored in the list.
     MoveWithinRow { delta: isize, extend: bool },
     MoveTo { pos: usize, extend: bool },
     TypeAhead(char),
@@ -157,6 +175,8 @@ enum Action {
     SetRatio { target: GroupId, ratio: f32 },
     Split(Axis),
     NewTab(GroupId),
+    /// A tab dragged within its own strip.
+    ReorderTab { group: GroupId, from: usize, to: usize },
     SelectTab { group: GroupId, index: usize },
     CloseTab { group: GroupId, index: usize },
     CloseActiveTab,
@@ -180,6 +200,9 @@ enum Action {
 /// to `IContextMenu::InvokeCommand`, where it would invoke an unrelated verb.
 const MENU_ID_PIN: u32 = 0x0800_0001;
 const MENU_ID_NEW_TAB: u32 = 0x0800_0002;
+const MENU_ID_EDIT_SITE: u32 = 0x0800_0003;
+const _: () = assert!(MENU_ID_EDIT_SITE > 0x7FFF);
+const _: () = assert!(MENU_ID_EDIT_SITE < crate::plugins::MENU_ID_BASE);
 const _: () = assert!(MENU_ID_PIN > 0x7FFF);
 const _: () = assert!(MENU_ID_NEW_TAB > 0x7FFF);
 const _: () = assert!(MENU_ID_PIN < crate::plugins::MENU_ID_BASE);
@@ -195,6 +218,46 @@ fn report(to: &crossbeam_channel::Sender<(crate::notice::Level, String)>, text: 
 fn report_info(to: &crossbeam_channel::Sender<(crate::notice::Level, String)>, text: String) {
     tracing::info!("{text}");
     let _ = to.send((crate::notice::Level::Info, text));
+}
+
+/// The storage indices of `tab`'s selection that are on screen, in row order.
+///
+/// Only rows the filter shows: an entry the listing hides is never acted on,
+/// whatever state the selection was left in. And in row order, because the
+/// selection is a set and its own order changes from run to run.
+fn visible_selection(tab: &crate::workspace::Tab) -> Vec<usize> {
+    let mut selected: Vec<(usize, usize)> = tab
+        .selection
+        .iter()
+        .filter_map(|i| tab.list.rank(i).map(|rank| (rank, i)))
+        .collect();
+    selected.sort_unstable();
+    selected.into_iter().map(|(_, i)| i).collect()
+}
+
+/// What a pending question is about: the tab it was asked in, the place that
+/// tab showed, and the names selected at the time.
+///
+/// Compared again when the answer arrives. An action like Delete reads the
+/// selection when it runs, so if the selection moved while the dialog was up
+/// the files deleted would not be the ones the dialog counted.
+#[derive(Debug, PartialEq, Eq)]
+struct Subject {
+    tab: TabId,
+    location: NodeId,
+    names: Vec<String>,
+}
+
+/// A write to a server, running on its own connection.
+struct RemoteJob {
+    /// "Uploading 3 items to files.example.com", for the status bar.
+    label: String,
+    /// The tab to re-read when it finishes.
+    tab: TabId,
+    progress: std::sync::Arc<crate::remote_ops::Progress>,
+    done: crossbeam_channel::Receiver<Result<String, String>>,
+    /// A folder just created, to open in its rename box once it is listed.
+    rename_after: Option<String>,
 }
 
 /// A remote file being fetched so it can be opened.
@@ -250,6 +313,11 @@ pub struct NeutronApp {
     hwnd: Option<isize>,
 
     loader: Loader,
+    /// Listings for the column view's other columns. See `crate::columns`.
+    columns: crate::columns::ColumnCache,
+    /// The home folder, read once: the column view starts its columns there
+    /// for anything inside it, and asks every frame.
+    home: Option<PathBuf>,
     workspace: Workspace,
     /// Shell COM apartments, shared by every M3 service.
     sta: neutron_shell::sta::StaPool,
@@ -264,6 +332,8 @@ pub struct NeutronApp {
     /// have moved.
     pin_target: Option<PathBuf>,
     tab_target: Option<NodeId>,
+    /// The saved server a sidebar menu was opened on, for its "Edit…" row.
+    edit_site_target: Option<String>,
     /// Where the maximise button is, shared with the window procedure so
     /// Windows can offer Snap Layouts over it.
     snap: std::sync::Arc<neutron_shell::snaplayout::MaximiseButton>,
@@ -272,7 +342,7 @@ pub struct NeutronApp {
     /// One at a time: two modals stacked on each other is a state nobody can
     /// reason about, and the second question is always about something the
     /// first one may be about to change.
-    confirm: Option<(crate::confirm::Confirm, Box<Action>)>,
+    confirm: Option<(crate::confirm::Confirm, Box<Action>, Option<Subject>)>,
     /// The pane whose address bar is open, and what has been typed into it.
     ///
     /// One at a time, keyed by pane: two panes each showing a path field over
@@ -340,6 +410,8 @@ pub struct NeutronApp {
     connect: crate::connect::ConnectDialog,
     /// A remote file being fetched so it can be opened.
     download: Option<DownloadJob>,
+    /// The write to a server in progress, if any. See `crate::remote_ops`.
+    remote_job: Option<RemoteJob>,
 
     /// Installed plugins, and the command running from one if any.
     plugins: crate::plugins::PluginRuntime,
@@ -396,6 +468,8 @@ pub struct NeutronApp {
     /// `Ctrl+V` presses, seen by a window subclass because egui drops them.
     /// See `neutron_shell::pastekey` for why that is necessary.
     paste_rx: crossbeam_channel::Receiver<()>,
+    /// Folders and files the system asked Neutron to open. See `main.rs`.
+    opened: crossbeam_channel::Receiver<Vec<PathBuf>>,
 
     /// The open context menu, if any.
     ///
@@ -415,6 +489,8 @@ pub struct NeutronApp {
     /// answering it reads the credential store, which is not a per-frame cost.
     drive_state: neutron_cloud::google::DriveState,
     drive_tx: crossbeam_channel::Sender<neutron_cloud::google::DriveState>,
+    /// A browser sign-in is waiting on a worker. See `connect_drive`.
+    drive_signing_in: bool,
     drive_rx: crossbeam_channel::Receiver<neutron_cloud::google::DriveState>,
 }
 
@@ -423,6 +499,7 @@ impl NeutronApp {
         cc: &eframe::CreationContext<'_>,
         mut startup: StartupTimer,
         start_path: Option<String>,
+        opened: crossbeam_channel::Receiver<Vec<PathBuf>>,
     ) -> Self {
         startup.mark_gpu_ready();
 
@@ -505,6 +582,10 @@ impl NeutronApp {
         // clipboard holds files rather than text, which is the only case that
         // matters here. A window subclass sees the key first.
         let (paste_tx, paste_rx) = crossbeam_channel::unbounded();
+        #[cfg(target_os = "macos")]
+        if let Err(e) = neutron_shell::pastekey::watch(0, paste_tx.clone()) {
+            tracing::warn!("{e}; Command+V will not work");
+        }
         let snap: std::sync::Arc<neutron_shell::snaplayout::MaximiseButton> =
             std::sync::Arc::new(Default::default());
         if let Some(h) = hwnd {
@@ -517,7 +598,20 @@ impl NeutronApp {
                 tracing::warn!("{e}; Snap Layouts will not appear");
             }
         }
-        let drive_state = neutron_cloud::google::GoogleDrive::new().state();
+        // Read on a worker. Whether Drive is signed in is a credential-store
+        // lookup — on the Mac that is the Keychain, through a helper process,
+        // and it can put up a prompt — and `main.rs` promises nothing of the
+        // kind happens on this thread. Shown as not set up until the answer
+        // arrives, which hides the row rather than flashing a sign-in button.
+        let drive_state = neutron_cloud::google::DriveState::NotConfigured;
+        {
+            let done = drive_tx.clone();
+            let wake = cc.egui_ctx.clone();
+            sta.submit(move || {
+                let _ = done.send(neutron_cloud::google::GoogleDrive::new().state());
+                wake.request_repaint();
+            });
+        }
 
         // Attaches to a helper left running by an earlier session, so search is
         // available with no prompt at all in the common case.
@@ -544,6 +638,8 @@ impl NeutronApp {
             startup,
             hwnd,
             loader,
+            columns: crate::columns::ColumnCache::spawn(cc.egui_ctx.clone()),
+            home: neutron_shell::places::home(),
             workspace,
             sta,
             icons,
@@ -551,6 +647,7 @@ impl NeutronApp {
             pins,
             pin_target: None,
             tab_target: None,
+            edit_site_target: None,
             snap,
             confirm: None,
             address: None,
@@ -578,6 +675,7 @@ impl NeutronApp {
             sites_tx,
             sites_rx,
             drive_state,
+            drive_signing_in: false,
             drive_tx,
             drive_rx,
             notices: crate::notice::Notices::default(),
@@ -587,6 +685,7 @@ impl NeutronApp {
             sites_error,
             connect: crate::connect::ConnectDialog::default(),
             download: None,
+            remote_job: None,
             plugins,
             palette,
             archive_job: None,
@@ -608,6 +707,7 @@ impl NeutronApp {
             clip_fail_tx,
             clip_fail_rx,
             paste_rx,
+            opened,
             menu: None,
             menu_reply: None,
             menu_tx,
@@ -660,6 +760,9 @@ impl NeutronApp {
         t.selection.clear();
         t.reselect = None;
         t.status = Status::Loading;
+        // An index into the folder being left. Applied to the one being
+        // entered, it would scroll to whichever entry happens to share it.
+        t.view.scroll_to = None;
         // The filter describes the folder being left, not the one being
         // entered. Carrying it across a navigation shows an arbitrarily empty
         // pane with no visible cause, which reads as a broken listing.
@@ -721,6 +824,7 @@ impl NeutronApp {
         let active = self.workspace.active_tab_id();
 
         match action {
+            Action::RunCommand(id) => self.run_command(ctx, id),
             Action::Navigate(id) => {
                 if let Some(tab) = active {
                     self.navigate(tab, id);
@@ -750,6 +854,7 @@ impl NeutronApp {
                     }
                 }
             }
+            Action::Up if self.in_columns() => self.column_step(-1),
             Action::Up => {
                 if let Some(tab) = active {
                     let parent = self
@@ -766,6 +871,9 @@ impl NeutronApp {
                 if let Some(tab) = active {
                     self.refresh_in_place(tab);
                 }
+                // The other columns are not the tab's listing, so a refresh
+                // of the tab alone would leave them as they were.
+                self.columns.clear();
             }
 
             Action::Activate(idx) => self.activate(idx),
@@ -786,6 +894,7 @@ impl NeutronApp {
                     self.drag_out();
                 }
             }
+            Action::BeginRename if self.on_server() => self.begin_rename(ctx),
             Action::BeginRename => {
                 if !self.refuse_without_a_path("rename anything in") {
                     self.begin_rename(ctx);
@@ -796,10 +905,14 @@ impl NeutronApp {
                     r.text = text;
                 }
             }
-            Action::RenameCommit => self.commit_rename(ctx),
+            Action::RenameCommit(text) => {
+                if let Some(edit) = self.rename.as_mut() { edit.text = text; }
+                self.commit_rename(ctx);
+            },
             Action::RenameCancel => {
                 self.close_rename(ctx);
             }
+            Action::NewFolder if self.on_server() => self.remote_new_folder(),
             Action::NewFolder => {
                 if !self.refuse_without_a_path("create folders in") {
                     self.new_folder();
@@ -840,6 +953,11 @@ impl NeutronApp {
                     job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+            Action::CancelRemoteJob => {
+                if let Some(job) = self.remote_job.as_ref() {
+                    job.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             Action::ReloadPlugins => {
                 self.plugins.reload();
                 self.palette = commands::catalogue(&self.plugins.palette_entries());
@@ -865,6 +983,7 @@ impl NeutronApp {
                     self.clip_selection(cut);
                 }
             }
+            Action::Paste if self.on_server() => self.remote_paste(),
             Action::Paste => {
                 if !self.refuse_without_a_path("paste into") {
                     self.paste();
@@ -923,6 +1042,13 @@ impl NeutronApp {
                     t.view.scroll_to = t.selection.cursor();
                 }
             }
+            Action::SetView(mode) => {
+                if let Some(t) = self.workspace.active_tab_mut() {
+                    t.view.view = mode;
+                    t.view.scroll_to = t.selection.cursor();
+                }
+            }
+            Action::ColumnPick { dir, entry, double } => self.column_pick(dir, entry, double),
 
             Action::SetFilter(text) => {
                 if let Some(t) = self.workspace.active_tab_mut() {
@@ -940,6 +1066,11 @@ impl NeutronApp {
                 }
             }
 
+            // On a server the delete is permanent and asked about first; the
+            // question names the server and the count. See `question_for`.
+            Action::Delete { .. } if self.on_server() => self.ask(Action::DeleteOnServer),
+            Action::DeleteOnServer => self.remote_delete(),
+            Action::EditSite(id) => self.edit_site(&id),
             Action::Delete { permanent } => {
                 if !self.refuse_without_a_path("delete from") {
                     self.delete_selection(permanent);
@@ -961,6 +1092,11 @@ impl NeutronApp {
 
             Action::ContextMenu { idx, pos } => self.context_menu(idx, pos),
 
+            Action::DropFiles { group, paths, .. } if self.on_server() => {
+                if let Some(tab) = self.workspace.groups.get(&group).and_then(|g| g.active_tab()) {
+                    self.remote_upload(tab, paths);
+                }
+            }
             Action::DropFiles { group, paths, copy } => {
                 if !self.refuse_without_a_path("copy files into") {
                     self.drop_files(group, paths, copy);
@@ -1025,6 +1161,7 @@ impl NeutronApp {
                     t.view.scroll_to = t.selection.cursor();
                 }
             }
+            Action::MoveWithinRow { delta, .. } if self.in_columns() => self.column_step(delta),
             Action::MoveWithinRow { delta, extend } => {
                 if let Some(t) = self.workspace.active_tab_mut() {
                     if t.view.view == neutron_ui::file_list::ViewMode::Grid {
@@ -1045,9 +1182,15 @@ impl NeutronApp {
 
             // --- workspace ---
             Action::FocusGroup(g) => self.workspace.focused = g,
+            Action::ReorderTab { group, from, to } => {
+                self.workspace.reorder_tab(group, from, to);
+                // The drag is over; without this the next release anywhere
+                // would read as a drop.
+                self.tab_drag = None;
+            }
             Action::FocusNextPane => self.workspace.focus_next_pane(),
             Action::SetRatio { target, ratio } => {
-                self.workspace.layout.set_ratio(target, ratio);
+                self.workspace.layout.set_divider_ratio(target, ratio);
             }
             Action::Split(axis) => {
                 tracing::debug!(?axis, panes = self.workspace.layout.len(), "split pane");
@@ -1220,6 +1363,11 @@ impl NeutronApp {
             return;
         };
         let full = base.join(&name);
+        #[cfg(target_os = "macos")]
+        if full.extension().is_some_and(|ext| ext == "app") && kind.is_container() {
+            self.open_local(full);
+            return;
+        }
 
         if kind.is_container() {
             self.navigate(tab, NodeId::Path(full));
@@ -1314,26 +1462,39 @@ impl NeutronApp {
             return;
         };
 
-        let owner = self.hwnd.unwrap_or(0);
-        let wake = self.ctx.clone();
-        let done = self.refresh_tx.clone();
-
-        tracing::info!(count = paths.len(), "dragging out");
-        let notices = self.notice_tx.clone();
-        self.sta.submit(move || {
-            match neutron_shell::dragout::drag(&paths, owner) {
-                // Re-listed after any completed drop, not only after a move.
-                // The drag cannot report reliably whether the files left —
-                // Explorer moves them itself and then says it did nothing —
-                // so the listing is the only account that is true.
-                Ok(neutron_shell::dragout::Dropped::Completed) => {
-                    let _ = done.send(tab_id);
-                }
-                Ok(neutron_shell::dragout::Dropped::Cancelled) => {}
-                Err(e) => report(&notices, format!("Drag failed: {e}")),
+        // On the Mac a drag is started on the UI thread and does not block:
+        // AppKit runs it from the event loop this thread already owns. On
+        // Windows `DoDragDrop` is a modal loop of its own, hence the worker.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = tab_id;
+            if let Err(e) = neutron_shell::dragout::drag(&paths, 0) {
+                self.notices.error(format!("Drag failed: {e}"));
             }
-            wake.request_repaint();
-        });
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let owner = self.hwnd.unwrap_or(0);
+            let wake = self.ctx.clone();
+            let done = self.refresh_tx.clone();
+
+            tracing::info!(count = paths.len(), "dragging out");
+            let notices = self.notice_tx.clone();
+            self.sta.submit(move || {
+                match neutron_shell::dragout::drag(&paths, owner) {
+                    // Re-listed after any completed drop, not only after a move.
+                    // The drag cannot report reliably whether the files left —
+                    // Explorer moves them itself and then says it did nothing —
+                    // so the listing is the only account that is true.
+                    Ok(neutron_shell::dragout::Dropped::Completed) => {
+                        let _ = done.send(tab_id);
+                    }
+                    Ok(neutron_shell::dragout::Dropped::Cancelled) => {}
+                    Err(e) => report(&notices, format!("Drag failed: {e}")),
+                }
+                wake.request_repaint();
+            });
+        }
     }
 
     /// Opens the rename box on the focused tab's cursor row.
@@ -1357,20 +1518,37 @@ impl NeutronApp {
 
     /// Puts a row into a rename box and focuses it.
     fn open_rename(&mut self, ctx: &egui::Context, tab: TabId, idx: usize, name: String) {
+        // A folder on disk or on a server: the two places a name can be changed.
+        let Some(place) = self
+            .workspace
+            .tabs
+            .get(&tab)
+            .map(|t| t.location().clone())
+            .filter(|l| l.as_path().is_some() || l.as_remote().is_some())
+        else {
+            return;
+        };
+        if let Some(tab) = self.workspace.tabs.get_mut(&tab) {
+            tab.selection.apply(&tab.list, idx, SelectMode::Replace);
+            tab.view.scroll_to = Some(idx);
+        }
         self.renames_started += 1;
         let generation = self.renames_started;
         self.rename = Some(RenameEdit {
             tab,
             generation,
             idx,
+            place,
             original: name.clone(),
             text: name,
+            refresh_pending: false,
         });
 
         // Focused from here rather than from the widget: the box has not been
         // drawn yet, and without focus the first keystroke would go to the key
         // table instead — where it would be a navigation shortcut.
         ctx.memory_mut(|m| m.request_focus(file_list::rename_field_id(generation)));
+        ctx.request_repaint();
     }
 
     /// Ends the rename and gives the keyboard back.
@@ -1381,6 +1559,9 @@ impl NeutronApp {
     fn close_rename(&mut self, ctx: &egui::Context) -> Option<RenameEdit> {
         let edit = self.rename.take()?;
         ctx.memory_mut(|m| m.surrender_focus(file_list::rename_field_id(edit.generation)));
+        if edit.refresh_pending {
+            self.refresh_in_place(edit.tab);
+        }
         Some(edit)
     }
 
@@ -1401,13 +1582,15 @@ impl NeutronApp {
             return;
         }
 
-        let Some(dir) = self
-            .workspace
-            .tabs
-            .get(&edit.tab)
-            .and_then(|t| t.location().as_path())
-            .map(|p| p.to_path_buf())
-        else {
+        // The folder the rename was started in, not the one the tab shows
+        // now. Clicking away commits, and a click on Up or a sidebar row
+        // navigates in the same frame — reading the tab here would rename a
+        // file of the same name in the folder just arrived at.
+        if edit.place.as_remote().is_some() {
+            self.remote_rename(edit.tab, &edit.place, edit.original, text);
+            return;
+        }
+        let Some(dir) = edit.place.as_path().map(Path::to_path_buf) else {
             return;
         };
         let from = dir.join(&edit.original);
@@ -1445,6 +1628,8 @@ impl NeutronApp {
             } else {
                 if let Err(e) = neutron_shell::fileops::rename(&from, &text, owner) {
                     report(&notices, format!("Could not rename to {text:?}: {e}"));
+                } else {
+                    report_info(&notices, format!("Renamed to {text}"));
                 }
                 let _ = done.send(tab);
             }
@@ -1523,10 +1708,7 @@ impl NeutronApp {
         // clipboard, and into a plugin's request — and a plugin writing a file
         // per selected item would produce a differently-ordered file each time
         // from the same selection.
-        let mut selected: Vec<usize> = tab.selection.iter().filter(|&i| i < tab.list.len()).collect();
-        selected.sort_by_key(|&i| tab.list.rank(i).unwrap_or(usize::MAX));
-
-        let paths: Vec<PathBuf> = selected
+        let paths: Vec<PathBuf> = visible_selection(tab)
             .into_iter()
             .map(|i| dir.join(tab.list.name(i)))
             .collect();
@@ -1569,6 +1751,10 @@ impl NeutronApp {
             if let Err(e) = neutron_shell::clipboard::write(&paths, how) {
                 report(&notices, format!("Could not put that on the clipboard: {e}"));
                 let _ = failed.send(());
+            } else {
+                report_info(&notices, if cut {
+                    format!("Cut {} items — choose a destination and Paste", paths.len())
+                } else { format!("Copied {} items to the clipboard", paths.len()) });
             }
             wake.request_repaint();
         });
@@ -1587,7 +1773,7 @@ impl NeutronApp {
     fn clipboard_keys(&self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         // A menu or a text field is using the keyboard; its own copy and paste
         // win.
-        if self.menu.is_some() || ctx.egui_wants_keyboard_input() {
+        if self.menu.is_some() || self.confirm.is_some() || ctx.egui_wants_keyboard_input() {
             // Still drained, so a press held while a field had focus does not
             // fire the moment focus leaves.
             while self.paste_rx.try_recv().is_ok() {}
@@ -1652,20 +1838,38 @@ impl NeutronApp {
         let notices = self.notice_tx.clone();
         self.sta.submit(move || {
             let Some((paths, how)) = neutron_shell::clipboard::read() else {
-                tracing::debug!("nothing on the clipboard to paste");
+                report_info(&notices, "No files on the clipboard — copy or cut files first".into());
+                wake.request_repaint();
                 return;
             };
+            // On the worker, so a stat is fine here. A cut that has already
+            // been pasted is the usual case: the clipboard still names the
+            // files, but they have moved, and "into itself" was the wrong
+            // thing to say about it.
+            if !paths.iter().any(|p| p.exists()) {
+                report_info(
+                    &notices,
+                    "The files on the clipboard are no longer there — a cut can only be pasted once".into(),
+                );
+                wake.request_repaint();
+                return;
+            }
             if !neutron_shell::clipboard::can_paste_into(&paths, &dir) {
                 report(
                     &notices,
                     "Cannot paste a folder into itself".to_owned(),
                 );
+                wake.request_repaint();
                 return;
             }
 
             tracing::info!(count = paths.len(), ?how, dest = %dir.display(), "paste");
             if let Err(e) = neutron_shell::fileops::transfer(&paths, &dir, how, owner) {
                 report(&notices, format!("Paste failed: {e}"));
+            } else {
+                report_info(&notices, format!("{} {} items into {}",
+                    if how == neutron_shell::fileops::Transfer::Move { "Moved" } else { "Copied" },
+                    paths.len(), dir.file_name().unwrap_or_default().to_string_lossy()));
             }
             let _ = done.send(tab_id);
             wake.request_repaint();
@@ -1698,6 +1902,9 @@ impl NeutronApp {
         self.sta.submit(move || {
             if let Err(e) = neutron_shell::fileops::delete(&paths, disposal, owner) {
                 report(&notices, format!("Delete failed: {e}"));
+            } else {
+                report_info(&notices, format!("{} {} items",
+                    if permanent { "Permanently deleted" } else if cfg!(target_os = "macos") { "Moved to Trash:" } else { "Recycled" }, paths.len()));
             }
             // Refresh regardless of the outcome, for the reason above.
             let _ = done.send(tab_id);
@@ -1893,9 +2100,13 @@ impl NeutronApp {
             .then(|| self.tab_target.take())
             .flatten();
 
+        let edit_site = (answer == Some(MENU_ID_EDIT_SITE))
+            .then(|| self.edit_site_target.take())
+            .flatten();
+
         let plugin = answer.and_then(|id| self.plugins.menu_choice(id));
-        let for_shell = match (&pin, &new_tab, &plugin) {
-            (None, None, None) => answer,
+        let for_shell = match (&pin, &new_tab, &plugin, &edit_site) {
+            (None, None, None, None) => answer,
             _ => None,
         };
 
@@ -1911,9 +2122,37 @@ impl NeutronApp {
             self.open_in_new_tab(id);
         }
 
+        if let Some(site) = edit_site {
+            self.edit_site(&site);
+        }
+
         if let Some(reference) = plugin {
             let ctx = ctx.clone();
             self.run_plugin(&ctx, &reference);
+        }
+    }
+
+    /// Opens the connect dialog on a saved server, to change it in place.
+    fn edit_site(&mut self, id: &str) {
+        let Some(site) = self.sites.get(id).cloned() else {
+            self.notices.error(format!("No saved server called {id:?}"));
+            return;
+        };
+        self.connect.edit(&site);
+        // Opened from a refusal over an unrecognised certificate, the dialog
+        // arrives with that certificate's fingerprint filled in. Trusting it
+        // still takes the user's own Save; this only spares them copying a
+        // ninety-five character string out of an error message.
+        let refused = self
+            .workspace
+            .active_tab()
+            .filter(|t| t.location().as_remote().is_some_and(|(s, _)| s == id))
+            .and_then(|t| match &t.status {
+                Status::Error(e) => certificate_in(e),
+                _ => None,
+            });
+        if let Some(fingerprint) = refused {
+            self.connect.trust_certificate(&fingerprint);
         }
     }
 
@@ -1944,6 +2183,34 @@ impl NeutronApp {
     /// run is no longer a record of what *you* were doing — nor for a file
     /// fetched from a server, which is a copy under `%TEMP%` that will not be
     /// there later.
+    /// Opens what the system handed over: a folder in a new tab, a file in a
+    /// new tab on its folder with the file selected.
+    fn drain_opened(&mut self) {
+        while let Ok(paths) = self.opened.try_recv() {
+            let Some(group) = self.workspace.focused_group().map(|g| g.id) else {
+                return;
+            };
+            for path in paths {
+                let (folder, select) = if path.is_dir() {
+                    (path, None)
+                } else {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                    match path.parent() {
+                        Some(parent) => (parent.to_path_buf(), name),
+                        None => continue,
+                    }
+                };
+                let view = self.workspace.view_for_new_tab();
+                let tab = self.workspace.open_tab(group, NodeId::Path(folder.clone()), view);
+                self.reload(tab, NodeId::Path(folder));
+                if let Some(t) = self.workspace.tabs.get_mut(&tab) {
+                    t.reselect = select.map(|n| crate::workspace::Reselect { names: vec![n.clone()], cursor: Some(n) });
+                }
+            }
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
     fn open_local(&mut self, path: PathBuf) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2052,6 +2319,14 @@ impl eframe::App for NeutronApp {
         }
     }
 
+    /// What the window is cleared to before anything is drawn. On the Mac,
+    /// nothing: the window is transparent, so the desktop shows between the
+    /// cards. Elsewhere eframe's own default.
+    #[cfg(target_os = "macos")]
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let frame_started = Instant::now();
         let ctx = ui.ctx().clone();
@@ -2070,7 +2345,17 @@ impl eframe::App for NeutronApp {
             .painter()
             .clone()
             .with_layer_id(egui::LayerId::background());
-        neutron_ui::ambient::paint(&bg, screen, &p);
+        if cfg!(target_os = "macos") {
+            // The window is transparent here, and the cards float over the
+            // desktop. Not *fully* clear: the window server sends a click on a
+            // pixel with no alpha at all to whatever is behind the window, so
+            // the gutters and the title strip would stop belonging to Neutron —
+            // and the strip is how the window is dragged. One part in 255 of
+            // black keeps them ours and is invisible.
+            bg.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(1));
+        } else {
+            neutron_ui::ambient::paint(&bg, screen, &p);
+        }
 
         self.drain_places();
         self.drain_loads(&ctx);
@@ -2079,6 +2364,9 @@ impl eframe::App for NeutronApp {
         self.drain_goto();
         self.drain_sites();
         while let Ok(state) = self.drive_rx.try_recv() {
+            // An answer ends any sign-in in progress; the sign-in's own
+            // result is the only thing sent while one runs.
+            self.drive_signing_in = false;
             self.drive_state = state;
         }
         if self.clip_fail_rx.try_recv().is_ok() {
@@ -2094,13 +2382,20 @@ impl eframe::App for NeutronApp {
         self.pump_archive_job();
         self.pump_plugin(&ctx);
         self.pump_download();
+        self.pump_remote_job();
+        self.drain_opened();
         self.drain_notices(&ctx);
         self.sync_watchers(&ctx);
         self.drain_changes();
         self.pump_preview(&ctx);
+        self.pump_columns();
         self.icons.pump();
         self.icon_texture = self.icons.texture(&ctx);
+        let previous_index_state = std::mem::discriminant(self.index.state());
         self.index.pump();
+        if previous_index_state != std::mem::discriminant(self.index.state()) {
+            self.refresh_finder();
+        }
         self.sync_finder_results();
 
         // Before `keyboard`, not after: the menu *consumes* the arrows and
@@ -2120,6 +2415,8 @@ impl eframe::App for NeutronApp {
         self.action_rail(ui, &p, &mut actions);
         self.preview_pane(ui, &p);
         self.panes(ui, &p, &mut actions);
+        // Drawn now, so spent. See `Workspace::consume_scroll_requests`.
+        self.workspace.consume_scroll_requests();
 
         // After every panel: the eight grip regions sit on top of whatever
         // is under the window edge, and an undecorated window has no resize
@@ -2143,6 +2440,11 @@ impl eframe::App for NeutronApp {
             actions.push(Action::EndTabDrag);
         }
 
+        // Actions update the model after the widgets have drawn. Present that
+        // new state even if no further mouse or keyboard event arrives.
+        if !actions.is_empty() {
+            ctx.request_repaint();
+        }
         for action in actions {
             self.apply(&ctx, action);
         }
@@ -2189,9 +2491,14 @@ struct RenameEdit {
     /// Storage index, so a re-sort under the box does not move the rename to a
     /// different file.
     idx: usize,
+    /// The folder the entry is in — on disk or on a server — fixed when the
+    /// rename opens.
+    place: NodeId,
     /// What the file is called now, to tell an unchanged rename from a real one.
     original: String,
     text: String,
+    /// Watcher changes wait until the editor closes so its row stays stable.
+    refresh_pending: bool,
 }
 
 /// A shell menu waiting to be shown, from the apartment thread that built it.
@@ -2252,6 +2559,15 @@ impl NeutronApp {
                         elapsed: loaded.enumerate_time + loaded.sort_time,
                     };
                     tab.list = loaded.list;
+                    // The loader sorts and hides, but it never sees the filter
+                    // field — a refresh keeps the filter text, so without this
+                    // F5 or any change on disk listed the whole folder under a
+                    // box still saying "doc". Only when there is a filter: the
+                    // re-sort is the work the loader exists to keep off this
+                    // thread.
+                    if !tab.view.filter.trim().is_empty() {
+                        tab.refilter();
+                    }
                     match tab.reselect.take() {
                         Some(wanted) => tab.restore_selection(&wanted),
                         None => tab.selection.clear(),
@@ -2312,6 +2628,12 @@ impl NeutronApp {
         // while the menu is open would bin the selection *and* run whichever
         // command the cursor was on.
         if self.menu.is_some() {
+            return;
+        }
+
+        // Nor while a question is open. A key that moved the selection would
+        // change what the dialog's button acts on, after the dialog counted it.
+        if self.confirm.is_some() {
             return;
         }
 
@@ -2384,14 +2706,20 @@ impl NeutronApp {
                 ]);
                 // Backspace goes up a level, as in Explorer. Only without Alt,
                 // so it does not double up with Alt+← above.
-                bindings.push((egui::Key::Backspace, Action::Up));
+                if cfg!(target_os = "macos") && ctrl {
+                    bindings.push((egui::Key::Backspace, Action::Delete { permanent: false }));
+                } else {
+                    bindings.push((egui::Key::Backspace, Action::Up));
+                }
             }
 
             bindings.push((
                 egui::Key::Delete,
                 // Shift is the long-standing Windows convention for bypassing
                 // the Recycle Bin, and the shell still confirms it.
-                Action::Delete { permanent: shift },
+                if cfg!(target_os = "macos") && shift {
+                    Action::Ask(Box::new(Action::Delete { permanent: true }))
+                } else { Action::Delete { permanent: shift } },
             ));
             // Alt+P, which is Explorer's binding for the same pane. Not
             // Ctrl+P: that is the file finder, and it is used far more often.
@@ -2404,10 +2732,20 @@ impl NeutronApp {
             bindings.push((egui::Key::Escape, Action::ClearSelection));
             bindings.push((egui::Key::F6, Action::FocusNextPane));
 
+            // Hidden files. Not Cmd+H on the Mac: the application menu owns
+            // that as "Hide Neutron", so the window vanished instead. The
+            // Finder's own binding, Cmd+Shift+., is the one Mac users know.
+            if cfg!(target_os = "macos") {
+                if i.modifiers.command && shift && i.key_pressed(egui::Key::Period) {
+                    actions.push(Action::ToggleHidden);
+                }
+            } else if ctrl {
+                bindings.push((egui::Key::H, Action::ToggleHidden));
+            }
+
             if ctrl {
                 bindings.extend([
                     (egui::Key::A, Action::SelectAll),
-                    (egui::Key::H, Action::ToggleHidden),
                     (
                         // Ctrl+L is the address bar, as it is in every browser
                         // and in Explorer. Shift escalates to the view toggle,
@@ -2473,8 +2811,11 @@ impl NeutronApp {
                 }
 
                 // Ctrl+` for the terminal, as in the editor this is most often
-                // sitting beside.
-                bindings.push((egui::Key::Backtick, Action::OpenTerminal));
+                // sitting beside. The real Control key on the Mac, where Cmd+`
+                // is the system's own "next window" and never arrives here.
+                if !cfg!(target_os = "macos") || (i.modifiers.ctrl && !i.modifiers.command) {
+                    bindings.push((egui::Key::Backtick, Action::OpenTerminal));
+                }
 
                 if let Some(group) = self.workspace.focused_group().map(|g| g.id) {
                     bindings.push((egui::Key::T, Action::NewTab(group)));
@@ -2499,7 +2840,21 @@ impl NeutronApp {
                 }
             }
 
-            if i.key_pressed(egui::Key::Enter) {
+            // The Finder's navigation keys: Cmd+Up to the enclosing folder,
+            // Cmd+Down into the one under the cursor, Cmd+[ and Cmd+] through
+            // history. They replace plain Up and Down while Command is held,
+            // where the table above would otherwise also move the cursor.
+            let finder_keys = cfg!(target_os = "macos") && i.modifiers.command && !alt;
+            let mut open_cursor = i.key_pressed(egui::Key::Enter);
+            if finder_keys {
+                bindings.retain(|(key, _)| !matches!(key, egui::Key::ArrowUp | egui::Key::ArrowDown));
+                bindings.push((egui::Key::ArrowUp, Action::Up));
+                bindings.push((egui::Key::OpenBracket, Action::Back));
+                bindings.push((egui::Key::CloseBracket, Action::Forward));
+                open_cursor |= i.key_pressed(egui::Key::ArrowDown);
+            }
+
+            if open_cursor {
                 if let Some(idx) = self
                     .workspace
                     .active_tab()
@@ -2531,6 +2886,13 @@ impl NeutronApp {
             tracing::warn!("no Google client id configured; not starting the flow");
             return;
         }
+        // One sign-in at a time. Each waits on a worker for the browser, and a
+        // second one would only compete for the same loopback redirect.
+        if self.drive_signing_in {
+            self.notices.info("Already waiting for Google sign-in in the browser");
+            return;
+        }
+        self.drive_signing_in = true;
 
         self.drive_state = neutron_cloud::google::DriveState::Error("Connecting…".to_owned());
         let wake = self.ctx.clone();
@@ -2640,8 +3002,15 @@ impl NeutronApp {
         };
 
         let id = crate::header::address_id(group);
+        let mut state = egui::text_edit::TextEditState::default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(text.chars().count()),
+        )));
+        egui::TextEdit::store_state(ctx, id, state);
         ctx.memory_mut(|m| m.request_focus(id));
         self.address = Some((group, text));
+        ctx.request_repaint();
     }
 
     /// Goes where the address bar says.
@@ -2694,17 +3063,41 @@ impl NeutronApp {
             self.apply_now(then);
             return;
         };
-        self.confirm = Some((question, Box::new(then)));
+        let subject = self.subject();
+        self.confirm = Some((question, Box::new(then), subject));
+    }
+
+    /// What a question asked now would be about. See [`Subject`].
+    fn subject(&self) -> Option<Subject> {
+        let tab = self.workspace.active_tab_id()?;
+        let t = self.workspace.tabs.get(&tab)?;
+        Some(Subject {
+            tab,
+            location: t.location().clone(),
+            names: visible_selection(t)
+                .into_iter()
+                .map(|i| t.list.name(i).to_owned())
+                .collect(),
+        })
     }
 
     /// The wording for `action`, or `None` if it does not warrant asking.
     fn question_for(&self, action: &Action) -> Option<crate::confirm::Confirm> {
         match action {
-            Action::Delete { .. } => {
+            #[cfg(target_os = "macos")]
+            Action::Delete { permanent: true } if self.workspace.active_tab()?.location().is_filesystem() => {
+                let count = visible_selection(self.workspace.active_tab()?).len();
+                Some(crate::confirm::Confirm {
+                    title: "Delete permanently?".into(),
+                    body: format!("{count} selected items will be permanently deleted. This cannot be undone."),
+                    proceed: "Delete permanently".into(),
+                })
+            }
+            // Only on a server. A local delete goes to the Recycle Bin and is
+            // undone from there; asking about it would train people to dismiss
+            // the dialog that matters.
+            Action::DeleteOnServer => {
                 let place = self.workspace.active_tab()?.location();
-                // Only on a server. A local delete goes to the Recycle Bin and
-                // is undone from there; asking about it would train people to
-                // dismiss the dialog that matters.
                 let (site, _) = place.as_remote()?;
                 let name = self
                     .sites
@@ -2712,16 +3105,24 @@ impl NeutronApp {
                     .map(|s| s.display().to_owned())
                     .unwrap_or_else(|| "that server".to_owned());
 
-                let count = self.workspace.active_tab()?.selection.len();
-                let what = match count {
+                let tab = self.workspace.active_tab()?;
+                let selected = visible_selection(tab);
+                let what = match selected.len() {
                     1 => "1 item".to_owned(),
                     n => format!("{n} items"),
+                };
+                // Said whenever it is true, because it is the part that is
+                // easy not to think about: one row can be a thousand files.
+                let folders = if selected.iter().any(|&i| tab.list.kind(i) == neutron_core::EntryKind::Directory) {
+                    " Folders are deleted with everything inside them."
+                } else {
+                    ""
                 };
                 Some(crate::confirm::Confirm {
                     title: format!("Delete from {name}?"),
                     body: format!(
-                        "{what} will be deleted from {name}. A server has no \
-                         Recycle Bin, so this cannot be undone."
+                        "{what} will be deleted from {name}.{folders} A server \
+                         has no Recycle Bin, so this cannot be undone."
                     ),
                     proceed: format!("Delete {what}"),
                 })
@@ -2749,16 +3150,25 @@ impl NeutronApp {
 
     /// The confirmation dialog, drawn over everything.
     fn confirm_overlay(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let Some((question, _)) = self.confirm.as_ref() else {
+        let Some((question, ..)) = self.confirm.as_ref() else {
             return;
         };
         match crate::confirm::show(ui, p, question) {
             crate::confirm::Answer::Waiting => {}
             crate::confirm::Answer::Cancelled => self.confirm = None,
             crate::confirm::Answer::Confirmed => {
-                if let Some((_, then)) = self.confirm.take() {
-                    self.apply_now(*then);
+                let Some((_, then, asked_about)) = self.confirm.take() else {
+                    return;
+                };
+                // Input is blocked while the dialog is up, but a refresh can
+                // still change the listing underneath it. A yes to one set of
+                // files is not a yes to another.
+                if asked_about != self.subject() {
+                    self.notices
+                        .error("The selection changed while the question was open, so nothing was done");
+                    return;
                 }
+                self.apply_now(*then);
             }
         }
     }
@@ -2801,6 +3211,19 @@ impl NeutronApp {
                     "Pin to Quick access".to_owned()
                 },
                 accel: "Ctrl+Shift+D".to_owned(),
+                enabled: true,
+                ..Default::default()
+            });
+        }
+
+        // A saved server can be edited from its own row: its password, how it
+        // signs in, a certificate to trust.
+        self.edit_site_target = id.as_remote().map(|(site, _)| site.to_owned());
+        if self.edit_site_target.is_some() {
+            items.push(neutron_core::MenuItem::separator());
+            items.push(neutron_core::MenuItem {
+                id: MENU_ID_EDIT_SITE,
+                label: "Edit server…".to_owned(),
                 enabled: true,
                 ..Default::default()
             });
@@ -3062,13 +3485,6 @@ impl NeutronApp {
 
                 match self.index.state() {
                     IndexState::Ready(_) => self.index.find(&self.finder.needle, &scope),
-                    // A helper from an older build answers requests it knows
-                    // and refuses the rest, so say which rather than claiming
-                    // there is no index at all.
-                    IndexState::Rejected(why) => {
-                        let why = why.clone();
-                        self.finder.set_rows(Vec::new(), why);
-                    }
                     IndexState::Starting => {
                         self.finder.set_rows(Vec::new(), "Indexing…".into());
                     }
@@ -3086,7 +3502,7 @@ impl NeutronApp {
             crate::finder::Mode::Everything => {
                 match self.index.state() {
                     IndexState::Ready(_) => self.index.search(&self.finder.needle),
-                    IndexState::Rejected(why) | IndexState::Unavailable(why) => {
+                    IndexState::Unavailable(why) => {
                         let why = why.clone();
                         self.finder.set_rows(Vec::new(), why);
                     }
@@ -3150,8 +3566,16 @@ impl NeutronApp {
                     self.finder.status = status;
                 }
             }
-            None if self.finder.needle.is_empty() => {}
-            None => {}
+            // A refused query says why in place of results — a helper from an
+            // older build that does not know the request, or on the Mac a
+            // folder that has gone. The next query is asked as normal.
+            None => {
+                if let Some(why) = self.index.rejection() {
+                    if self.finder.status != why || !self.finder.rows.is_empty() {
+                        self.finder.set_rows(Vec::new(), why.to_owned());
+                    }
+                }
+            }
         }
     }
 
@@ -3235,6 +3659,9 @@ impl NeutronApp {
 
             C::ToggleHidden => Some(Action::ToggleHidden),
             C::ToggleView => Some(Action::ToggleView),
+            C::ListView => Some(Action::SetView(file_list::ViewMode::List)),
+            C::GridView => Some(Action::SetView(file_list::ViewMode::Grid)),
+            C::ColumnView => Some(Action::SetView(file_list::ViewMode::Columns)),
             C::TogglePreview => Some(Action::TogglePreview),
             C::ToggleTheme => Some(Action::ToggleTheme),
 
@@ -3376,6 +3803,9 @@ impl NeutronApp {
         let tab = self.workspace.active_tab();
 
         egui::Panel::bottom("status_bar")
+            // The cards float on nothing, so a panel's edge line would be the
+            // only thing drawn between them.
+            .show_separator_line(false)
             .exact_size(30.0)
             .frame(toolbar_frame(p))
             .show(ui, |ui| {
@@ -3516,11 +3946,8 @@ impl NeutronApp {
         };
 
         let _ = dir;
-        self.start_archive_job(crate::archive_ops::extract(
-            archive,
-            format,
-            self.ctx.clone(),
-        ));
+        let ctx = self.ctx.clone();
+        self.start_archive_job(move || crate::archive_ops::extract(archive, format, ctx));
     }
 
     /// Zips the selection into a new archive beside it.
@@ -3529,10 +3956,11 @@ impl NeutronApp {
             return;
         };
 
-        self.start_archive_job(crate::archive_ops::compress(paths, dir, self.ctx.clone()));
+        let ctx = self.ctx.clone();
+        self.start_archive_job(move || crate::archive_ops::compress(paths, dir, ctx));
     }
 
-    fn start_archive_job(&mut self, job: crate::archive_ops::ArchiveJob) {
+    fn start_archive_job(&mut self, start: impl FnOnce() -> crate::archive_ops::ArchiveJob) {
         if self.archive_job.is_some() {
             // Refused rather than queued: archive work is disk-bound, so two at
             // once makes both slower, and the status bar has room for one line.
@@ -3541,7 +3969,7 @@ impl NeutronApp {
             return;
         }
         self.notices.dismiss_info();
-        self.archive_job = Some(job);
+        self.archive_job = Some(start());
     }
 
     /// Applies whatever the archive worker has reported.
@@ -3553,6 +3981,7 @@ impl NeutronApp {
             return;
         };
 
+        let directory = job.directory.clone();
         self.archive_job = None;
         let (level, text) = match finished {
             crate::archive_ops::Finished::Done { label, summary } => {
@@ -3575,8 +4004,9 @@ impl NeutronApp {
         };
         self.notices.raise_reported(level, text);
 
-        // The folder the result landed in is watched, so the new archive or
-        // folder appears on its own. Nothing to refresh here.
+        // Refresh the originating folder even when no watcher is available or
+        // the user has changed panes while the job was running.
+        let _ = self.changed_tx.send(directory);
     }
 
     /// `%APPDATA%\\Neutron\\plugins`, created if it is not there yet.
@@ -3978,6 +4408,22 @@ impl NeutronApp {
 
     /// The running download, or what the last remote operation said.
     fn download_status(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
+        if let Some(job) = self.remote_job.as_ref() {
+            if ui
+                .add(egui::Button::new(egui::RichText::new("Stop").size(11.0)).small())
+                .on_hover_text("Stop after the item in progress. A partly sent file is removed.")
+                .clicked()
+            {
+                actions.push(Action::CancelRemoteJob);
+            }
+            let sent = job.progress.bytes.load(std::sync::atomic::Ordering::Relaxed);
+            let label = if sent > 0 {
+                format!("{} — {}", job.label, neutron_ui::format::size(Some(sent)))
+            } else {
+                format!("{}…", job.label)
+            };
+            ui.colored_label(p.accent, label);
+        }
         if let Some(job) = self.download.as_ref() {
             if ui
                 .add(egui::Button::new(egui::RichText::new("Stop").size(11.0)).small())
@@ -4053,7 +4499,7 @@ impl NeutronApp {
                 .font(egui::FontId::proportional(13.0))
                 .text_color(p.text)
                 .hint_text(
-                    egui::RichText::new(crate::connect::hint(field, self.connect.protocol))
+                    egui::RichText::new(self.connect.hint(field))
                         .color(p.text_faint)
                         .size(13.0),
                 )
@@ -4206,6 +4652,10 @@ impl NeutronApp {
             .collect();
 
         for tab in stale {
+            if let Some(edit) = self.rename.as_mut().filter(|edit| edit.tab == tab) {
+                edit.refresh_pending = true;
+                continue;
+            }
             self.refresh_in_place(tab);
         }
     }
@@ -4323,6 +4773,7 @@ impl NeutronApp {
         });
 
         egui::Panel::right("preview")
+            .show_separator_line(false)
             .default_size(320.0)
             .size_range(egui::Rangef::new(220.0, 640.0))
             .frame(
@@ -4348,13 +4799,19 @@ impl NeutronApp {
     fn action_rail(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
         let tab = self.workspace.active_tab();
         let state = crate::rail::RailState {
-            has_selection: tab.is_some_and(|t| !t.selection.is_empty()),
-            has_cursor: tab.is_some_and(|t| {
-                t.selection.cursor().is_some_and(|i| i < t.list.len())
-            }),
+            local_folder: tab.is_some_and(|t| t.location().is_filesystem()),
+            server_folder: tab.is_some_and(|t| t.location().as_remote().is_some()),
+            selection_count: tab.map_or(0, |t| t.selection.iter().filter(|&i| t.list.rank(i).is_some()).count()),
+            has_cursor: tab.is_some_and(|t| t.selection.cursor().is_some_and(|i| i < t.list.len())),
+            selected_archive: tab.is_some_and(|t| t.selection.iter().any(|i| {
+                i < t.list.len() && !t.list.kind(i).is_container()
+                    && neutron_archive::format_of(Path::new(t.list.name(i))).is_some()
+            })),
+            archive_busy: self.archive_job.is_some(),
         };
 
         egui::Panel::left("action-rail")
+            .show_separator_line(false)
             .resizable(false)
             .exact_size(crate::rail::WIDTH)
             .frame(
@@ -4373,17 +4830,7 @@ impl NeutronApp {
             )
             .show(ui, |ui| {
                 if let Some(chosen) = crate::rail::show(ui, p, &state) {
-                    use crate::rail::RailAction as R;
-                    actions.push(match chosen {
-                        R::Copy => Action::Clip { cut: false },
-                        R::Cut => Action::Clip { cut: true },
-                        R::Paste => Action::Paste,
-                        R::Delete => Action::Delete { permanent: false },
-                        R::Rename => Action::BeginRename,
-                        R::NewFolder => Action::NewFolder,
-                        R::Extract => Action::ExtractSelection,
-                        R::Compress => Action::CompressSelection,
-                    });
+                    actions.push(Action::RunCommand(chosen.command()));
                 }
             });
     }
@@ -4401,6 +4848,7 @@ impl NeutronApp {
             .unwrap_or_else(|| "Neutron".to_owned());
 
         egui::Panel::top("title-bar")
+            .show_separator_line(false)
             .resizable(false)
             .exact_size(crate::chrome::HEIGHT)
             .frame(
@@ -4420,6 +4868,7 @@ impl NeutronApp {
         let current = self.workspace.active_tab().map(|t| t.location().clone());
 
         egui::Panel::left("sidebar")
+            .show_separator_line(false)
             .default_size(232.0)
             .size_range(egui::Rangef::new(180.0, 420.0))
             .frame(
@@ -4723,6 +5172,7 @@ impl NeutronApp {
                     index,
                 }),
                 TabAction::DropHere => Action::DropTab(group_id),
+                TabAction::Reorder { from, to } => Action::ReorderTab { group: group_id, from, to },
             });
         }
 
@@ -4739,7 +5189,7 @@ impl NeutronApp {
             can_forward: tab.history.can_go_forward(),
             has_parent: tab.location().parent().is_some(),
             show_hidden: tab.view.show_hidden,
-            grid: tab.view.view == neutron_ui::file_list::ViewMode::Grid,
+            view: tab.view.view,
             filter: &tab.view.filter,
             // Only in the pane it was opened on. A split showing two panes would
             // otherwise draw the same field over both breadcrumbs, bound to one
@@ -4766,7 +5216,7 @@ impl NeutronApp {
                 header::HeaderAction::Navigate(id) => Action::Navigate(id),
                 header::HeaderAction::SetFilter(text) => Action::SetFilter(text),
                 header::HeaderAction::ToggleHidden => Action::ToggleHidden,
-                header::HeaderAction::ToggleView => Action::ToggleView,
+                header::HeaderAction::SetView(mode) => Action::SetView(mode),
                 header::HeaderAction::Split(axis) => Action::Split(axis),
                 header::HeaderAction::SetAddress(text) => Action::SetAddress(text),
                 header::HeaderAction::SubmitAddress => Action::SubmitAddress,
@@ -4796,7 +5246,7 @@ impl NeutronApp {
                         .iter()
                         .map(|f| f.path().to_path_buf())
                         .collect::<Vec<_>>(),
-                    i.modifiers.ctrl,
+                    if cfg!(target_os = "macos") { i.modifiers.alt } else { i.modifiers.ctrl },
                 )
             });
 
@@ -4812,6 +5262,13 @@ impl NeutronApp {
             }
 
             if !dropped.is_empty() {
+                // The drop lands here, and the checks that run on it — is this
+                // a folder with a path at all? — read the focused pane. So this
+                // one is focused first; otherwise a drop on a local pane while
+                // a server pane had focus was refused in the server's name.
+                if group_id != self.workspace.focused {
+                    actions.push(Action::FocusGroup(group_id));
+                }
                 actions.push(Action::DropFiles {
                     group: group_id,
                     paths: dropped,
@@ -4825,6 +5282,15 @@ impl NeutronApp {
                 ui.add_space(40.0);
                 ui.colored_label(p.danger, "Could not open this location");
                 ui.colored_label(p.text_muted, e.as_str());
+                // On a server most of what goes wrong is fixed in its settings
+                // — a password that was never saved, a certificate to trust,
+                // a changed port — so the way there is right under the error.
+                if let Some((site, _)) = tab.location().as_remote() {
+                    ui.add_space(10.0);
+                    if ui.button("Edit server…").clicked() {
+                        actions.push(Action::EditSite(site.to_owned()));
+                    }
+                }
             });
             return;
         }
@@ -4846,6 +5312,15 @@ impl NeutronApp {
                 });
             }
             return;
+        }
+
+        // A folder in the column view. Anything else — a server, Drive, This
+        // PC — has no path to build columns from and stays a list.
+        if tab.view.view == file_list::ViewMode::Columns {
+            if let Some(dir) = tab.location().as_path() {
+                self.draw_columns(ui, p, group_id, tab, dir, actions);
+                return;
+            }
         }
 
         // The list widget needs `&mut FileListState` to consume `scroll_to` and
@@ -4873,25 +5348,28 @@ impl NeutronApp {
             .then_some(&self.cut_names)
             .filter(|names| !names.is_empty());
 
-        let drawn = file_list::show(
-            ui,
-            &mut view,
-            &tab.list,
-            &file_list::Marks {
-                selection: &tab.selection,
-                cut,
-                // Only in the pane that owns it. A split showing the same
-                // folder twice would otherwise draw two boxes, both bound to
-                // one text field id, and neither would behave.
-                rename: self
-                    .rename
-                    .as_ref()
-                    .filter(|r| Some(r.tab) == group.active_tab())
-                    .map(|r| (r.idx, r.text.as_str(), r.generation)),
-            },
-            p,
-            Some(&source as &dyn file_list::IconSource),
-        );
+        let marks = file_list::Marks {
+            selection: &tab.selection,
+            cut,
+            // Only in the pane that owns it. A split showing the same
+            // folder twice would otherwise draw two boxes, both bound to
+            // one text field id, and neither would behave.
+            rename: self
+                .rename
+                .as_ref()
+                .filter(|r| Some(r.tab) == group.active_tab())
+                .map(|r| (r.idx, r.text.as_str(), r.generation)),
+        };
+        let icons = Some(&source as &dyn file_list::IconSource);
+        // Scoped by tab and folder, so each keeps its own scroll position: a
+        // folder just entered opens at the top rather than wherever the last
+        // one was left, a second tab in the pane does not share the first
+        // one's, and Back returns to where the folder was.
+        let drawn = ui
+            .push_id((tab.id, tab.location()), |ui| {
+                file_list::show(ui, &mut view, &tab.list, &marks, p, icons)
+            })
+            .inner;
 
         // The grid works out its own column count from the pane width, and
         // that number is what Up and Down have to step by. It is computed on a
@@ -4911,23 +5389,494 @@ impl NeutronApp {
             if group_id != self.workspace.focused {
                 actions.push(Action::FocusGroup(group_id));
             }
-            match a {
-                FileListAction::Activate(idx) => actions.push(Action::Activate(idx)),
-                FileListAction::Select { idx, mode } => actions.push(Action::Select { idx, mode }),
-                FileListAction::SortBy(col) => actions.push(Action::SortBy(col)),
-                FileListAction::ClearSelection => actions.push(Action::ClearSelection),
-                FileListAction::Marquee { from, to, additive } => {
-                    actions.push(Action::Marquee { from, to, additive })
+            actions.push(list_action(a));
+        }
+    }
+
+    /// The column view of a folder: the folders on the way to it, then the
+    /// folder itself, then what is inside the selected folder.
+    fn draw_columns(
+        &self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        group_id: GroupId,
+        tab: &crate::workspace::Tab,
+        dir: &Path,
+        actions: &mut Vec<Action>,
+    ) {
+        use neutron_ui::columns::{Column, ColumnAction, Contents, Role};
+
+        let chain = crate::columns::chain(dir, self.home.as_deref());
+        let peek = crate::columns::peek(tab);
+        let arriving = crate::columns::arriving(tab);
+        let current = chain.len() - 1;
+
+        // The entry in each folder that leads to the next, owned here so the
+        // columns can borrow it.
+        let through: Vec<String> = chain
+            .iter()
+            .skip(1)
+            .map(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            .collect();
+        let mut dirs: Vec<&Path> = chain.iter().map(PathBuf::as_path).collect();
+        if let Some(peek) = &peek {
+            dirs.push(peek);
+        }
+        // One per column: an executable's icon is keyed by its full path, so
+        // each column's rows need their own folder to root it.
+        let icons: Vec<RowIcons> = dirs
+            .iter()
+            .map(|d| RowIcons {
+                service: &self.icons,
+                texture: self.icon_texture,
+                dir: Some(d.to_path_buf()),
+            })
+            .collect();
+
+        let columns: Vec<Column> = dirs
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| {
+                let (contents, role) = if i < current {
+                    (self.column_contents(d), Role::Named { highlight: Some(through[i].as_str()) })
+                } else if i == current && !arriving {
+                    (
+                        Contents::Ready(&tab.list),
+                        Role::Current {
+                            selection: &tab.selection,
+                            rename: self
+                                .rename
+                                .as_ref()
+                                .filter(|r| r.tab == tab.id)
+                                .map(|r| (r.idx, r.text.as_str(), r.generation)),
+                            scroll_to: tab.view.scroll_to,
+                        },
+                    )
+                } else if i == current {
+                    // Still loading: drawn from the listing the column view
+                    // already had, with what will be selected marked.
+                    let pending = tab.reselect.as_ref().and_then(|r| r.cursor.as_deref());
+                    (self.column_contents(d), Role::Named { highlight: pending })
+                } else {
+                    (self.column_contents(d), Role::Named { highlight: None })
+                };
+                Column {
+                    dir: d,
+                    contents,
+                    role,
+                    cut: (self.cut_dir.as_deref() == Some(d))
+                        .then_some(&self.cut_names)
+                        .filter(|names| !names.is_empty()),
+                    icons: Some(&icons[i] as &dyn file_list::IconSource),
                 }
-                FileListAction::ContextMenu { idx, pos } => {
-                    actions.push(Action::ContextMenu { idx, pos })
-                }
-                FileListAction::DragOut => actions.push(Action::DragOut),
-                FileListAction::RenameTyped(text) => actions.push(Action::RenameTyped(text)),
-                FileListAction::RenameCommit => actions.push(Action::RenameCommit),
-                FileListAction::RenameCancel => actions.push(Action::RenameCancel),
+            })
+            .collect();
+
+        if let Some(a) = neutron_ui::columns::show(ui, p, &columns) {
+            if group_id != self.workspace.focused {
+                actions.push(Action::FocusGroup(group_id));
+            }
+            actions.push(match a {
+                ColumnAction::Current(a) => list_action(a),
+                ColumnAction::Pick { dir, entry, double } => Action::ColumnPick { dir, entry, double },
+            });
+        }
+    }
+
+    /// A column's listing as the cache has it.
+    fn column_contents(&self, dir: &Path) -> neutron_ui::columns::Contents<'_> {
+        use crate::columns::Slot;
+        use neutron_ui::columns::Contents;
+        match self.columns.get(dir) {
+            Some(Slot::Ready { list, .. }) => Contents::Ready(list.as_ref()),
+            Some(Slot::Failed(e)) => Contents::Failed(e),
+            Some(Slot::Loading) | None => Contents::Loading,
+        }
+    }
+
+    /// Whether the focused tab is showing a folder in the column view.
+    fn in_columns(&self) -> bool {
+        self.workspace.active_tab().is_some_and(|t| {
+            t.view.view == file_list::ViewMode::Columns && t.location().as_path().is_some()
+        })
+    }
+
+    /// Takes the column listings that have arrived, and tells the cache which
+    /// folders the column views on screen need next.
+    fn pump_columns(&mut self) {
+        self.columns.pump();
+
+        let mut wanted = Vec::new();
+        // Every pane is on screen, so every pane's active tab counts.
+        for group in self.workspace.groups.values() {
+            let Some(tab) = group.active_tab().and_then(|t| self.workspace.tabs.get(&t)) else {
+                continue;
+            };
+            if tab.view.view != file_list::ViewMode::Columns {
+                continue;
+            }
+            let Some(dir) = tab.location().as_path() else {
+                continue;
+            };
+            let (sort, show_hidden) = (tab.view.sort, tab.view.show_hidden);
+            let want = |dir: PathBuf| crate::columns::Want { dir, sort, show_hidden };
+
+            // The folders before the current one; and the current one as well
+            // while the tab is still arriving, because its column is drawn
+            // from here until the tab's own listing lands.
+            let chain = crate::columns::chain(dir, self.home.as_deref());
+            let upto = if crate::columns::arriving(tab) { chain.len() } else { chain.len() - 1 };
+            wanted.extend(chain.into_iter().take(upto).map(want));
+            if let Some(peek) = crate::columns::peek(tab) {
+                wanted.push(want(peek));
             }
         }
+        self.columns.want(&wanted);
+    }
+
+    /// Right and Left in the column view: into the folder under the cursor, or
+    /// back out to the folder that contains this one.
+    ///
+    /// Out selects the folder just left, so Left then Right is a round trip.
+    /// In selects the first entry when its listing is already in the column to
+    /// the right — which it is once the cursor has rested on the folder.
+    fn column_step(&mut self, delta: isize) {
+        let Some(tab_id) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let Some(t) = self.workspace.tabs.get(&tab_id) else {
+            return;
+        };
+        let Some(dir) = t.location().as_path().map(Path::to_path_buf) else {
+            return;
+        };
+
+        let (target, select) = if delta > 0 {
+            if crate::columns::arriving(t) {
+                return;
+            }
+            let Some(idx) = t.selection.cursor().filter(|&i| t.list.rank(i).is_some()) else {
+                return;
+            };
+            let full = dir.join(t.list.name(idx));
+            if !t.list.kind(idx).is_container() || crate::columns::is_package(&full) {
+                return;
+            }
+            let first = crate::columns::first_name(self.columns.get(&full));
+            (full, first)
+        } else {
+            let Some(parent) = dir.parent() else {
+                // A drive root has no parent folder, but it does have a place
+                // above it — This PC — and Up has always gone there.
+                if let Some(above) = t.location().parent() {
+                    self.navigate(tab_id, above);
+                }
+                return;
+            };
+            let left = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+            (parent.to_path_buf(), left)
+        };
+
+        self.navigate(tab_id, NodeId::Path(target));
+        if let Some(t) = self.workspace.tabs.get_mut(&tab_id) {
+            t.reselect = select.map(|name| crate::workspace::Reselect {
+                names: vec![name.clone()],
+                cursor: Some(name),
+            });
+        }
+    }
+
+    /// A click in a column other than the current one: that folder becomes
+    /// the current one, with the entry clicked selected.
+    fn column_pick(
+        &mut self,
+        dir: PathBuf,
+        entry: Option<(String, neutron_core::EntryKind)>,
+        double: bool,
+    ) {
+        let Some(tab_id) = self.workspace.active_tab_id() else {
+            return;
+        };
+
+        // A double-click opens, as Enter does: a folder becomes the current
+        // one and anything else goes to its application. The first click of
+        // the pair has already selected it.
+        if double {
+            if let Some((name, kind)) = entry {
+                let full = dir.join(&name);
+                if kind.is_container() && !crate::columns::is_package(&full) {
+                    self.navigate(tab_id, NodeId::Path(full));
+                } else {
+                    self.open_local(full);
+                }
+            }
+            return;
+        }
+
+        let target = NodeId::Path(dir);
+        let Some(t) = self.workspace.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        // Already there and loaded: select by name now rather than reloading.
+        if t.location() == &target && !crate::columns::arriving(t) {
+            let found = entry
+                .as_ref()
+                .and_then(|(name, _)| (0..t.list.len()).find(|&i| t.list.name(i) == name));
+            match found {
+                Some(idx) => {
+                    t.selection.apply(&t.list, idx, SelectMode::Replace);
+                    t.view.scroll_to = Some(idx);
+                }
+                None => t.selection.clear(),
+            }
+            return;
+        }
+
+        // A no-op when the tab is already on its way there; the selection is
+        // then applied when that load lands.
+        self.navigate(tab_id, target);
+        if let Some(t) = self.workspace.tabs.get_mut(&tab_id) {
+            t.reselect = entry.map(|(name, _)| crate::workspace::Reselect {
+                names: vec![name.clone()],
+                cursor: Some(name),
+            });
+        }
+    }
+}
+
+// --- writing to servers -----------------------------------------------------
+
+impl NeutronApp {
+    /// Whether the focused tab is a folder on a saved server.
+    fn on_server(&self) -> bool {
+        self.workspace.active_tab().is_some_and(|t| t.location().as_remote().is_some())
+    }
+
+    /// Names in a tab's listing, for checking what a write would collide with.
+    fn listed_names(&self, tab: TabId) -> Vec<String> {
+        self.workspace.tabs.get(&tab).map_or_else(Vec::new, |t| {
+            (0..t.list.len()).map(|i| t.list.name(i).to_owned()).collect()
+        })
+    }
+
+    /// Runs `work` against the server `tab` is showing, on a thread of its own.
+    ///
+    /// One at a time: a second write while the first is still going would
+    /// race it for the same names, and the status bar has room for one.
+    fn start_remote(
+        &mut self,
+        tab: TabId,
+        label: String,
+        rename_after: Option<String>,
+        work: impl FnOnce(&neutron_remote::Site, &str, &crate::remote_ops::Progress) -> Result<String, String>
+        + Send
+        + 'static,
+    ) {
+        if let Some(running) = self.remote_job.as_ref() {
+            self.notices.info(format!("Still busy: {}", running.label));
+            return;
+        }
+        let Some((site_id, dir)) = self
+            .workspace
+            .tabs
+            .get(&tab)
+            .and_then(|t| t.location().as_remote())
+            .map(|(site, dir)| (site.to_owned(), dir.to_owned()))
+        else {
+            return;
+        };
+        let Some(site) = self.sites.get(&site_id).cloned() else {
+            self.notices.error(format!("No saved server called {site_id:?}"));
+            return;
+        };
+
+        let progress = std::sync::Arc::new(crate::remote_ops::Progress::default());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let worker_progress = std::sync::Arc::clone(&progress);
+        let wake = self.ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("neutron-remote-write".into())
+            .spawn(move || {
+                let _ = tx.send(work(&site, &dir, &worker_progress));
+                wake.request_repaint();
+            });
+        if let Err(e) = spawned {
+            self.notices.error(format!("Could not start: {e}"));
+            return;
+        }
+        self.remote_job = Some(RemoteJob { label, tab, progress, done: rx, rename_after });
+    }
+
+    fn pump_remote_job(&mut self) {
+        let Some(job) = self.remote_job.as_ref() else {
+            return;
+        };
+        let Ok(outcome) = job.done.try_recv() else {
+            return;
+        };
+        let Some(job) = self.remote_job.take() else {
+            return;
+        };
+        match outcome {
+            Ok(receipt) => {
+                self.notices.info(receipt);
+                if let Some(name) = job.rename_after {
+                    self.pending_rename = Some((job.tab, name));
+                }
+            }
+            Err(reason) => self.notices.error(format!("{} — {reason}", job.label)),
+        }
+        // Re-read whatever happened, including a write that failed partway:
+        // the listing is the only account of the server that is true.
+        self.refresh_in_place(job.tab);
+    }
+
+    /// The server's display name for the focused tab, for labels.
+    fn server_name(&self, tab: TabId) -> String {
+        self.workspace
+            .tabs
+            .get(&tab)
+            .and_then(|t| t.location().as_remote())
+            .and_then(|(site, _)| self.sites.get(site))
+            .map_or_else(|| "the server".to_owned(), |s| s.display().to_owned())
+    }
+
+    fn remote_new_folder(&mut self) {
+        let Some(tab) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let taken = self.listed_names(tab);
+        let name = neutron_core::naming::next_available("New folder", |c| taken.iter().any(|t| t == c));
+        let op = crate::remote_ops::Op::CreateDir { name: name.clone() };
+        let label = format!("Creating {name} on {}", self.server_name(tab));
+        self.start_remote(tab, label, Some(name), move |site, dir, progress| {
+            crate::remote_ops::run(site, dir, &op, progress)
+        });
+    }
+
+    fn remote_rename(&mut self, tab: TabId, place: &NodeId, from: String, to: String) {
+        // Checked against the listing, because a server's rename may quietly
+        // replace what is already there. Only when the tab still shows the
+        // folder the rename began in; otherwise there is nothing to check
+        // against, and guessing is how a file gets overwritten.
+        if self.workspace.tabs.get(&tab).map(|t| t.location()) != Some(place) {
+            self.notices.info("The folder changed before the rename finished, so nothing was renamed");
+            return;
+        }
+        if !from.eq_ignore_ascii_case(&to) && self.listed_names(tab).contains(&to) {
+            self.notices.error(format!("{to} is already here — pick another name"));
+            return;
+        }
+        let op = crate::remote_ops::Op::Rename { from, to: to.clone() };
+        let label = format!("Renaming to {to}");
+        self.start_remote(tab, label, None, move |site, dir, progress| {
+            crate::remote_ops::run(site, dir, &op, progress)
+        });
+    }
+
+    fn remote_delete(&mut self) {
+        let Some(tab_id) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let Some(t) = self.workspace.tabs.get(&tab_id) else {
+            return;
+        };
+        let entries: Vec<(String, neutron_core::EntryKind)> = visible_selection(t)
+            .into_iter()
+            .map(|i| (t.list.name(i).to_owned(), t.list.kind(i)))
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let label = format!("Deleting from {}", self.server_name(tab_id));
+        let op = crate::remote_ops::Op::Delete { entries };
+        self.start_remote(tab_id, label, None, move |site, dir, progress| {
+            crate::remote_ops::run(site, dir, &op, progress)
+        });
+    }
+
+    /// Uploads whatever local files are on the clipboard.
+    ///
+    /// A cut onto a server copies: the originals stay, because removing local
+    /// files after a network transfer is a second, separate risk, and nothing
+    /// here can undo it if the upload turns out to have been incomplete.
+    fn remote_paste(&mut self) {
+        let Some(tab) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let taken = self.listed_names(tab);
+        let label = format!("Uploading to {}", self.server_name(tab));
+        self.start_remote(tab, label, None, move |site, dir, progress| {
+            // Read here, on the worker: another process can hold the clipboard.
+            let Some((sources, _)) = neutron_shell::clipboard::read() else {
+                return Err("there are no files on the clipboard — copy files first".to_owned());
+            };
+            upload_new(site, dir, sources, &taken, progress)
+        });
+    }
+
+    fn remote_upload(&mut self, tab: TabId, sources: Vec<PathBuf>) {
+        let taken = self.listed_names(tab);
+        let label = format!("Uploading to {}", self.server_name(tab));
+        self.start_remote(tab, label, None, move |site, dir, progress| {
+            upload_new(site, dir, sources, &taken, progress)
+        });
+    }
+}
+
+/// Uploads `sources`, refusing up front any whose name the server folder
+/// already has — an upload replaces, and there is no bin behind it.
+fn upload_new(
+    site: &neutron_remote::Site,
+    dir: &str,
+    sources: Vec<PathBuf>,
+    taken: &[String],
+    progress: &crate::remote_ops::Progress,
+) -> Result<String, String> {
+    let names: Vec<String> = sources
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    let taken: Vec<&str> = taken.iter().map(String::as_str).collect();
+    let clashes = crate::remote_ops::collisions(names.iter().map(String::as_str), &taken);
+    if !clashes.is_empty() {
+        return Err(format!(
+            "{} already on the server, so nothing was sent: {}",
+            if clashes.len() == 1 { "this name is" } else { "these names are" },
+            clashes.join(", ")
+        ));
+    }
+    crate::remote_ops::run(site, dir, &crate::remote_ops::Op::Upload { sources }, progress)
+}
+
+/// The first SHA-256 certificate fingerprint in `text`, in the colon-separated
+/// form an untrusted-certificate refusal names it in.
+fn certificate_in(text: &str) -> Option<String> {
+    text.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '"' | '\''))
+        .map(|word| word.trim_end_matches(['.', ';']))
+        .find(|word| {
+            let pairs: Vec<&str> = word.split(':').collect();
+            pairs.len() == 32 && pairs.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+        })
+        .map(str::to_owned)
+}
+
+/// What the app does with something the list reported.
+///
+/// Shared by the list, the grid and the column view's current column, which
+/// all speak in the list's terms.
+fn list_action(a: FileListAction) -> Action {
+    match a {
+        FileListAction::Activate(idx) => Action::Activate(idx),
+        FileListAction::Select { idx, mode } => Action::Select { idx, mode },
+        FileListAction::SortBy(col) => Action::SortBy(col),
+        FileListAction::ClearSelection => Action::ClearSelection,
+        FileListAction::Marquee { from, to, additive } => Action::Marquee { from, to, additive },
+        FileListAction::ContextMenu { idx, pos } => Action::ContextMenu { idx, pos },
+        FileListAction::DragOut => Action::DragOut,
+        FileListAction::RenameTyped(text) => Action::RenameTyped(text),
+        FileListAction::RenameCommit(text) => Action::RenameCommit(text),
+        FileListAction::RenameCancel => Action::RenameCancel,
     }
 }
 
@@ -5048,5 +5997,18 @@ fn window_handle(cc: &eframe::CreationContext<'_>) -> Option<isize> {
     match cc.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod certificate_tests {
+    use super::certificate_in;
+
+    #[test]
+    fn the_fingerprint_is_found_in_a_refusal() {
+        let fp = vec!["AB"; 32].join(":");
+        let message = format!("files.example.com presented a certificate nobody vouches for (SHA-256 {fp}). Edit the server to trust it.");
+        assert_eq!(certificate_in(&message), Some(fp));
+        assert_eq!(certificate_in("connection refused"), None);
     }
 }

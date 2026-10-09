@@ -233,8 +233,7 @@ pub fn sort(list: &mut EntryList, spec: SortSpec) {
             SortColumn::Size => list.size(ai).cmp(&list.size(bi)),
             SortColumn::Modified => list.modified(ai).cmp(&list.modified(bi)),
             SortColumn::Created => list.created(ai).cmp(&list.created(bi)),
-            SortColumn::Kind => extension(list.name(ai))
-                .cmp(extension(list.name(bi)))
+            SortColumn::Kind => cmp_ignore_ascii_case(extension(list.name(ai)), extension(list.name(bi)))
                 .then_with(|| natural_cmp(list.name(ai), list.name(bi))),
         };
 
@@ -249,8 +248,19 @@ pub fn sort(list: &mut EntryList, spec: SortSpec) {
     list.set_order(order);
 }
 
-/// Lowercased extension, or `""` when there is none. Dotfiles like `.gitignore`
-/// are treated as having no extension, matching Explorer.
+/// Orders two extensions as if both were lowercase, without allocating either.
+///
+/// So `.JPG` and `.jpg` sort as one kind, and an uppercase extension does not
+/// sort ahead of every lowercase one.
+fn cmp_ignore_ascii_case(a: &str, b: &str) -> Ordering {
+    a.bytes()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+}
+
+/// The extension, or `""` when there is none, compared without regard to case.
+/// Dotfiles like `.gitignore` are treated as having no extension, matching
+/// Explorer.
 fn extension(name: &str) -> &str {
     match name.rfind('.') {
         Some(0) | None => "",
@@ -358,6 +368,30 @@ mod tests {
         );
 
         assert_eq!(names(&list), ["a.txt", "b.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn sorting_by_kind_ignores_the_case_of_the_extension() {
+        let mut list: EntryList = [
+            mk("b.JPG", EntryKind::File, 0, 0),
+            mk("c.png", EntryKind::File, 0, 0),
+            mk("a.jpg", EntryKind::File, 0, 0),
+            mk("d.Jpg", EntryKind::File, 0, 0),
+        ]
+        .into_iter()
+        .collect();
+
+        sort(
+            &mut list,
+            SortSpec {
+                column: SortColumn::Kind,
+                order: SortOrder::Ascending,
+                dirs_first: true,
+            },
+        );
+
+        // One group of JPEGs, ordered by name inside it, then the PNG.
+        assert_eq!(names(&list), ["a.jpg", "b.JPG", "d.Jpg", "c.png"]);
     }
 
     #[test]

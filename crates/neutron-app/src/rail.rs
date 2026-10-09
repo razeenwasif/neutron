@@ -15,14 +15,9 @@
 //! no single current location, but there *is* a single focused selection, and
 //! the rail acts on that.
 //!
-//! # Enablement is about the selection, not about whether it would work
-//!
-//! A row is dimmed when there is nothing for it to act on — no selection, no
-//! cursor. It is *not* dimmed for a location that cannot be written to: those
-//! go through the same actions as the keyboard and meet the same guard in
-//! `app.rs`, which answers with a sentence naming the place. A rail that
-//! silently greys itself out in a zip teaches nothing; one that says "Neutron
-//! cannot rename anything in This PC" teaches the rule once.
+//! Enablement comes from the focused pane's capabilities. Disabled buttons
+//! explain what is missing, and active buttons dispatch the same commands as
+//! the palette. The rail scrolls when the window is short.
 
 use egui::{Rect, Sense, Ui, pos2, vec2};
 use neutron_ui::icons::{self, Glyph};
@@ -50,12 +45,58 @@ pub enum RailAction {
     Compress,
 }
 
-/// What the rail needs to know to dim the right rows.
+/// A filesystem-free snapshot of the focused pane.
+#[derive(Default)]
 pub struct RailState {
-    /// Something is selected, so the verbs that consume a selection apply.
-    pub has_selection: bool,
-    /// A cursor row exists. Rename acts on one row, not on the set.
+    pub local_folder: bool,
+    /// A folder on a saved server: uploads, new folders, renames and deletes
+    /// work there; copying off it and archives do not yet.
+    pub server_folder: bool,
+    pub selection_count: usize,
     pub has_cursor: bool,
+    pub selected_archive: bool,
+    pub archive_busy: bool,
+}
+
+impl RailAction {
+    pub fn command(self) -> crate::commands::CommandId {
+        use crate::commands::CommandId as C;
+        match self {
+            Self::Copy => C::Copy,
+            Self::Cut => C::Cut,
+            Self::Paste => C::Paste,
+            Self::Rename => C::Rename,
+            Self::Delete => C::DeleteSelection,
+            Self::NewFolder => C::NewFolder,
+            Self::Extract => C::Extract,
+            Self::Compress => C::Compress,
+        }
+    }
+    fn unavailable(self, state: &RailState) -> Option<&'static str> {
+        if state.server_folder {
+            match self {
+                Self::Copy | Self::Cut => return Some("Copying files off a server is not supported yet"),
+                Self::Extract | Self::Compress => return Some("Archives work on local folders only"),
+                _ => {}
+            }
+        } else if !state.local_folder {
+            return Some("Open a local folder to use file actions");
+        }
+        match self {
+            Self::Paste | Self::NewFolder => None,
+            Self::Rename if state.selection_count != 1 || !state.has_cursor => {
+                Some("Select one item to rename")
+            }
+            Self::Extract | Self::Compress if state.archive_busy => {
+                Some("Wait for the current archive operation to finish")
+            }
+            Self::Extract if !state.selected_archive || state.selection_count != 1 => {
+                Some("Select one ZIP or TAR archive to extract")
+            }
+            _ if state.selection_count == 0 => Some("Select files or folders first"),
+            _ => None,
+        }
+    }
 }
 
 /// One row: glyph, label, the action it sends, and whether it needs a
@@ -65,15 +106,6 @@ struct Item {
     label: &'static str,
     action: RailAction,
     hint: &'static str,
-    needs: Needs,
-}
-
-#[derive(PartialEq, Eq)]
-enum Needs {
-    /// Always available — it acts on the folder, not on what is picked.
-    Nothing,
-    Selection,
-    Cursor,
 }
 
 /// A gap between groups.
@@ -86,19 +118,63 @@ const GAP: Option<Item> = None;
 
 fn items() -> Vec<Option<Item>> {
     vec![
-        Some(Item { glyph: Glyph::Copy, label: "Copy", action: RailAction::Copy, hint: "Copy to clipboard (Ctrl+C)", needs: Needs::Selection }),
-        Some(Item { glyph: Glyph::Cut, label: "Cut", action: RailAction::Cut, hint: "Cut to clipboard (Ctrl+X)", needs: Needs::Selection }),
-        // Paste never dims. Whether the clipboard holds files is a question for
+        Some(Item {
+            glyph: Glyph::Copy,
+            label: "Copy",
+            action: RailAction::Copy,
+            hint: "Copy to clipboard (Ctrl+C)",
+        }),
+        Some(Item {
+            glyph: Glyph::Cut,
+            label: "Cut",
+            action: RailAction::Cut,
+            hint: "Cut to clipboard (Ctrl+X)",
+        }),
+        // Clipboard contents are read only when Paste is invoked. Whether the clipboard holds files is a question for
         // the shell on a worker thread, and asking it every frame to grey out a
         // button would be a COM call in the paint path.
-        Some(Item { glyph: Glyph::Paste, label: "Paste", action: RailAction::Paste, hint: "Paste here (Ctrl+V)", needs: Needs::Nothing }),
+        Some(Item {
+            glyph: Glyph::Paste,
+            label: "Paste",
+            action: RailAction::Paste,
+            hint: "Paste here (Ctrl+V)",
+        }),
         GAP,
-        Some(Item { glyph: Glyph::Rename, label: "Rename", action: RailAction::Rename, hint: "Rename this file (F2)", needs: Needs::Cursor }),
-        Some(Item { glyph: Glyph::Trash, label: "Delete", action: RailAction::Delete, hint: "Send to the Recycle Bin (Delete)", needs: Needs::Selection }),
-        Some(Item { glyph: Glyph::NewFolder, label: "Folder", action: RailAction::NewFolder, hint: "New folder (Ctrl+Shift+N)", needs: Needs::Nothing }),
+        Some(Item {
+            glyph: Glyph::Rename,
+            label: "Rename",
+            action: RailAction::Rename,
+            hint: "Rename this file (F2)",
+        }),
+        Some(Item {
+            glyph: Glyph::Trash,
+            label: "Delete",
+            action: RailAction::Delete,
+            hint: if cfg!(target_os = "macos") {
+                "Move to Trash (Cmd+Backspace)"
+            } else {
+                "Send to the Recycle Bin (Delete)"
+            },
+        }),
+        Some(Item {
+            glyph: Glyph::NewFolder,
+            label: "Folder",
+            action: RailAction::NewFolder,
+            hint: "New folder (Ctrl+Shift+N)",
+        }),
         GAP,
-        Some(Item { glyph: Glyph::Extract, label: "Extract", action: RailAction::Extract, hint: "Extract this archive", needs: Needs::Selection }),
-        Some(Item { glyph: Glyph::Compress, label: "Zip", action: RailAction::Compress, hint: "Compress to a zip", needs: Needs::Selection }),
+        Some(Item {
+            glyph: Glyph::Extract,
+            label: "Extract",
+            action: RailAction::Extract,
+            hint: "Extract this archive",
+        }),
+        Some(Item {
+            glyph: Glyph::Compress,
+            label: "Zip",
+            action: RailAction::Compress,
+            hint: "Compress to a zip",
+        }),
     ]
 }
 
@@ -115,73 +191,89 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
     // corners on the way.
     theme::vertical_wash(ui.painter(), full, theme::RADIUS_CARD as f32, p);
 
-    let mut y = full.top();
+    egui::ScrollArea::vertical()
+        .id_salt("action-rail-scroll")
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            let full = ui.available_rect_before_wrap();
+            let mut y = full.top();
 
-    for entry in items() {
-        let Some(item) = entry else {
-            y += 14.0;
-            continue;
-        };
+            for entry in items() {
+                let Some(item) = entry else {
+                    y += 14.0;
+                    continue;
+                };
 
-        let rect = Rect::from_min_size(pos2(full.left(), y), vec2(full.width(), ITEM));
-        y += ITEM + SPACING;
+                let rect = Rect::from_min_size(pos2(full.left(), y), vec2(full.width(), ITEM));
+                y += ITEM + SPACING;
 
-        let enabled = match item.needs {
-            Needs::Nothing => true,
-            Needs::Selection => state.has_selection,
-            Needs::Cursor => state.has_cursor,
-        };
+                let unavailable = item.action.unavailable(state);
+                let enabled = unavailable.is_none();
 
-        let response = ui.allocate_rect(rect, if enabled { Sense::click() } else { Sense::hover() });
+                let response = ui.allocate_rect(
+                    rect,
+                    if enabled {
+                        Sense::click()
+                    } else {
+                        Sense::hover()
+                    },
+                );
 
-        if enabled && response.hovered() {
-            ui.painter().rect_filled(
-                rect.shrink2(vec2(6.0, 1.0)),
-                theme::RADIUS_CONTROL,
-                p.hover,
-            );
-        }
+                if enabled && response.hovered() {
+                    ui.painter().rect_filled(
+                        rect.shrink2(vec2(6.0, 1.0)),
+                        theme::RADIUS_CONTROL,
+                        p.hover,
+                    );
+                }
 
-        // Dimming is done by choosing a fainter colour rather than by fading
-        // the whole row: egui has no opacity on a painter, and a grey glyph
-        // beside grey text is the same signal.
-        let (glyph_colour, text_colour) = if !enabled {
-            (p.text_faint, p.text_faint)
-        } else if response.hovered() {
-            (p.text, p.text)
-        } else {
-            (p.icon, p.text_muted)
-        };
+                // Dimming is done by choosing a fainter colour rather than by fading
+                // the whole row: egui has no opacity on a painter, and a grey glyph
+                // beside grey text is the same signal.
+                let (glyph_colour, text_colour) = if !enabled {
+                    (p.text_faint, p.text_faint)
+                } else if response.hovered() {
+                    (p.text, p.text)
+                } else {
+                    (p.icon, p.text_muted)
+                };
 
-        icons::draw(
-            ui.painter(),
-            pos2(rect.center().x, rect.top() + 17.0),
-            item.glyph,
-            glyph_colour,
-        );
+                icons::draw(
+                    ui.painter(),
+                    pos2(rect.center().x, rect.top() + 17.0),
+                    item.glyph,
+                    glyph_colour,
+                );
 
-        let galley = ui.painter().layout_no_wrap(
-            item.label.to_owned(),
-            egui::FontId::proportional(9.5),
-            text_colour,
-        );
-        ui.painter().galley(
-            pos2(
-                (rect.center().x - galley.size().x / 2.0).round(),
-                rect.top() + 32.0,
-            ),
-            galley,
-            text_colour,
-        );
+                let galley = ui.painter().layout_no_wrap(
+                    item.label.to_owned(),
+                    egui::FontId::proportional(9.5),
+                    text_colour,
+                );
+                ui.painter().galley(
+                    pos2(
+                        (rect.center().x - galley.size().x / 2.0).round(),
+                        rect.top() + 32.0,
+                    ),
+                    galley,
+                    text_colour,
+                );
 
-        if enabled {
-            let response = response.on_hover_text(item.hint);
-            if response.clicked() {
-                chosen = Some(item.action);
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, item.label)
+                });
+                let hint = unavailable.unwrap_or(item.hint);
+                let hint = if cfg!(target_os = "macos") {
+                    hint.replace("Ctrl+", "Cmd+")
+                } else {
+                    hint.to_owned()
+                };
+                let response = response.on_hover_text(hint);
+                if enabled && response.clicked() {
+                    chosen = Some(item.action);
+                }
             }
-        }
-    }
-
+        });
     chosen
 }
 
@@ -191,12 +283,9 @@ mod tests {
 
     #[test]
     fn every_action_appears_exactly_once() {
-        let mut seen: Vec<RailAction> = items()
-            .into_iter()
-            .flatten()
-            .map(|i| i.action)
-            .collect();
+        let mut seen: Vec<RailAction> = items().into_iter().flatten().map(|i| i.action).collect();
         let before = seen.len();
+        seen.sort_by_key(|action| *action as u8);
         seen.dedup();
         assert_eq!(before, seen.len(), "an action is listed twice");
         assert!(before >= 8, "only {before} actions on the rail");
@@ -221,24 +310,61 @@ mod tests {
     #[test]
     fn the_hints_teach_the_shortcut() {
         for item in items().into_iter().flatten() {
-            assert!(
-                !item.hint.is_empty(),
-                "{:?} has no hover text",
-                item.action
-            );
+            assert!(!item.hint.is_empty(), "{:?} has no hover text", item.action);
         }
     }
 
-    /// Paste must not dim: asking the shell whether the clipboard holds files
-    /// is a COM call, and it would land in the paint path.
     #[test]
-    fn paste_is_always_available() {
-        let paste = items()
-            .into_iter()
-            .flatten()
-            .find(|i| i.action == RailAction::Paste)
-            .expect("paste is on the rail");
-        assert!(paste.needs == Needs::Nothing);
+    fn dashboard_and_virtual_locations_offer_no_local_mutations() {
+        for item in items().into_iter().flatten() {
+            assert!(item.action.unavailable(&RailState::default()).is_some());
+        }
+    }
+    #[test]
+    fn an_empty_folder_can_create_and_paste_but_cannot_mutate_a_selection() {
+        let state = RailState {
+            local_folder: true,
+            ..Default::default()
+        };
+        assert!(RailAction::Paste.unavailable(&state).is_none());
+        assert!(RailAction::NewFolder.unavailable(&state).is_none());
+        for action in [
+            RailAction::Copy,
+            RailAction::Cut,
+            RailAction::Delete,
+            RailAction::Rename,
+            RailAction::Extract,
+            RailAction::Compress,
+        ] {
+            assert!(action.unavailable(&state).is_some());
+        }
+    }
+    #[test]
+    fn a_server_folder_offers_the_writes_a_server_can_take() {
+        let state = RailState { server_folder: true, selection_count: 1, has_cursor: true, ..Default::default() };
+        for action in [RailAction::Paste, RailAction::NewFolder, RailAction::Rename, RailAction::Delete] {
+            assert!(action.unavailable(&state).is_none(), "{action:?} should work on a server");
+        }
+        for action in [RailAction::Copy, RailAction::Cut, RailAction::Extract, RailAction::Compress] {
+            assert!(action.unavailable(&state).is_some(), "{action:?} should explain itself");
+        }
+    }
+
+    #[test]
+    fn extracting_requires_one_archive_and_an_idle_worker() {
+        let mut state = RailState {
+            local_folder: true,
+            selection_count: 1,
+            has_cursor: true,
+            ..Default::default()
+        };
+        assert!(RailAction::Extract.unavailable(&state).is_some());
+        state.selected_archive = true;
+        assert!(RailAction::Extract.unavailable(&state).is_none());
+        state.archive_busy = true;
+        assert!(RailAction::Extract.unavailable(&state).is_some());
+        assert!(RailAction::Compress.unavailable(&state).is_some());
+        assert!(RailAction::Copy.unavailable(&state).is_none());
     }
 
     #[test]

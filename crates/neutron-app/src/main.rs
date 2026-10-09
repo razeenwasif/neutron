@@ -22,8 +22,10 @@ mod address;
 mod app;
 mod archive_ops;
 mod bench;
+#[cfg_attr(target_os = "macos", path = "chrome_macos.rs")]
 mod chrome;
 mod cloud;
+mod columns;
 mod commands;
 mod confirm;
 mod connect;
@@ -36,11 +38,13 @@ mod loader;
 mod notice;
 mod preview;
 mod panes;
+mod persist;
 mod pins;
 mod place;
 mod rail;
 mod recent;
 mod remote;
+mod remote_ops;
 mod plugins;
 mod sidebar;
 mod startup;
@@ -83,11 +87,16 @@ fn main() -> eframe::Result<()> {
     // An optional path argument opens that folder instead of the home
     // directory, so Neutron can stand in for Explorer from a shell or a
     // "open with" association.
+    //
+    // Made absolute against the directory it was typed in. `neutron .` would
+    // otherwise open a location called "." — titled ".", with nowhere for Up
+    // to go — and save it, to be resolved next time against wherever the next
+    // launch happens to start, which from the Finder is `/`.
     let start_path = args
         .iter()
         .skip(1)
         .find(|a| !a.starts_with("--"))
-        .cloned();
+        .map(|a| std::path::absolute(a).map_or_else(|_| a.clone(), |p| p.to_string_lossy().into_owned()));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -99,16 +108,29 @@ fn main() -> eframe::Result<()> {
             // and nothing done inside the window makes the two read as one
             // object. See `chrome.rs`, including what has to be put back by
             // hand once the OS stops drawing the frame.
-            .with_decorations(false)
+            .with_decorations(cfg!(target_os = "macos"))
+            .with_fullsize_content_view(cfg!(target_os = "macos"))
+            .with_title_shown(!cfg!(target_os = "macos"))
+            .with_titlebar_shown(!cfg!(target_os = "macos"))
+            .with_titlebar_buttons_shown(true)
             .with_resizable(true)
+            // On the Mac the window itself is see-through, so the sidebar, the
+            // action rail and the panes float over the desktop as three cards.
+            // Metal composites a transparent surface; see `NeutronApp::ui` for
+            // the ground that is no longer painted there.
+            .with_transparent(cfg!(target_os = "macos"))
+            // And no window shadow from the OS. On a transparent window macOS
+            // traces its shadow around everything drawn, including each card's
+            // own soft shadow, which put a dark outline around every card. The
+            // cards' shadows are the floating effect; this one only fought it.
+            .with_has_shadow(!cfg!(target_os = "macos"))
             .with_icon(app_icon()),
-        // Deliberately *not* `.with_transparent(true)`. Measurement showed wgpu
-        // cannot provide a surface with a transparent `CompositeAlphaMode` on
-        // any backend available here (DX12, Vulkan, GL all logged the same
-        // rejection), so requesting it only produced a warning per launch and
-        // no blur. Neutron paints its own ground and drifting colour fields
-        // instead — see `neutron_ui::ambient` — which makes the glass effect
-        // self-contained and independent of compositor support.
+        // Not transparent on Windows. Measurement showed wgpu cannot provide a
+        // surface with a transparent `CompositeAlphaMode` on any backend
+        // available there (DX12, Vulkan, GL all logged the same rejection), so
+        // requesting it only produced a warning per launch and no blur.
+        // Neutron paints its own ground and drifting colour fields instead —
+        // see `neutron_ui::ambient`.
         // wgpu rather than glow: the icon atlas will be a single large texture
         // with frequent partial uploads, which wgpu expresses far better.
         renderer: eframe::Renderer::Wgpu,
@@ -116,44 +138,29 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    // Folders and files handed over by the system — "Open With Neutron", a
+    // drop on the Dock icon. Listened for before eframe starts, because the
+    // ones that launched the app arrive before it has built anything.
+    let (open_tx, opened) = crossbeam_channel::unbounded();
+    if let Err(e) = neutron_shell::open_requests::watch(open_tx) {
+        tracing::warn!("{e}; files opened from the Finder will not reach Neutron");
+    }
+
     let mut startup = startup::StartupTimer::new(launched);
     startup.mark_setup_done();
 
     eframe::run_native(
         "Neutron",
         options,
-        Box::new(move |cc| Ok(Box::new(app::NeutronApp::new(cc, startup, start_path)))),
+        Box::new(move |cc| Ok(Box::new(app::NeutronApp::new(cc, startup, start_path, opened)))),
     )
 }
 
-/// The window and taskbar icon.
-///
-/// Set explicitly rather than relying on the icon embedded in the executable by
-/// `build.rs`: winit installs its own default window icon, so the resource
-/// icon alone leaves the title bar showing a generic placeholder. The embedded
-/// `.ico` still matters — that is what Explorer and a pinned taskbar shortcut
-/// use — so both exist on purpose.
-///
-/// Stored as raw RGBA rather than PNG so no image decoder is needed at startup;
-/// 16KB of pixels costs less than a decode dependency, and nothing has to
-/// happen before the first frame.
-///
-/// # Regenerating
-///
-/// Both this and `icon.ico` are rendered from signed distance fields rather
-/// than rasterised from `assets/icon.svg`, for two reasons: no SVG rasteriser
-/// is among the build requirements, and rendering each `.ico` size from the
-/// geometry beats downscaling one bitmap — 16px is where an icon fails, and it
-/// fails first at the corners.
-///
-/// These instructions used to read `convert -background none …`. On Windows
-/// that is not ImageMagick. `C:\Windows\System32\convert.exe` converts a FAT
-/// volume to NTFS, and a bare `convert` resolves to it — so the documented way
-/// to rebuild the icon named a filesystem tool. `assets/icon.svg` carries the
-/// same unit-square geometry the generator draws.
+/// The window icon, generated from assets/icon.svg by scripts/render-icon.sh.
+/// The macOS Dock uses the matching high-resolution ICNS in the app bundle.
 fn app_icon() -> egui::IconData {
-    const RGBA: &[u8] = include_bytes!("../../../assets/icon_64.rgba");
-    const SIZE: u32 = 64;
+    const RGBA: &[u8] = include_bytes!("../../../assets/icon_256.rgba");
+    const SIZE: u32 = 256;
 
     // A truncated or mis-sized asset would otherwise show up as a garbled icon;
     // failing the build is far easier to diagnose.
@@ -197,6 +204,8 @@ fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
                 _ => eframe::wgpu::Backends::DX12,
             };
         }
+        #[cfg(target_os = "macos")]
+        { setup.instance_descriptor.backends = eframe::wgpu::Backends::METAL; }
         // A file manager is not a game: integrated graphics draw this UI
         // perfectly well, and forcing the discrete GPU awake costs battery and
         // adds seconds of spin-up on hybrid laptops.

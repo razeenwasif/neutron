@@ -4,9 +4,9 @@
 //!
 //! Blocking throughout, and one step waits on a human. Worker thread only.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -18,6 +18,13 @@ use crate::oauth::{self, AuthError, Pkce};
 /// scopes. It exists so a browser that never opens, or a user who wandered off,
 /// eventually releases the worker rather than pinning it for the session.
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often the loopback wait wakes to check [`CONSENT_TIMEOUT`].
+const POLL: Duration = Duration::from_millis(100);
+
+/// Longest request line read from the loopback socket. Google's redirect is a
+/// few hundred bytes; anything far longer is not it.
+const MAX_REQUEST_LINE: u64 = 8 * 1024;
 
 /// Where the client credentials come from.
 ///
@@ -134,38 +141,81 @@ pub fn authorize() -> Result<Tokens, AuthError> {
     exchange_code(&client_id, &redirect, &code, &pkce)
 }
 
-/// Accepts exactly one request and reads the authorisation code from it.
+/// Waits for the redirect that carries this flow's authorisation code.
 fn wait_for_redirect(listener: &TcpListener, expected_state: &str) -> Result<String, AuthError> {
+    wait_for_redirect_within(listener, expected_state, CONSENT_TIMEOUT)
+}
+
+/// [`wait_for_redirect`], with the deadline as a parameter so the tests can
+/// use one measured in milliseconds.
+///
+/// # The deadline is real
+///
+/// A blocking `accept` cannot be interrupted, so a deadline checked only after
+/// it returns is checked only when something connects — and the case the
+/// deadline exists for is the one where nothing ever does: a browser that
+/// never opened, a user who closed the tab. That pinned a worker thread for
+/// the life of the process. The listener is non-blocking instead, and polled.
+///
+/// # Only this flow's redirect ends it
+///
+/// The port is reachable by every process on the machine, and browsers make
+/// requests of their own. A request for any other path is answered with a 404
+/// and ignored; a request on the redirect path whose `state` does not match is
+/// answered with an error page and ignored too. Ending the flow on either
+/// would let anything local cancel a sign-in by guessing a port, and a
+/// favicon fetch that won the race would do it by accident.
+fn wait_for_redirect_within(
+    listener: &TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String, AuthError> {
     listener
-        .set_nonblocking(false)
+        .set_nonblocking(true)
         .map_err(|e| AuthError::Http(e.to_string()))?;
 
-    let deadline = std::time::Instant::now() + CONSENT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
 
-    for stream in listener.incoming() {
-        if std::time::Instant::now() > deadline {
-            return Err(AuthError::Http("timed out waiting for consent".to_owned()));
-        }
-
-        let mut stream = match stream {
-            Ok(s) => s,
+    loop {
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
             Err(e) => {
-                tracing::debug!("loopback accept failed: {e}");
+                if e.kind() != std::io::ErrorKind::WouldBlock {
+                    tracing::debug!("loopback accept failed: {e}");
+                }
+                if Instant::now() >= deadline {
+                    return Err(AuthError::Http("timed out waiting for consent".to_owned()));
+                }
+                std::thread::sleep(POLL);
                 continue;
             }
         };
+
+        // On macOS and the BSDs an accepted socket inherits the listener's
+        // non-blocking flag, and a non-blocking read here would fail at once
+        // rather than wait for the browser to send its request.
+        let _ = stream.set_nonblocking(false);
         // A connection that stalls mid-request must not hold the flow open.
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
+        // Capped, because anything on the machine can connect, and a request
+        // line that never ends must not grow without limit.
         let mut line = String::new();
-        if BufReader::new(&stream).read_line(&mut line).is_err() {
+        if BufReader::new((&stream).take(MAX_REQUEST_LINE))
+            .read_line(&mut line)
+            .is_err()
+        {
             continue;
         }
 
-        // Browsers request /favicon.ico alongside the page. Answering it as the
-        // redirect would fail the state check and abort a flow that is fine.
-        if line.contains("/favicon.ico") {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        // The redirect URI is the bare origin, so the browser comes back to
+        // `/`. Anything else — `/favicon.ico` above all, which browsers
+        // request alongside the page — is not the redirect.
+        if request_path(&line) != Some("/") {
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
             continue;
         }
 
@@ -179,10 +229,22 @@ fn wait_for_redirect(listener: &TcpListener, expected_state: &str) -> Result<Str
         let _ = stream.write_all(page.as_bytes());
         let _ = stream.flush();
 
-        return result.map(|r| r.code);
+        match result {
+            // Not ours. Answered, so whoever sent it is not left hanging, and
+            // otherwise ignored: the real redirect may still be on its way.
+            Err(AuthError::StateMismatch) => {
+                tracing::warn!("ignored a loopback request whose state did not match");
+                continue;
+            }
+            other => return other.map(|r| r.code),
+        }
     }
+}
 
-    Err(AuthError::Http("the loopback listener closed".to_owned()))
+/// The path of an HTTP request line, without its query.
+fn request_path(request_line: &str) -> Option<&str> {
+    let target = request_line.split_whitespace().nth(1)?;
+    Some(target.split_once('?').map_or(target, |(path, _)| path))
 }
 
 /// Redeems the authorisation code, sending the verifier that proves this is the
@@ -319,7 +381,10 @@ fn open_browser(url: &str) -> Result<(), AuthError> {
 /// nothing interprets the `&` separators.
 #[cfg(not(windows))]
 fn open_browser(url: &str) -> Result<(), AuthError> {
-    std::process::Command::new("xdg-open")
+    // `open` hands a URL to the default browser on macOS; `xdg-open` is the
+    // freedesktop equivalent and does not exist there.
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(opener)
         .arg(url)
         .spawn()
         .map(|_| ())
@@ -455,6 +520,82 @@ mod tests {
         let pkce = crate::oauth::Pkce::from_verifier("v".repeat(43));
         let url = crate::oauth::authorize_url("id", "http://127.0.0.1:1", "st", &pkce);
         assert!(url.matches('&').count() >= 6, "{url}");
+    }
+
+    /// Sends one request line to the loopback listener and returns the reply.
+    fn send(port: u16, line: &str) -> String {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.write_all(format!("{line}\r\nHost: 127.0.0.1\r\n\r\n").as_bytes()).unwrap();
+        let mut reply = String::new();
+        let _ = stream.read_to_string(&mut reply);
+        reply
+    }
+
+    #[test]
+    fn an_abandoned_sign_in_gives_up_on_its_deadline() {
+        // Nothing ever connects: the browser never opened, or the user closed
+        // the tab. The wait used to block in `accept` for ever.
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let started = Instant::now();
+        let outcome = wait_for_redirect_within(&listener, "ours", Duration::from_millis(300));
+
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert!(
+            matches!(&outcome, Err(AuthError::Http(e)) if e.contains("timed out")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn stray_requests_are_answered_and_ignored_until_the_real_redirect_arrives() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let client = std::thread::spawn(move || {
+            [
+                send(port, "GET /favicon.ico HTTP/1.1"),
+                // Another path, even one carrying the right state, is not
+                // the redirect.
+                send(port, "GET /elsewhere?code=x&state=ours HTTP/1.1"),
+                // A local process trying to cancel the sign-in.
+                send(port, "GET /?error=access_denied&state=guess HTTP/1.1"),
+                send(port, "GET /?error=access_denied HTTP/1.1"),
+                // Or to substitute its own code.
+                send(port, "GET /?code=theirs&state=guess HTTP/1.1"),
+                send(port, "GET /?code=good&state=ours HTTP/1.1"),
+            ]
+        });
+
+        let outcome = wait_for_redirect_within(&listener, "ours", Duration::from_secs(10));
+        let replies = client.join().unwrap();
+
+        assert_eq!(outcome, Ok("good".to_owned()));
+        assert!(replies[0].starts_with("HTTP/1.1 404"), "{}", replies[0]);
+        assert!(replies[1].starts_with("HTTP/1.1 404"), "{}", replies[1]);
+        for reply in &replies[2..5] {
+            assert!(reply.contains("Could not connect"), "{reply}");
+        }
+        assert!(replies[5].contains("Google Drive connected"), "{}", replies[5]);
+    }
+
+    #[test]
+    fn a_decline_with_the_right_state_still_ends_the_flow() {
+        // The user pressing Cancel is this flow's answer, not a stray.
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client =
+            std::thread::spawn(move || send(port, "GET /?error=access_denied&state=ours HTTP/1.1"));
+
+        let outcome = wait_for_redirect_within(&listener, "ours", Duration::from_secs(10));
+        client.join().unwrap();
+        assert_eq!(outcome, Err(AuthError::Declined));
+    }
+
+    #[test]
+    fn the_request_path_is_read_without_its_query() {
+        assert_eq!(request_path("GET /?code=a HTTP/1.1"), Some("/"));
+        assert_eq!(request_path("GET /favicon.ico HTTP/1.1"), Some("/favicon.ico"));
+        assert_eq!(request_path("GET"), None);
     }
 
     #[test]
