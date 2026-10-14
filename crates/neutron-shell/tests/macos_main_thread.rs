@@ -6,7 +6,8 @@ fn main() {
     open_documents_event_reaches_the_channel();
     drag_without_a_window_is_an_error_not_a_crash();
     quick_look_without_a_window_is_an_error_not_a_crash();
-    println!("macos_main_thread: 3 passed");
+    menu_items_reach_the_app_and_follow_its_state();
+    println!("macos_main_thread: 4 passed");
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -66,4 +67,44 @@ fn quick_look_without_a_window_is_an_error_not_a_crash() {
     assert!(err.contains("window"), "{err}");
     assert!(quicklook::take_moves().is_empty());
     quicklook::follow(&[std::path::PathBuf::from("/tmp")], 0);
+}
+
+/// A menu built from a description: choosing an item queues its tag, and the
+/// state the app publishes disables and ticks items when AppKit validates.
+#[cfg(target_os = "macos")]
+fn menu_items_reach_the_app_and_follow_its_state() {
+    use neutron_shell::menubar::{self, Entry, Key, Menu};
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let app = NSApplication::sharedApplication(mtm);
+    menubar::install(vec![Menu {
+        title: "Test".into(),
+        entries: vec![
+            Entry::Item { tag: 7, title: "Seven".into(), key: Some(Key::cmd("7")) },
+            Entry::Separator,
+            Entry::Item { tag: 8, title: "Eight".into(), key: None },
+        ],
+        windows: false,
+    }])
+    .expect("installs");
+
+    let bar = app.mainMenu().expect("a menu bar");
+    let top = bar.itemAtIndex(bar.numberOfItems() - 1).expect("the new menu");
+    let menu = top.submenu().expect("with items");
+    assert_eq!(menu.numberOfItems(), 3);
+
+    menu.performActionForItemAtIndex(0);
+    assert_eq!(menubar::take_chosen(), vec![7]);
+    assert!(menubar::take_chosen().is_empty(), "taken twice");
+
+    menubar::set_state([7].into_iter().collect(), [8].into_iter().collect());
+    menu.update();
+    let seven = menu.itemAtIndex(0).unwrap();
+    let eight = menu.itemAtIndex(2).unwrap();
+    assert!(!seven.isEnabled(), "a disabled item stayed enabled");
+    assert!(eight.isEnabled());
+    assert_eq!(eight.state(), 1, "a checked item was not ticked");
+    assert_eq!(seven.state(), 0);
 }

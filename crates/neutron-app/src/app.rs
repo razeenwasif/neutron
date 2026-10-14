@@ -137,6 +137,9 @@ enum Action {
     GetInfoSelection,
     /// Finder aliases to these items, beside them.
     MakeAlias(Vec<PathBuf>),
+    /// The selection's paths as text on the clipboard, one per line, or the
+    /// folder's own with nothing selected.
+    CopyPath,
     /// Clear the status line.
     DismissNotice,
     /// Open a terminal at the focused tab's folder.
@@ -634,6 +637,11 @@ impl NeutronApp {
             // wake the event loop, and winit sees neither.
             let ctx = cc.egui_ctx.clone();
             neutron_shell::quicklook::set_waker(move || ctx.request_repaint());
+            let ctx = cc.egui_ctx.clone();
+            neutron_shell::menubar::set_waker(move || ctx.request_repaint());
+            if let Err(e) = neutron_shell::menubar::install(crate::menubar::menus()) {
+                tracing::warn!(error = %e, "the menu bar could not be built");
+            }
         }
         let (planned_tx, planned_rx) = crossbeam_channel::unbounded();
         let (notice_tx, notice_rx) = crossbeam_channel::unbounded();
@@ -1195,6 +1203,25 @@ impl NeutronApp {
                 });
             }
             Action::OpenInNewTab(id) => self.open_in_new_tab(id),
+            Action::CopyPath => {
+                let paths = match self.selection_paths() {
+                    Some((_, _, paths)) => paths,
+                    None => self
+                        .workspace
+                        .active_tab()
+                        .and_then(|t| t.location().as_path().map(|p| vec![p.to_path_buf()]))
+                        .unwrap_or_default(),
+                };
+                if !paths.is_empty() {
+                    let text = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
+                    let notices = self.notice_tx.clone();
+                    let count = paths.len();
+                    self.sta.submit(move || match neutron_shell::clipboard::write_text(&text) {
+                        Ok(()) => report_info(&notices, if count == 1 { "Copied the path".into() } else { format!("Copied {count} paths") }),
+                        Err(e) => report(&notices, format!("The path could not be copied: {e}")),
+                    });
+                }
+            }
             Action::OpenTerminalAt(dir) => {
                 let notices = self.notice_tx.clone();
                 self.sta.submit(move || {
@@ -2276,6 +2303,142 @@ impl NeutronApp {
         rows
     }
 
+    /// Whether a question or a menu has the window: keys and menu commands
+    /// wait until it is answered.
+    fn modal(&self) -> bool {
+        self.confirm.is_some() || !self.clash_questions.is_empty() || self.menu.is_some() || self.connect.open
+    }
+
+    /// What a menu bar item does, now.
+    fn menu_command(&self, cmd: crate::menubar::Cmd) -> Option<Action> {
+        use crate::menubar::Cmd as C;
+        use neutron_core::SortColumn;
+        let selection = || self.selection_paths().map(|(_, _, paths)| paths);
+        Some(match cmd {
+            C::NewWindow => Action::NewWindow,
+            C::NewTab => Action::NewTab(self.workspace.focused_group()?.id),
+            C::NewFolder => Action::NewFolder,
+            C::Open => Action::Activate(self.workspace.active_tab()?.selection.cursor()?),
+            C::CloseTab => Action::CloseActiveTab,
+            C::GetInfo => Action::GetInfoSelection,
+            C::Rename => Action::BeginRename,
+            C::Duplicate => Action::Duplicate,
+            C::MakeAlias => Action::MakeAlias(selection()?),
+            C::QuickLook => Action::QuickLookSelection,
+            C::Compress => Action::CompressSelection,
+            C::Extract => Action::ExtractSelection,
+            C::MoveToTrash => Action::Delete { permanent: false },
+            C::DeleteImmediately => Action::Ask(Box::new(Action::Delete { permanent: true })),
+            C::Eject => Action::EjectCurrent,
+            C::AddToSidebar => Action::TogglePin,
+            C::Undo | C::Redo => return None,
+            C::Cut => Action::Clip { cut: true },
+            C::Copy => Action::Clip { cut: false },
+            C::Paste => Action::Paste,
+            C::SelectAll => Action::SelectAll,
+            C::CopyPath => Action::CopyPath,
+            C::Filter => Action::FocusFilter,
+            C::SearchEverywhere => Action::ToggleFinder(Mode::Everything),
+            C::FindFile => Action::ToggleFinder(Mode::Files),
+            C::CommandPalette => Action::ToggleFinder(Mode::Commands),
+            C::AsGrid => Action::SetView(file_list::ViewMode::Grid),
+            C::AsList => Action::SetView(file_list::ViewMode::List),
+            C::AsColumns => Action::SetView(file_list::ViewMode::Columns),
+            C::SortName => Action::SortBy(SortColumn::Name),
+            C::SortKind => Action::SortBy(SortColumn::Kind),
+            C::SortModified => Action::SortBy(SortColumn::Modified),
+            C::SortCreated => Action::SortBy(SortColumn::Created),
+            C::SortSize => Action::SortBy(SortColumn::Size),
+            C::ShowPreview => Action::TogglePreview,
+            C::ShowHidden => Action::ToggleHidden,
+            C::SplitRight => Action::Split(Axis::Horizontal),
+            C::SplitDown => Action::Split(Axis::Vertical),
+            C::AddressBar | C::GoToFolder => Action::ToggleAddress,
+            C::ToggleTheme => Action::ToggleTheme,
+            C::Back => Action::Back,
+            C::Forward => Action::Forward,
+            C::Enclosing => Action::Up,
+            C::Dashboard => Action::Navigate(NodeId::Home),
+            C::Home => Action::GoKnown("Home"),
+            C::Desktop => Action::GoKnown("Desktop"),
+            C::Documents => Action::GoKnown("Documents"),
+            C::Downloads => Action::GoKnown("Downloads"),
+            C::Applications => Action::GoKnown("Applications"),
+            C::Trash => Action::Navigate(NodeId::path(&trash_folder()?)),
+            C::Connect => Action::OpenConnect,
+            C::AirDrop => Action::OpenAirDrop,
+            C::Terminal => Action::OpenTerminal,
+            C::NextTab => Action::CycleTab(1),
+            C::PreviousTab => Action::CycleTab(-1),
+            C::NextPane => Action::FocusNextPane,
+        })
+    }
+
+    /// Tells the menu bar which items are available and which are ticked.
+    fn publish_menu_state(&self, ctx: &egui::Context) {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        use crate::menubar::Cmd as C;
+        let mut disabled = std::collections::HashSet::new();
+        let mut checked = std::collections::HashSet::new();
+        if self.modal() {
+            disabled.extend(C::all().map(C::tag));
+            neutron_shell::menubar::set_state(disabled, checked);
+            return;
+        }
+        // A text field has the keyboard: its editing keys must reach it.
+        let typing = ctx.egui_wants_keyboard_input();
+        let tab = self.workspace.active_tab();
+        let selected = tab.map(visible_selection).unwrap_or_default();
+        let dir = tab.and_then(|t| t.location().as_path());
+        let archive = match (tab, dir) {
+            (Some(t), Some(d)) => selected.iter().any(|&i| neutron_archive::format_of(&d.join(t.list.name(i))).is_some()),
+            _ => false,
+        };
+        let ejectable = dir.is_some_and(|d| self.ejectable.iter().any(|v| d.starts_with(v)));
+        let tabs = self.workspace.focused_group().map_or(0, |g| g.tabs.len());
+        for cmd in C::all() {
+            let off = match cmd {
+                C::Undo | C::Redo => true,
+                c if typing && c.edits_text() => true,
+                C::Open | C::GetInfo | C::Rename | C::Duplicate | C::MakeAlias | C::QuickLook | C::Compress
+                | C::MoveToTrash | C::DeleteImmediately | C::Cut | C::Copy => selected.is_empty(),
+                C::Extract => !archive,
+                C::NewFolder | C::Paste | C::Terminal => dir.is_none(),
+                C::Back => !tab.is_some_and(|t| t.history.can_go_back()),
+                C::Forward => !tab.is_some_and(|t| t.history.can_go_forward()),
+                C::Eject => !ejectable,
+                C::NextTab | C::PreviousTab => tabs < 2,
+                _ => false,
+            };
+            if off {
+                disabled.insert(cmd.tag());
+            }
+        }
+        if let Some(t) = tab {
+            checked.insert(match t.view.view {
+                file_list::ViewMode::Grid => C::AsGrid,
+                file_list::ViewMode::List => C::AsList,
+                file_list::ViewMode::Columns => C::AsColumns,
+            }.tag());
+            checked.insert(match t.view.sort.column {
+                neutron_core::SortColumn::Name => C::SortName,
+                neutron_core::SortColumn::Kind => C::SortKind,
+                neutron_core::SortColumn::Modified => C::SortModified,
+                neutron_core::SortColumn::Created => C::SortCreated,
+                neutron_core::SortColumn::Size => C::SortSize,
+            }.tag());
+            if t.view.show_hidden {
+                checked.insert(C::ShowHidden.tag());
+            }
+        }
+        if self.preview.open {
+            checked.insert(C::ShowPreview.tag());
+        }
+        neutron_shell::menubar::set_state(disabled, checked);
+    }
+
     fn clear_cut_marks(&mut self) {
         self.cut_dir = None;
         self.cut_names.clear();
@@ -2910,6 +3073,16 @@ impl eframe::App for NeutronApp {
         for delta in neutron_shell::quicklook::take_moves() {
             actions.push(Action::MoveCursor { delta, extend: false });
         }
+        // The menu bar. Its items are disabled while a dialog is open, but a
+        // choice made just before one opened is dropped here too.
+        for tag in neutron_shell::menubar::take_chosen() {
+            if self.modal() {
+                continue;
+            }
+            if let Some(action) = crate::menubar::Cmd::from_tag(tag).and_then(|c| self.menu_command(c)) {
+                actions.push(action);
+            }
+        }
 
         // Before every other panel: it claims the top strip, and the rest
         // lay out inside what is left.
@@ -2955,6 +3128,7 @@ impl eframe::App for NeutronApp {
             self.apply(&ctx, action);
         }
         self.quick_look_follow();
+        self.publish_menu_state(&ctx);
 
         self.startup.mark_frame(frame_started.elapsed());
     }

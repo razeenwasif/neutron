@@ -15,3 +15,7 @@ pub fn read() -> Option<(Vec<PathBuf>, Transfer)> {
 pub fn can_paste_into(_paths: &[PathBuf], _destination: &Path) -> bool {
     false
 }
+
+pub fn write_text(_text: &str) -> Result<(), String> {
+    Err("the clipboard is not available here".into())
+}

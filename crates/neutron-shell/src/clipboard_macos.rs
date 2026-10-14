@@ -21,3 +21,8 @@ pub fn can_paste_into(paths: &[PathBuf], destination: &Path) -> bool {
     let existing: Vec<PathBuf> = paths.iter().filter_map(|p| p.canonicalize().ok()).collect();
     !existing.is_empty() && !existing.iter().any(|p| destination.starts_with(p))
 }
+
+/// Puts plain text on the clipboard: a path, as Copy Path writes it.
+pub fn write_text(text: &str) -> Result<(), String> {
+    super::macos::call(serde_json::json!({"action":"clipboard-text", "text":text})).map(|_| ())
+}

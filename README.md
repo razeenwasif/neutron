@@ -93,7 +93,8 @@ public distribution requires Developer ID signing and notarization.
 
 ### On the Mac
 
-The keys follow the Finder's:
+The menu bar has File, Edit, View, Go and Window menus laid out as the
+Finder's, with every command below in them. The keys follow the Finder's:
 
 | Key | Does |
 |---|---|

@@ -318,3 +318,8 @@ mod tests {
         assert!(!can_paste_into(&[], Path::new(r"C:\anywhere")));
     }
 }
+
+/// Plain text on the clipboard is offered by the Mac build only, so far.
+pub fn write_text(_text: &str) -> Result<(), String> {
+    Err("copying text is not supported here yet".into())
+}
