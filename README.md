@@ -112,6 +112,7 @@ Finder's, with every command below in them. The keys follow the Finder's:
 | `⌘⇧]`, `⌘⇧[`, `⌃⇥` | Next and previous tab |
 | `⌘E` | Eject the disk this folder is on |
 | `⌘K` | Connect to a server |
+| `⌘N`, `⌘W` | New window; close the tab, or the window on its last tab |
 | `⌃⌘T` | Add the folder to the sidebar |
 | `⌘⇧.` | Show hidden files |
 
@@ -598,7 +599,7 @@ do not.
 | `Ctrl+C` `Ctrl+X` `Ctrl+V` | Copy / cut / paste, through the real Windows clipboard |
 | `F2` | Rename in place, with the stem selected |
 | `Ctrl+Shift+N` | New folder, ready to be named |
-| `Ctrl+N` | Open a second window here |
+| `Ctrl+N` | Open another window here — in the same Neutron, sharing its caches, jobs and undo history |
 | ``Ctrl+` `` | Open a terminal here — see `docs/terminal.md` |
 | `Ctrl+H` | Show hidden files |
 | `Ctrl+Shift+L` | Cycle the view: list, grid, columns |

@@ -129,25 +129,6 @@ pub fn open_at(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Opens another Neutron window showing `dir`.
-///
-/// A second process rather than a second viewport: every piece of per-window
-/// state in this application — the workspace, the icon atlas, the apartment
-/// pool — is owned by the process, and threading a second window through all of
-/// it is a rewrite. Two processes cost about 300MB of driver-side GPU memory
-/// each and share nothing, which is the honest trade and is why this is a
-/// deliberate action rather than something that happens by accident.
-pub fn new_window(dir: &Path) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("{e}"))?;
-    let mut command = std::process::Command::new(exe);
-    command.arg(dir);
-    detach(&mut command);
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("could not open a second window: {e}"))
-}
-
 /// Starts `program`, passing `dir` after `args` when `dir_is_argument`, and
 /// otherwise as the working directory.
 fn spawn(
@@ -181,18 +162,6 @@ fn console(command: &mut std::process::Command) {
 
 #[cfg(not(windows))]
 fn console(_command: &mut std::process::Command) {}
-
-/// A second window must outlive the one that opened it, and must not inherit a
-/// console.
-#[cfg(windows)]
-fn detach(command: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    command.creation_flags(DETACHED_PROCESS);
-}
-
-#[cfg(not(windows))]
-fn detach(_command: &mut std::process::Command) {}
 
 #[cfg(test)]
 mod tests {

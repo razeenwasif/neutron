@@ -104,31 +104,7 @@ fn main() -> eframe::Result<()> {
         .map(|a| std::path::absolute(a).map_or_else(|_| a.clone(), |p| p.to_string_lossy().into_owned()));
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Neutron")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([720.0, 420.0])
-            // Neutron draws its own title bar. A system one sits above the
-            // layout as a separate strip in the OS's colours and corner radius,
-            // and nothing done inside the window makes the two read as one
-            // object. See `chrome.rs`, including what has to be put back by
-            // hand once the OS stops drawing the frame.
-            .with_decorations(cfg!(target_os = "macos"))
-            .with_fullsize_content_view(cfg!(target_os = "macos"))
-            .with_title_shown(!cfg!(target_os = "macos"))
-            .with_titlebar_shown(!cfg!(target_os = "macos"))
-            .with_titlebar_buttons_shown(true)
-            .with_resizable(true)
-            // On the Mac the window is transparent so that Neutron can round
-            // its corners itself, and paints a solid ground inside them; see
-            // `theme::paint_ground`. Metal composites a transparent surface.
-            .with_transparent(cfg!(target_os = "macos"))
-            // The OS traces a transparent window's shadow around whatever is
-            // drawn. With the ground solid that is the rounded window, which is
-            // the shadow a window should have. (When the cards floated over the
-            // desktop it traced each card's own shadow instead, and was off.)
-            .with_has_shadow(true)
-            .with_icon(app_icon()),
+        viewport: window_builder().with_inner_size([1280.0, 800.0]),
         // Not transparent on Windows. Measurement showed wgpu cannot provide a
         // surface with a transparent `CompositeAlphaMode` on any backend
         // available there (DX12, Vulkan, GL all logged the same rejection), so
@@ -162,6 +138,35 @@ fn main() -> eframe::Result<()> {
 
 /// The window icon, generated from assets/icon.svg by scripts/render-icon.sh.
 /// The macOS Dock uses the matching high-resolution ICNS in the app bundle.
+/// How every Neutron window is made: the first, and each opened with New
+/// Window, so they all have the same chrome.
+pub(crate) fn window_builder() -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_title("Neutron")
+        .with_min_inner_size([720.0, 420.0])
+        // Neutron draws its own title bar. A system one sits above the
+        // layout as a separate strip in the OS's colours and corner radius,
+        // and nothing done inside the window makes the two read as one
+        // object. See `chrome.rs`, including what has to be put back by
+        // hand once the OS stops drawing the frame.
+        .with_decorations(cfg!(target_os = "macos"))
+        .with_fullsize_content_view(cfg!(target_os = "macos"))
+        .with_title_shown(!cfg!(target_os = "macos"))
+        .with_titlebar_shown(!cfg!(target_os = "macos"))
+        .with_titlebar_buttons_shown(true)
+        .with_resizable(true)
+        // On the Mac the window is transparent so that Neutron can round
+        // its corners itself, and paints a solid ground inside them; see
+        // `theme::paint_ground`. Metal composites a transparent surface.
+        .with_transparent(cfg!(target_os = "macos"))
+        // The OS traces a transparent window's shadow around whatever is
+        // drawn. With the ground solid that is the rounded window, which is
+        // the shadow a window should have. (When the cards floated over the
+        // desktop it traced each card's own shadow instead, and was off.)
+        .with_has_shadow(true)
+        .with_icon(app_icon())
+}
+
 fn app_icon() -> egui::IconData {
     const RGBA: &[u8] = include_bytes!("../../../assets/icon_256.rgba");
     const SIZE: u32 = 256;

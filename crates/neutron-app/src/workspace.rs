@@ -185,15 +185,29 @@ pub struct Workspace {
     pub tabs: HashMap<TabId, Tab>,
     /// Pane that receives keyboard input.
     pub focused: GroupId,
-    next_tab: u64,
-    next_group: u64,
+}
+
+/// Tab and pane ids, unique across every window of the process.
+///
+/// Per-window counters would hand two windows the same ids, and everything
+/// that routes by id — listings coming back from the loader, egui's memory of
+/// each pane's scroll position — would deliver one window's to the other.
+static NEXT_TAB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NEXT_GROUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn fresh_tab() -> TabId {
+    TabId(NEXT_TAB.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+fn fresh_group() -> GroupId {
+    GroupId(NEXT_GROUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 impl Workspace {
     /// Creates a workspace with a single pane holding one tab at `location`.
     pub fn new(location: NodeId) -> Self {
-        let group_id = GroupId(0);
-        let tab_id = TabId(0);
+        let group_id = fresh_group();
+        let tab_id = fresh_tab();
 
         let mut groups = HashMap::new();
         groups.insert(
@@ -216,8 +230,6 @@ impl Workspace {
             groups,
             tabs,
             focused: group_id,
-            next_tab: 1,
-            next_group: 1,
         }
     }
 
@@ -255,8 +267,7 @@ impl Workspace {
 
     /// Opens a tab in `group` and focuses it. Returns the new tab's id.
     pub fn open_tab(&mut self, group: GroupId, location: NodeId, view: FileListState) -> TabId {
-        let id = TabId(self.next_tab);
-        self.next_tab += 1;
+        let id = fresh_tab();
 
         self.tabs.insert(id, Tab::new(id, location, view));
         if let Some(g) = self.groups.get_mut(&group) {
@@ -313,8 +324,7 @@ impl Workspace {
         let location = source.location().clone();
         let view = source.view.clone();
 
-        let new_group = GroupId(self.next_group);
-        self.next_group += 1;
+        let new_group = fresh_group();
 
         if !self.layout.split(group, axis, new_group) {
             return None;
@@ -696,8 +706,7 @@ impl Workspace {
             let Some(&target) = group_for_index.get(&split.target) else {
                 continue;
             };
-            let new_group = GroupId(ws.next_group);
-            ws.next_group += 1;
+            let new_group = fresh_group();
 
             let axis = if split.horizontal {
                 Axis::Horizontal

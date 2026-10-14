@@ -500,6 +500,19 @@ pub struct NeutronApp {
     clash_questions: std::collections::VecDeque<crate::transfers::Question>,
     /// What can be undone and redone.
     history: crate::undo::History,
+    /// The window being drawn: the first is the root viewport.
+    viewport: egui::ViewportId,
+    /// Origin of the window being drawn, as `WindowState::origin`.
+    origin: Option<egui::Pos2>,
+    /// The other windows, each with its state; see `WindowState`.
+    windows: Vec<WindowState>,
+    /// Counts windows opened, to name each viewport.
+    windows_opened: u64,
+    mail: Mail,
+    /// The window that opened Quick Look, which its arrow keys move.
+    look_window: Option<egui::ViewportId>,
+    /// The window a context menu being built was asked for in.
+    menu_window: Option<egui::ViewportId>,
     /// Changes made and reversals finished, reported from workers.
     undo_tx: crossbeam_channel::Sender<UndoEvent>,
     undo_rx: crossbeam_channel::Receiver<UndoEvent>,
@@ -794,6 +807,13 @@ impl NeutronApp {
             planned_rx,
             clash_questions: std::collections::VecDeque::new(),
             history: crate::undo::History::default(),
+            viewport: egui::ViewportId::ROOT,
+            origin: None,
+            windows: Vec::new(),
+            windows_opened: 0,
+            mail: Mail::default(),
+            look_window: None,
+            menu_window: None,
             undo_tx,
             undo_rx,
             watchers: std::collections::HashMap::new(),
@@ -1405,6 +1425,7 @@ impl NeutronApp {
             Action::QuickLookSelection if self.in_archive() && !neutron_shell::quicklook::is_open() => {
                 // Taken out first; the panel opens when the files are there.
                 if let Some((archive, entries)) = self.archive_selection() {
+                    self.look_window = Some(self.viewport);
                     let notices = self.notice_tx.clone();
                     self.sta.submit(move || match crate::archives::materialise(&archive, &entries) {
                         Ok(paths) => neutron_shell::quicklook::request(paths),
@@ -1417,6 +1438,7 @@ impl NeutronApp {
                     let _ = neutron_shell::quicklook::toggle(&[], 0);
                     self.quick_look_shown = None;
                 } else if let Some((paths, index, key)) = self.quick_look_subject() {
+                    self.look_window = Some(self.viewport);
                     match neutron_shell::quicklook::toggle(&paths, index) {
                         Ok(()) => self.quick_look_shown = Some(key),
                         Err(e) => self.notices.error(e),
@@ -1591,6 +1613,15 @@ impl NeutronApp {
                 if let Some(tab) = tab {
                     self.close_tab(ctx, tab);
                 }
+            }
+            // The last tab of a window closes the window, as Command-W does in
+            // the Finder — unless it is the only window, which stays open
+            // rather than quitting the application on a tab shortcut.
+            Action::CloseActiveTab
+                if self.workspace.tabs.len() == 1
+                    && (self.viewport != egui::ViewportId::ROOT || !self.windows.is_empty()) =>
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Action::CloseActiveTab => {
                 if let Some(tab) = active {
@@ -1827,7 +1858,8 @@ impl NeutronApp {
 
     /// Applies navigations a worker asked for once its work was done.
     fn drain_goto(&mut self) {
-        let wanted: Vec<_> = self.goto_rx.try_iter().collect();
+        let owned = &self.workspace.tabs;
+        let wanted = take_mine(&mut self.mail.goto, |(tab, _)| owned.contains_key(tab));
         for (tab, id) in wanted {
             self.navigate(tab, id);
         }
@@ -1835,7 +1867,8 @@ impl NeutronApp {
 
     /// Applies decisions made on an apartment thread about how to open a file.
     fn drain_open_as(&mut self) {
-        let decisions: Vec<_> = self.open_as_rx.try_iter().collect();
+        let owned = &self.workspace.tabs;
+        let decisions = take_mine(&mut self.mail.open_as, |(tab, ..)| owned.contains_key(tab));
         for (tab, path, as_folder) in decisions {
             if as_folder {
                 let name = path
@@ -2946,6 +2979,7 @@ impl NeutronApp {
         // sender releases whichever apartment thread is parked on the old one.
         self.menu = None;
         self.menu_reply = None;
+        self.menu_window = Some(self.viewport);
 
         let ctx_wake = self.ctx.clone();
         let done = self.refresh_tx.clone();
@@ -2986,7 +3020,10 @@ impl NeutronApp {
 
     /// Draws the open context menu and answers the thread waiting on it.
     fn context_menu_overlay(&mut self, ctx: &egui::Context, p: &neutron_ui::Palette) {
-        while let Ok(pending) = self.menu_rx.try_recv() {
+        // Only in the window it was asked for in.
+        let mine = self.menu_window.is_none_or(|w| w == self.viewport);
+        let pending_menus = if mine { std::mem::take(&mut self.mail.menus) } else { Vec::new() };
+        for pending in pending_menus {
             // Plugin rows are appended here rather than on the apartment
             // thread: this is the side that knows what is installed, and it is
             // also where the ids handed out have to be remembered.
@@ -3156,7 +3193,7 @@ impl NeutronApp {
     /// Opens what the system handed over: a folder in a new tab, a file in a
     /// new tab on its folder with the file selected.
     fn drain_opened(&mut self) {
-        while let Ok(paths) = self.opened.try_recv() {
+        for paths in std::mem::take(&mut self.mail.opened) {
             let Some(group) = self.workspace.focused_group().map(|g| g.id) else {
                 return;
             };
@@ -3300,16 +3337,200 @@ impl eframe::App for NeutronApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let frame_started = Instant::now();
         let ctx = ui.ctx().clone();
+
+        // Once a frame, for every window.
+        self.shared_frame(&ctx);
+
+        // The first window, then the others, each with its own state.
+        self.window_frame(ui);
+        // Closing the first window while others are open hands one of them
+        // the first window's place, rather than ending the application.
+        let hand_over = !self.windows.is_empty() && ctx.input(|i| i.viewport().close_requested());
+        if hand_over {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        self.other_windows(&ctx);
+        if hand_over {
+            self.hand_over_first_window();
+        }
+        // Anything no window took — work for a tab closed meanwhile.
+        self.mail = Mail::default();
+
+        self.startup.mark_frame(frame_started.elapsed());
+    }
+}
+
+/// What belongs to one window: its panes and tabs, and whatever is open in it.
+///
+/// The window being drawn has its state in the app's own fields, where the
+/// code that draws and acts has always found it. The others wait here, and
+/// each is swapped in for its own frame — so every function that reads
+/// `self.workspace` reads the workspace of the window it is running for,
+/// without being told there is more than one.
+struct WindowState {
+    viewport: egui::ViewportId,
+    /// Where a new window first appears; the OS keeps it after that.
+    origin: Option<egui::Pos2>,
+    workspace: Workspace,
+    confirm: Option<(crate::confirm::Confirm, Box<Action>, Option<Subject>)>,
+    address: Option<(GroupId, String)>,
+    type_ahead: String,
+    type_ahead_at: Option<Instant>,
+    quick_look_shown: Option<QuickLookKey>,
+    menu: Option<neutron_ui::MenuState>,
+    menu_reply: Option<crossbeam_channel::Sender<Option<u32>>>,
+    menu_actions: Vec<(u32, Action)>,
+    pending_menu_actions: std::cell::RefCell<Vec<(u32, Action)>>,
+    pin_target: Option<PathBuf>,
+    tab_target: Option<NodeId>,
+    edit_site_target: Option<String>,
+    tab_drag: Option<TabDrag>,
+    last_title: String,
+    finder: Finder,
+    connect: crate::connect::ConnectDialog,
+    preview: crate::preview::PreviewState,
+    previews: crate::preview::PreviewLoader,
+    rename: Option<RenameEdit>,
+    pending_rename: Option<(TabId, String)>,
+}
+
+impl WindowState {
+    fn new(ctx: &egui::Context, viewport: egui::ViewportId, origin: Option<egui::Pos2>, location: NodeId) -> Self {
+        Self {
+            viewport,
+            origin,
+            workspace: Workspace::new(location),
+            confirm: None,
+            address: None,
+            type_ahead: String::new(),
+            type_ahead_at: None,
+            quick_look_shown: None,
+            menu: None,
+            menu_reply: None,
+            menu_actions: Vec::new(),
+            pending_menu_actions: std::cell::RefCell::new(Vec::new()),
+            pin_target: None,
+            tab_target: None,
+            edit_site_target: None,
+            tab_drag: None,
+            last_title: String::new(),
+            finder: Finder::default(),
+            connect: crate::connect::ConnectDialog::default(),
+            preview: crate::preview::PreviewState::default(),
+            previews: crate::preview::PreviewLoader::spawn(ctx.clone()),
+            rename: None,
+            pending_rename: None,
+        }
+    }
+}
+
+/// What background work reported this frame, held until the window it is for
+/// has had its turn.
+///
+/// The channels are shared by every window, so they are emptied once, here,
+/// and each window takes what concerns its own tabs. Whatever is left when all
+/// have drawn — a listing for a tab closed meanwhile — is dropped.
+#[derive(Default)]
+struct Mail {
+    loads: Vec<(TabId, u64, LoadResult)>,
+    refreshes: Vec<TabId>,
+    open_as: Vec<(TabId, PathBuf, bool)>,
+    goto: Vec<(TabId, NodeId)>,
+    created: Vec<(TabId, String)>,
+    /// Folders that changed on disk. Every window looks at all of them.
+    changes: std::collections::HashSet<PathBuf>,
+    /// Files and folders the system asked Neutron to open.
+    opened: Vec<Vec<PathBuf>>,
+    /// Context menus built by the shell, for the window that asked.
+    menus: Vec<PendingMenu>,
+    /// Menu bar items chosen, for the window with focus.
+    chosen: Vec<u32>,
+    /// Arrow keys pressed in Quick Look, for the window that opened it.
+    moves: Vec<isize>,
+}
+
+/// Takes the items `mine` claims out of `all`, leaving the rest.
+fn take_mine<T>(all: &mut Vec<T>, mine: impl Fn(&T) -> bool) -> Vec<T> {
+    let (taken, rest): (Vec<T>, Vec<T>) = std::mem::take(all).into_iter().partition(|item| mine(item));
+    *all = rest;
+    taken
+}
+
+/// What a worker reports to the undo history.
+enum UndoEvent {
+    /// A change was made.
+    Did(crate::undo::Record),
+    /// An undo (or, with `undo` false, a redo) finished.
+    Reversed { undo: bool, record: crate::undo::Record, failed: Vec<String>, blocked: Vec<PathBuf> },
+}
+
+/// What the Quick Look panel was given: the tab, its cursor, and how many
+/// items — enough to tell when the panel has to follow.
+type QuickLookKey = (TabId, Option<usize>, usize);
+
+impl NeutronApp {
+    /// What is done once a frame however many windows are open: background
+    /// work pumped, shared caches fed, and the channels emptied into `mail`.
+    fn shared_frame(&mut self, ctx: &egui::Context) {
+        self.drain_places();
+        self.drain_sites();
+        while let Ok(state) = self.drive_rx.try_recv() {
+            // An answer ends any sign-in in progress; the sign-in's own
+            // result is the only thing sent while one runs.
+            self.drive_signing_in = false;
+            self.drive_state = state;
+        }
+        if self.clip_fail_rx.try_recv().is_ok() {
+            self.clear_cut_marks();
+        }
+        self.pump_archive_job();
+        self.pump_transfers();
+        self.pump_plugin(ctx);
+        self.pump_download();
+        self.pump_remote_job();
+        self.drain_notices(ctx);
+        self.sync_watchers(ctx);
+        self.pump_columns();
+        // Before drawing: installs icons that arrived since the last frame, so
+        // rows painted below pick them up immediately rather than a frame late.
+        self.icons.pump();
+        self.thumbs.pump();
+        self.icon_texture = self.icons.texture(ctx);
+        let previous_index_state = std::mem::discriminant(self.index.state());
+        self.index.pump();
+        if previous_index_state != std::mem::discriminant(self.index.state()) {
+            self.refresh_finder();
+        }
+        neutron_shell::quicklook::pump();
+        self.collect_mail();
+    }
+
+    /// Empties the shared channels into `mail`, for each window to take its
+    /// own from.
+    fn collect_mail(&mut self) {
+        while let Some(load) = self.loader.poll() {
+            self.mail.loads.push(load);
+        }
+        self.mail.refreshes.extend(self.refresh_rx.try_iter());
+        self.mail.open_as.extend(self.open_as_rx.try_iter());
+        self.mail.goto.extend(self.goto_rx.try_iter());
+        self.mail.created.extend(self.created_rx.try_iter());
+        self.mail.changes.extend(self.changed_rx.try_iter());
+        self.mail.opened.extend(self.opened.try_iter());
+        self.mail.menus.extend(self.menu_rx.try_iter());
+        self.mail.chosen.extend(neutron_shell::menubar::take_chosen());
+        self.mail.moves.extend(neutron_shell::quicklook::take_moves());
+    }
+
+    /// One window's frame: its share of the mail, its input, its drawing, and
+    /// the actions taken in it.
+    fn window_frame(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         let p = self.palette();
         let mut actions: Vec<Action> = Vec::new();
 
         // The ground the cards sit on. Painted onto a background layer so it
         // stays beneath every panel regardless of declaration order.
-        //
-        // No repaint is requested afterwards. The ground is still, so once a
-        // frame is drawn there is nothing that would make the next one differ:
-        // egui repaints on input and on an explicit request, and every worker
-        // that finishes already makes one of its own.
         let screen = ctx.content_rect();
         let bg = ui
             .painter()
@@ -3328,70 +3549,45 @@ impl eframe::App for NeutronApp {
             neutron_ui::ambient::paint(&bg, screen, &p);
         }
 
-        self.drain_places();
         self.drain_loads(&ctx);
         self.drain_refreshes();
         self.drain_open_as();
         self.drain_goto();
-        self.drain_sites();
-        while let Ok(state) = self.drive_rx.try_recv() {
-            // An answer ends any sign-in in progress; the sign-in's own
-            // result is the only thing sent while one runs.
-            self.drive_signing_in = false;
-            self.drive_state = state;
-        }
-        if self.clip_fail_rx.try_recv().is_ok() {
-            self.clear_cut_marks();
-        }
         self.clipboard_keys(&ctx, &mut actions);
-        while let Ok((tab, name)) = self.created_rx.try_recv() {
+        let tabs = &self.workspace.tabs;
+        for (tab, name) in take_mine(&mut self.mail.created, |(t, _)| tabs.contains_key(t)) {
             self.pending_rename = Some((tab, name));
         }
         self.open_pending_rename(&ctx);
-        // Before drawing: installs icons that arrived since the last frame, so
-        // rows painted below pick them up immediately rather than a frame late.
-        self.pump_archive_job();
-        self.pump_transfers();
-        self.pump_plugin(&ctx);
-        self.pump_download();
-        self.pump_remote_job();
-        self.drain_opened();
-        self.drain_notices(&ctx);
-        self.sync_watchers(&ctx);
+        // Opened from the Finder or the Dock: into the first window.
+        if self.viewport == egui::ViewportId::ROOT {
+            self.drain_opened();
+        }
         self.drain_changes();
         self.pump_preview(&ctx);
-        self.pump_columns();
-        self.icons.pump();
-        self.thumbs.pump();
-        self.icon_texture = self.icons.texture(&ctx);
-        let previous_index_state = std::mem::discriminant(self.index.state());
-        self.index.pump();
-        if previous_index_state != std::mem::discriminant(self.index.state()) {
-            self.refresh_finder();
-        }
         self.sync_finder_results();
-
-        // Before `keyboard`, not after: the menu *consumes* the arrows and
-        // Escape it uses, and `keyboard` only reads them. Drawn after the panes
-        // regardless — it lives on the foreground layer, so painting order is
-        // not what puts it on top.
         self.context_menu_overlay(&ctx, &p);
-
         self.keyboard(&ctx, &mut actions);
-        // Quick Look: a request from the menu's worker, and arrows pressed
-        // while the panel had the keyboard.
-        neutron_shell::quicklook::pump();
-        for delta in neutron_shell::quicklook::take_moves() {
-            actions.push(Action::MoveCursor { delta, extend: false });
-        }
-        // The menu bar. Its items are disabled while a dialog is open, but a
-        // choice made just before one opened is dropped here too.
-        for tag in neutron_shell::menubar::take_chosen() {
-            if self.modal() {
-                continue;
+
+        // The menu bar acts on the window with focus; Quick Look's arrows on
+        // the window that opened it.
+        let focused = ctx
+            .input(|i| i.viewport().focused)
+            .unwrap_or(self.viewport == egui::ViewportId::ROOT && self.windows.is_empty());
+        let looks_here = self.look_window.map_or(focused, |w| w == self.viewport);
+        if looks_here {
+            for delta in std::mem::take(&mut self.mail.moves) {
+                actions.push(Action::MoveCursor { delta, extend: false });
             }
-            if let Some(action) = crate::menubar::Cmd::from_tag(tag).and_then(|c| self.menu_command(c)) {
-                actions.push(action);
+        }
+        if focused {
+            for tag in std::mem::take(&mut self.mail.chosen) {
+                if self.modal() {
+                    continue;
+                }
+                if let Some(action) = crate::menubar::Cmd::from_tag(tag).and_then(|c| self.menu_command(c)) {
+                    actions.push(action);
+                }
             }
         }
 
@@ -3404,15 +3600,11 @@ impl eframe::App for NeutronApp {
         self.action_rail(ui, &p, &mut actions);
         self.preview_pane(ui, &p);
         self.panes(ui, &p, &mut actions);
-        // Drawn now, so spent. See `Workspace::consume_scroll_requests`.
         self.workspace.consume_scroll_requests();
 
-        // After every panel: the eight grip regions sit on top of whatever
-        // is under the window edge, and an undecorated window has no resize
-        // border of its own.
         crate::chrome::resize_edges(ui, screen);
 
-        // Drawn last so it covers everything, and after input routing so the
+        // Overlays draw after the panes so they sit on top of them, and the
         // overlay's own keys win while it is open.
         self.finder_overlay(ui, &p, &mut actions);
         self.connect_overlay(ui, &p, &mut actions);
@@ -3421,7 +3613,6 @@ impl eframe::App for NeutronApp {
         // touched, and its scrim has to cover the overlays too.
         self.confirm_overlay(ui, &p);
         self.clash_overlay(ui, &p);
-
 
         // Queued *after* drawing so a `DropTab` pushed by a tab strip this
         // frame is applied first. Pushed before it, this would clear the drag
@@ -3438,24 +3629,112 @@ impl eframe::App for NeutronApp {
         for action in actions {
             self.apply(&ctx, action);
         }
-        self.quick_look_follow();
-        self.publish_menu_state(&ctx);
+        if looks_here {
+            self.quick_look_follow();
+        }
+        if focused {
+            self.publish_menu_state(&ctx);
+        }
+    }
 
-        self.startup.mark_frame(frame_started.elapsed());
+    /// Draws every window but the first, each with its state swapped in.
+    fn other_windows(&mut self, ctx: &egui::Context) {
+        let mut i = 0;
+        while i < self.windows.len() {
+            let mut window = self.windows.remove(i);
+            self.swap_window(&mut window);
+            let mut builder = crate::window_builder().with_inner_size([1100.0, 720.0]);
+            if let Some(at) = self.origin {
+                builder = builder.with_position(at);
+            }
+            let mut closing = false;
+            ctx.show_viewport_immediate(self.viewport, builder, |ui, _class| {
+                self.window_frame(ui);
+                closing = ui.ctx().input(|i| i.viewport().close_requested());
+            });
+            self.swap_window(&mut window);
+            if closing {
+                self.forget_window(window);
+            } else {
+                self.windows.insert(i, window);
+                i += 1;
+            }
+        }
+    }
+
+    /// The first window was closed while others are open: the first of those
+    /// moves into it, and what the first window showed is let go.
+    fn hand_over_first_window(&mut self) {
+        if self.windows.is_empty() {
+            return;
+        }
+        let mut window = self.windows.remove(0);
+        self.swap_window(&mut window);
+        // The state moves; the windows stay. The first window is still the
+        // root viewport, and the one emptied is not drawn again, so it closes.
+        std::mem::swap(&mut self.viewport, &mut window.viewport);
+        self.origin = None;
+        self.forget_window(window);
+    }
+
+    /// Lets go of a closed window's tabs.
+    fn forget_window(&mut self, window: WindowState) {
+        for tab in window.workspace.tabs.keys() {
+            self.loader.forget(*tab);
+        }
+        if self.look_window == Some(window.viewport) {
+            self.look_window = None;
+        }
+        if self.menu_window == Some(window.viewport) {
+            self.menu_window = None;
+        }
+    }
+
+    /// Exchanges the window being drawn's state with `window`'s.
+    fn swap_window(&mut self, window: &mut WindowState) {
+        use std::mem::swap;
+        swap(&mut self.viewport, &mut window.viewport);
+        swap(&mut self.origin, &mut window.origin);
+        swap(&mut self.workspace, &mut window.workspace);
+        swap(&mut self.confirm, &mut window.confirm);
+        swap(&mut self.address, &mut window.address);
+        swap(&mut self.type_ahead, &mut window.type_ahead);
+        swap(&mut self.type_ahead_at, &mut window.type_ahead_at);
+        swap(&mut self.quick_look_shown, &mut window.quick_look_shown);
+        swap(&mut self.menu, &mut window.menu);
+        swap(&mut self.menu_reply, &mut window.menu_reply);
+        swap(&mut self.menu_actions, &mut window.menu_actions);
+        swap(&mut self.pending_menu_actions, &mut window.pending_menu_actions);
+        swap(&mut self.pin_target, &mut window.pin_target);
+        swap(&mut self.tab_target, &mut window.tab_target);
+        swap(&mut self.edit_site_target, &mut window.edit_site_target);
+        swap(&mut self.tab_drag, &mut window.tab_drag);
+        swap(&mut self.last_title, &mut window.last_title);
+        swap(&mut self.finder, &mut window.finder);
+        swap(&mut self.connect, &mut window.connect);
+        swap(&mut self.preview, &mut window.preview);
+        swap(&mut self.previews, &mut window.previews);
+        swap(&mut self.rename, &mut window.rename);
+        swap(&mut self.pending_rename, &mut window.pending_rename);
+    }
+
+    /// An id for one of a window's own panels. The first window keeps the
+    /// plain name, so the widths egui saved for its panels still apply; the
+    /// others add their viewport, so two windows' sidebars are never taken
+    /// for the same one where viewports share a pass.
+    fn window_id(&self, name: &str) -> egui::Id {
+        if self.viewport == egui::ViewportId::ROOT {
+            egui::Id::new(name)
+        } else {
+            egui::Id::new((name, self.viewport))
+        }
+    }
+
+    /// Every window's workspace: the one being drawn, and the others.
+    fn workspaces(&self) -> impl Iterator<Item = &Workspace> {
+        std::iter::once(&self.workspace).chain(self.windows.iter().map(|w| &w.workspace))
     }
 }
-
-/// What a worker reports to the undo history.
-enum UndoEvent {
-    /// A change was made.
-    Did(crate::undo::Record),
-    /// An undo (or, with `undo` false, a redo) finished.
-    Reversed { undo: bool, record: crate::undo::Record, failed: Vec<String>, blocked: Vec<PathBuf> },
-}
-
-/// What the Quick Look panel was given: the tab, its cursor, and how many
-/// items — enough to tell when the panel has to follow.
-type QuickLookKey = (TabId, Option<usize>, usize);
 
 /// Whether the preview pane was showing when the last session was saved.
 ///
@@ -3545,7 +3824,8 @@ impl NeutronApp {
     /// Re-lists tabs whose contents a finished shell operation may have changed.
     fn drain_refreshes(&mut self) {
         // Collected first because refreshing borrows `self` mutably.
-        let tabs: Vec<TabId> = self.refresh_rx.try_iter().collect();
+        let owned = &self.workspace.tabs;
+        let tabs = take_mine(&mut self.mail.refreshes, |tab| owned.contains_key(tab));
         for tab in tabs {
             self.refresh_in_place(tab);
         }
@@ -3556,7 +3836,9 @@ impl NeutronApp {
         // borrows `self.workspace` mutably for the whole body.
         let mut cleared_remote_note = false;
 
-        while let Some((tab_id, generation, result)) = self.loader.poll() {
+        let tabs = &self.workspace.tabs;
+        let mine = take_mine(&mut self.mail.loads, |(tab, ..)| tabs.contains_key(tab));
+        for (tab_id, generation, result) in mine {
             let Some(tab) = self.workspace.tabs.get_mut(&tab_id) else {
                 continue;
             };
@@ -5000,7 +5282,7 @@ impl NeutronApp {
         // A toast over the foot of the window, sized to what it says, rather
         // than a panel: a panel takes its height from every pane for as long
         // as a notice stands, and sits wherever the layout puts it.
-        egui::Area::new(egui::Id::new("status_bar"))
+        egui::Area::new(self.window_id("status_bar"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
             .show(ui.ctx(), |ui| {
@@ -5351,16 +5633,30 @@ impl NeutronApp {
     }
 
     /// Opens a second Neutron window on the focused tab's folder.
+    /// Opens another window on the focused tab's location, in this process:
+    /// its own panes and tabs, sharing everything else — the icon cache, the
+    /// places, the jobs, the undo history.
     fn new_window(&mut self) {
-        let Some(dir) = self.focused_folder("open a window in") else {
-            return;
-        };
-        let notices = self.notice_tx.clone();
-        self.sta.submit(move || {
-            if let Err(e) = neutron_shell::terminal::new_window(&dir) {
-                report(&notices, format!("Could not open a second window: {e}"));
-            }
-        });
+        let location = self.workspace.active_tab().map(|t| t.location().clone()).unwrap_or(NodeId::Home);
+        let view = self.workspace.view_for_new_tab();
+        self.windows_opened += 1;
+        let viewport = egui::ViewportId::from_hash_of(("neutron-window", self.windows_opened));
+        // A step down and across from the window it was opened from, as each
+        // new document window steps from the last.
+        let step = 28.0 * (self.windows.len() + 1) as f32;
+        let origin = self.ctx.input(|i| i.viewport().outer_rect).map(|r| r.min + egui::vec2(step, step));
+        let mut window = WindowState::new(&self.ctx, viewport, origin, location.clone());
+        if let Some(tab) = window.workspace.active_tab_mut() {
+            tab.view = view;
+        }
+        // Loaded with the new window's state in place, so the load is for its
+        // tab and lands there.
+        self.swap_window(&mut window);
+        if let Some(tab) = self.workspace.active_tab_id() {
+            self.reload(tab, location);
+        }
+        self.swap_window(&mut window);
+        self.windows.push(window);
     }
 
     /// The focused tab's folder, or a notice saying why there isn't one.
@@ -5811,10 +6107,11 @@ impl NeutronApp {
         // only the active tab would leave it showing whatever was true when it
         // was last on screen. The cost is a blocked thread per open tab, and
         // tabs are counted in ones.
+        // Every window's tabs: a watcher dropped because the window being
+        // drawn does not show its folder would leave another window stale.
         let wanted: HashSet<PathBuf> = self
-            .workspace
-            .tabs
-            .values()
+            .workspaces()
+            .flat_map(|w| w.tabs.values())
             .filter_map(|t| t.location().as_path().map(Path::to_path_buf))
             .collect();
 
@@ -5844,7 +6141,8 @@ impl NeutronApp {
 
     /// Re-lists any tab showing a folder that changed on disk.
     fn drain_changes(&mut self) {
-        let changed: std::collections::HashSet<PathBuf> = self.changed_rx.try_iter().collect();
+        // Every window looks at every change: a folder can be open in several.
+        let changed = self.mail.changes.clone();
         if changed.is_empty() {
             return;
         }
@@ -6004,7 +6302,7 @@ impl NeutronApp {
             })
         });
 
-        egui::Panel::right("preview")
+        egui::Panel::right(self.window_id("preview"))
             .show_separator_line(false)
             .default_size(320.0)
             .size_range(egui::Rangef::new(220.0, 640.0))
@@ -6044,7 +6342,7 @@ impl NeutronApp {
             archive_busy: self.archive_job.is_some(),
         };
 
-        egui::Panel::left("action-rail")
+        egui::Panel::left(self.window_id("action-rail"))
             .show_separator_line(false)
             .resizable(false)
             .exact_size(crate::rail::WIDTH)
@@ -6078,7 +6376,7 @@ impl NeutronApp {
             .map(|t| format!("{} — Neutron", t.location().display_name()))
             .unwrap_or_else(|| "Neutron".to_owned());
 
-        egui::Panel::top("title-bar")
+        egui::Panel::top(self.window_id("title-bar"))
             .show_separator_line(false)
             .resizable(false)
             .exact_size(crate::chrome::HEIGHT)
@@ -6098,7 +6396,7 @@ impl NeutronApp {
     fn sidebar(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
         let current = self.workspace.active_tab().map(|t| t.location().clone());
 
-        egui::Panel::left("sidebar")
+        egui::Panel::left(self.window_id("sidebar"))
             .show_separator_line(false)
             .default_size(232.0)
             .size_range(egui::Rangef::new(180.0, 420.0))
@@ -6865,9 +7163,11 @@ impl NeutronApp {
         self.columns.pump();
 
         let mut wanted = Vec::new();
-        // Every pane is on screen, so every pane's active tab counts.
-        for group in self.workspace.groups.values() {
-            let Some(tab) = group.active_tab().and_then(|t| self.workspace.tabs.get(&t)) else {
+        // Every pane of every window is on screen, so every pane's active tab
+        // counts — the cache keeps only what is asked for.
+        let panes = self.workspaces().flat_map(|w| w.groups.values().map(move |g| (w, g)));
+        for (workspace, group) in panes {
+            let Some(tab) = group.active_tab().and_then(|t| workspace.tabs.get(&t)) else {
                 continue;
             };
             if tab.view.view != file_list::ViewMode::Columns {
@@ -7638,6 +7938,22 @@ mod screens {
             act(&mut harness, Action::Back);
             settle(&mut harness);
         }
+
+        // A second window: its own tabs, its listing routed to it.
+        act(&mut harness, Action::NewWindow);
+        settle(&mut harness);
+        {
+            let app = harness.state();
+            let second = &app.windows[0].workspace;
+            let tab = second.active_tab().expect("the new window has a tab");
+            assert!(!tab.list.is_empty(), "the new window's listing did not reach it");
+            assert!(
+                app.workspace.active_tab_id() != second.active_tab_id(),
+                "the windows share a tab id"
+            );
+        }
+        shoot(&mut harness, &out, "windows.png");
+        harness.state_mut().windows.clear();
 
         act(&mut harness, Action::Navigate(NodeId::Home));
         settle(&mut harness);
