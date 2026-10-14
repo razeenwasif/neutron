@@ -34,6 +34,7 @@ pub enum CommandId {
     Duplicate,
     Undo,
     Redo,
+    Share,
     Copy,
     Cut,
     Paste,
@@ -114,6 +115,7 @@ pub const ALL: &[CommandDef] = &[
     CommandDef { id: CommandId::Extract, title: "Extract this archive", hint: "" },
     CommandDef { id: CommandId::Compress, title: "Compress to a zip", hint: "" },
     CommandDef { id: CommandId::Duplicate, title: "Duplicate", hint: "" },
+    CommandDef { id: CommandId::Share, title: "Share the selection", hint: "" },
     CommandDef { id: CommandId::Undo, title: "Undo the last change to files", hint: "Ctrl+Z" },
     CommandDef { id: CommandId::Redo, title: "Redo the change just undone", hint: "Ctrl+Y" },
     CommandDef {

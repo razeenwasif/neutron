@@ -635,7 +635,9 @@ mod tests {
         )];
         let catalogue = crate::commands::catalogue(&plugins);
 
-        let hits = match_commands(&catalogue, "sha");
+        // Specific enough that no built-in also matches: "sha" alone finds
+        // "Share the selection" first.
+        let hits = match_commands(&catalogue, "sha2");
         let (invoke, row) = hits.first().expect("the plugin command should match");
         assert_eq!(row.primary, "Copy SHA-256 of the selection");
         assert_eq!(

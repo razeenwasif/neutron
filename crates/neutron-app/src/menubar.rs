@@ -27,6 +27,7 @@ pub enum Cmd {
     Duplicate,
     MakeAlias,
     QuickLook,
+    Share,
     Compress,
     Extract,
     MoveToTrash,
@@ -84,7 +85,7 @@ pub enum Cmd {
 impl Cmd {
     const ALL: &'static [Cmd] = &[
         Cmd::NewWindow, Cmd::NewTab, Cmd::NewFolder, Cmd::Open, Cmd::CloseTab, Cmd::GetInfo,
-        Cmd::Rename, Cmd::Duplicate, Cmd::MakeAlias, Cmd::QuickLook, Cmd::Compress, Cmd::Extract,
+        Cmd::Rename, Cmd::Duplicate, Cmd::MakeAlias, Cmd::QuickLook, Cmd::Share, Cmd::Compress, Cmd::Extract,
         Cmd::MoveToTrash, Cmd::DeleteImmediately, Cmd::Eject, Cmd::AddToSidebar, Cmd::Undo,
         Cmd::Redo, Cmd::Cut, Cmd::Copy, Cmd::Paste, Cmd::SelectAll, Cmd::CopyPath, Cmd::Filter,
         Cmd::SearchEverywhere, Cmd::FindFile, Cmd::CommandPalette, Cmd::AsGrid, Cmd::AsList,
@@ -151,6 +152,7 @@ pub fn menus() -> Vec<Menu> {
         item(Cmd::Duplicate, "Duplicate", cmd("d")),
         item(Cmd::MakeAlias, "Make Alias", None),
         item(Cmd::QuickLook, "Quick Look", cmd("y")),
+        item(Cmd::Share, "Share…", None),
         Separator,
         item(Cmd::Compress, "Compress", None),
         item(Cmd::Extract, "Extract", None),

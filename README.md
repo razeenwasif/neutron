@@ -122,7 +122,9 @@ keep both, skip, or replace (the replaced items go to the Trash). Disks appear
 and disappear in the sidebar as they are mounted and ejected, with an eject
 button beside the ones that can be. Finder tags show as coloured dots after a
 file's name; **Tags** in its menu sets the colour tags, and the sidebar's Tags
-section lists every file with one, found by Spotlight. A `.zip`, `.tar` or `.tar.gz` opens as a
+section lists every file with one, found by Spotlight. **Share…** in a file's
+menu (and in File) opens the system's share menu — AirDrop, Mail, Messages and
+the rest — and **AirDrop…** goes straight to AirDrop. A `.zip`, `.tar` or `.tar.gz` opens as a
 read-only folder you can browse, preview, Quick Look and copy out of;
 **Extract** in its menu unpacks the whole thing beside itself.
 

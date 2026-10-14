@@ -56,7 +56,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std", "block2", "objc2-core-foundation", "NSApplication", "NSBitmapImageRep",
     "NSColorSpace", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSGraphics",
-    "NSCell", "NSGraphicsContext", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSResponder",
+    "NSCell", "NSGraphicsContext", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSResponder", "NSSharingService",
     "NSView", "NSWindow", "NSWorkspace",
 ] }
 

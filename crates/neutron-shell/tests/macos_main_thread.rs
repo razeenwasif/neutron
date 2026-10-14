@@ -7,7 +7,8 @@ fn main() {
     drag_without_a_window_is_an_error_not_a_crash();
     quick_look_without_a_window_is_an_error_not_a_crash();
     menu_items_reach_the_app_and_follow_its_state();
-    println!("macos_main_thread: 4 passed");
+    sharing_without_a_window_is_an_error_not_a_crash();
+    println!("macos_main_thread: 5 passed");
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -107,4 +108,12 @@ fn menu_items_reach_the_app_and_follow_its_state() {
     assert!(eight.isEnabled());
     assert_eq!(eight.state(), 1, "a checked item was not ticked");
     assert_eq!(seven.state(), 0);
+}
+
+/// The share picker needs a window to point from; with none it says so.
+#[cfg(target_os = "macos")]
+fn sharing_without_a_window_is_an_error_not_a_crash() {
+    let err = neutron_shell::share::share(&[std::path::PathBuf::from("/tmp")], (10.0, 10.0)).expect_err("no window");
+    assert!(err.contains("window"), "{err}");
+    assert!(neutron_shell::share::share(&[], (0.0, 0.0)).is_ok(), "nothing to share is not an error");
 }

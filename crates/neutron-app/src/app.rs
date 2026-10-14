@@ -94,6 +94,10 @@ enum Action {
     CancelArchiveJob,
     /// Stop the copy or move with this id.
     StopTransfer(u64),
+    /// The system's Share menu for the chosen items.
+    Share,
+    /// Send the chosen items with AirDrop.
+    AirDrop,
     /// Give the chosen items a Finder tag, or take it away.
     ToggleTag { name: &'static str, on: bool },
     /// Go to the folder `.0` is in, with it selected.
@@ -1067,6 +1071,23 @@ impl NeutronApp {
             Action::CompressSelection => {
                 if !self.refuse_without_a_path("compress anything in") {
                     self.compress_selection();
+                }
+            }
+            Action::Share => {
+                let Some(paths) = self.chosen_paths() else { return };
+                // Where the pointer is — over the menu item just chosen — or
+                // the middle of the window, for a keystroke.
+                let at = ctx
+                    .input(|i| i.pointer.latest_pos())
+                    .unwrap_or_else(|| ctx.content_rect().center());
+                if let Err(e) = neutron_shell::share::share(&paths, (at.x, at.y)) {
+                    self.notices.error(e);
+                }
+            }
+            Action::AirDrop => {
+                let Some(paths) = self.chosen_paths() else { return };
+                if let Err(e) = neutron_shell::share::airdrop(&paths) {
+                    self.notices.error(e);
                 }
             }
             Action::ToggleTag { name, on } => {
@@ -2590,6 +2611,8 @@ impl NeutronApp {
                 rows.push(row("Extract", Action::ExtractSelection, &mut actions));
             }
             if cfg!(target_os = "macos") {
+                rows.push(row("Share…", Action::Share, &mut actions));
+                rows.push(row("AirDrop…", Action::AirDrop, &mut actions));
                 rows.push(MenuItem { accel: neutron_ui::format::shortcut("Cmd+I"), ..row("Get Info", Action::GetInfo(paths.clone()), &mut actions) });
                 rows.push(row("Make Alias", Action::MakeAlias(paths), &mut actions));
                 // Ticked where every selected item has the tag.
@@ -2686,6 +2709,7 @@ impl NeutronApp {
         items.push(MenuItem::separator());
         items.push(add(&mut next, "Copy", Action::Clip { cut: false }, &mut self.menu_actions, false));
         items.push(add(&mut next, "Get Info", Action::GetInfo(paths.clone()), &mut self.menu_actions, false));
+        items.push(add(&mut next, "Share…", Action::Share, &mut self.menu_actions, false));
         let tags = self.tags_submenu(&mut next);
         items.push(tags);
         items.push(MenuItem::separator());
@@ -2778,6 +2802,7 @@ impl NeutronApp {
             C::Duplicate => Action::Duplicate,
             C::MakeAlias => Action::MakeAlias(selection()?),
             C::QuickLook => Action::QuickLookSelection,
+            C::Share => Action::Share,
             C::Compress => Action::CompressSelection,
             C::Extract => Action::ExtractSelection,
             C::MoveToTrash => Action::Delete { permanent: false },
@@ -2857,7 +2882,7 @@ impl NeutronApp {
                 c if typing && c.edits_text() => true,
                 C::Undo => self.history.busy || self.history.undo_label().is_none(),
                 C::Redo => self.history.busy || self.history.redo_label().is_none(),
-                C::Open | C::GetInfo | C::Rename | C::Duplicate | C::MakeAlias | C::QuickLook | C::Compress
+                C::Open | C::GetInfo | C::Rename | C::Duplicate | C::MakeAlias | C::QuickLook | C::Share | C::Compress
                 | C::MoveToTrash | C::DeleteImmediately | C::Cut | C::Copy => selected.is_empty(),
                 C::Extract => !archive,
                 C::NewFolder | C::Paste | C::Terminal => dir.is_none(),
@@ -5260,6 +5285,7 @@ impl NeutronApp {
             C::Extract => Some(Action::ExtractSelection),
             C::Compress => Some(Action::CompressSelection),
             C::Duplicate => Some(Action::Duplicate),
+            C::Share => Some(Action::Share),
             C::Undo => Some(Action::Undo),
             C::Redo => Some(Action::Redo),
             C::DeleteSelection => Some(Action::Delete { permanent: false }),

@@ -80,6 +80,10 @@ pub mod icons;
 
 pub mod thumbnails;
 
+#[cfg_attr(target_os = "macos", path = "share_macos.rs")]
+#[cfg_attr(not(target_os = "macos"), path = "share_stub.rs")]
+pub mod share;
+
 #[cfg_attr(target_os = "macos", path = "tags_macos.rs")]
 #[cfg_attr(not(target_os = "macos"), path = "tags_stub.rs")]
 pub mod tags;
