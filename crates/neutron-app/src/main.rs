@@ -47,6 +47,7 @@ mod remote;
 mod remote_ops;
 mod plugins;
 mod sidebar;
+mod thumbs;
 mod startup;
 mod workspace;
 

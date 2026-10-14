@@ -778,6 +778,9 @@ pub struct Subject<'a> {
     pub size: Option<u64>,
     pub modified: i64,
     pub is_dir: bool,
+    /// The system's own preview, for what the pane cannot read itself: a PDF,
+    /// a film, a picture in a format it has no decoder for, or one too large.
+    pub thumb: Option<neutron_ui::thumb::Thumb>,
 }
 
 /// Draws the pane's contents into `ui`.
@@ -799,6 +802,17 @@ pub fn show(
 
     header(ui, p, &subject);
     ui.add_space(2.0);
+
+    // Text and decoded pictures are the pane's own and drawn at full size;
+    // for anything else, the system's preview stands in.
+    let own = matches!(state.content, Preview::Text { .. } | Preview::Image { .. });
+    if let Some(thumb) = subject.thumb.filter(|_| !own) {
+        let space = egui::vec2(ui.available_width(), ui.available_height().min(480.0));
+        let shown = neutron_ui::thumb::fitted_size(space, thumb.size);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(space.x, shown.y), egui::Sense::hover());
+        neutron_ui::thumb::paint(ui.painter(), rect, thumb, 14.0, false, false);
+        return;
+    }
 
     match &state.content {
         Preview::Nothing => {}

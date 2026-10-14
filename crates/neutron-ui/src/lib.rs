@@ -11,6 +11,7 @@ pub mod file_list;
 pub mod format;
 pub mod icons;
 pub mod theme;
+pub mod thumb;
 
 pub use context_menu::{MenuOutcome, MenuState};
 pub use file_list::Marks;

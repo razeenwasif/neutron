@@ -35,6 +35,8 @@ pub const COLUMN_WIDTH: f32 = 240.0;
 /// How narrow or wide a column can be dragged. Narrower than the minimum and
 /// an icon and three letters do not fit; wider than the maximum and one column
 /// is the whole pane.
+/// Tallest a preview gets in the info column.
+const PREVIEW_MAX_H: f32 = 220.0;
 /// Narrowest the info column gets: enough to read a name and its facts.
 const INFO_MIN: f32 = 280.0;
 const MIN_WIDTH: f32 = 140.0;
@@ -109,6 +111,8 @@ pub struct Info<'a> {
     pub location: String,
     /// Offer Quick Look: only where the system has it.
     pub quick_look: bool,
+    /// What is inside the file, shown in place of its tile when there is one.
+    pub preview: Option<crate::thumb::Thumb>,
 }
 
 /// Something the user did that the app must act on.
@@ -218,10 +222,23 @@ fn draw_info(ui: &mut Ui, p: &Palette, rect: Rect, info: &Info<'_>) -> Option<Co
     let inner = rect.shrink2(vec2(26.0, 26.0));
     let mut y = inner.top();
 
-    let kind = icons::FileKind::of(info.name, info.kind);
-    let tile = Rect::from_center_size(pos2(inner.center().x, y + 42.0), vec2(84.0, 84.0));
-    icons::tile(&painter, tile, kind, p, false);
-    y = tile.bottom() + 18.0;
+    match info.preview {
+        // As large as the column allows, up to a height that still leaves the
+        // facts and the buttons on screen.
+        Some(thumb) => {
+            let space = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), PREVIEW_MAX_H));
+            let drawn = crate::thumb::fit(space, thumb.size, false).0;
+            let space = space.translate(vec2(0.0, -(space.height() - drawn.height()) / 2.0));
+            let drawn = crate::thumb::paint(&painter, space, thumb, 12.0, false, false);
+            y = drawn.bottom() + 18.0;
+        }
+        None => {
+            let kind = icons::FileKind::of(info.name, info.kind);
+            let tile = Rect::from_center_size(pos2(inner.center().x, y + 42.0), vec2(84.0, 84.0));
+            icons::tile(&painter, tile, kind, p, false);
+            y = tile.bottom() + 18.0;
+        }
+    }
 
     let name = painter.layout(
         info.name.to_owned(),

@@ -3,7 +3,10 @@
 use egui::{Rect, Sense, Ui, ViewportCommand, pos2};
 use neutron_ui::theme::Palette;
 
-pub const HEIGHT: f32 = 38.0;
+/// Just enough to clear the traffic lights, which end about 22 points down:
+/// with the gutter under it, the cards start a little below them rather than
+/// leaving a band of empty ground across the top of the window.
+pub const HEIGHT: f32 = 20.0;
 
 /// The strip above the cards: somewhere to drag the window by, and nothing
 /// else. No title is drawn — the window is transparent, so text here would sit

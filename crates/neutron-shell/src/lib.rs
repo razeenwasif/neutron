@@ -78,6 +78,8 @@ pub mod shell_ns;
 /// it is gated.
 pub mod icons;
 
+pub mod thumbnails;
+
 pub mod sta;
 
 /// Documents macOS asks Neutron to open (Finder's Open With, the Dock icon).

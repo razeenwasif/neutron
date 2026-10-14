@@ -324,6 +324,8 @@ pub struct NeutronApp {
     /// Shell COM apartments, shared by every M3 service.
     sta: neutron_shell::sta::StaPool,
     icons: IconService,
+    /// Previews of what is inside files, for tiles, rows and the info column.
+    thumbs: crate::thumbs::Thumbnails,
 
     known_folders: Vec<Place>,
     /// Folders pinned to Quick access. Read once at start-up and kept here;
@@ -570,6 +572,7 @@ impl NeutronApp {
         let mut loader = Loader::spawn(cc.egui_ctx.clone());
         let sta = neutron_shell::sta::StaPool::spawn();
         let icons = IconService::new(sta.clone(), cc.egui_ctx.clone());
+        let thumbs = crate::thumbs::Thumbnails::new(cc.egui_ctx.clone());
         let (notice_tx, notice_rx) = crossbeam_channel::unbounded();
         let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
         let (open_as_tx, open_as_rx) = crossbeam_channel::unbounded();
@@ -646,6 +649,7 @@ impl NeutronApp {
             workspace,
             sta,
             icons,
+            thumbs,
             known_folders: Vec::new(),
             pins,
             pin_target: None,
@@ -2406,6 +2410,7 @@ impl eframe::App for NeutronApp {
         self.pump_preview(&ctx);
         self.pump_columns();
         self.icons.pump();
+        self.thumbs.pump();
         self.icon_texture = self.icons.texture(&ctx);
         let previous_index_state = std::mem::discriminant(self.index.state());
         self.index.pump();
@@ -4813,6 +4818,17 @@ impl NeutronApp {
         }
     }
 
+    /// A large preview of entry `idx` of `tab`, at `path`, if it is the kind
+    /// of file that has one — requested on first sight.
+    fn preview_of(&self, path: &Path, tab: &crate::workspace::Tab, idx: usize) -> Option<neutron_ui::thumb::Thumb> {
+        let (name, kind) = (tab.list.name(idx), tab.list.kind(idx));
+        // Not for a file still in the cloud: previewing it could fetch it.
+        if !neutron_ui::thumb::wants_preview(name, kind) || tab.list.sync(idx) == neutron_core::entry::SyncState::CloudOnly {
+            return None;
+        }
+        self.thumbs.get(path, tab.list.modified(idx), crate::thumbs::Grade::Large)
+    }
+
     fn preview_pane(&self, ui: &mut egui::Ui, p: &Palette) {
         if !self.preview.open {
             return;
@@ -4826,6 +4842,10 @@ impl NeutronApp {
                 size: Some(tab.list.size(idx)),
                 modified: tab.list.modified(idx),
                 is_dir: tab.list.kind(idx).is_container(),
+                thumb: tab
+                    .location()
+                    .as_path()
+                    .and_then(|dir| self.preview_of(&dir.join(tab.list.name(idx)), tab, idx)),
             })
         });
 
@@ -5431,6 +5451,7 @@ impl NeutronApp {
         // is non-empty and was uploaded by `pump` earlier this frame.
         let source = RowIcons {
             service: &self.icons,
+            thumbs: &self.thumbs,
             texture: self.icon_texture,
             dir: tab.location().as_path().map(|p| p.to_path_buf()),
         };
@@ -5522,6 +5543,7 @@ impl NeutronApp {
             .iter()
             .map(|d| RowIcons {
                 service: &self.icons,
+                thumbs: &self.thumbs,
                 texture: self.icon_texture,
                 dir: Some(d.to_path_buf()),
             })
@@ -5582,6 +5604,7 @@ impl NeutronApp {
             modified: tab.list.modified(idx),
             location: tidy_location(dir),
             quick_look: cfg!(target_os = "macos"),
+            preview: self.preview_of(&dir.join(tab.list.name(idx)), tab, idx),
         });
 
         if let Some(a) = neutron_ui::columns::show(ui, p, &columns, info.as_ref()) {
@@ -6015,6 +6038,7 @@ fn list_action(a: FileListAction) -> Action {
 /// same for every row in the pane.
 struct RowIcons<'a> {
     service: &'a IconService,
+    thumbs: &'a crate::thumbs::Thumbnails,
     texture: Option<egui::TextureId>,
     dir: Option<PathBuf>,
 }
@@ -6033,6 +6057,13 @@ impl file_list::IconSource for RowIcons<'_> {
         let slot = self.service.slot(&key)?;
         self.texture?;
         Some(self.service.uv(slot))
+    }
+
+    fn preview(&self, name: &str, _kind: neutron_core::EntryKind, modified: i64) -> Option<neutron_ui::thumb::Thumb> {
+        // A folder with no path — a server, a shell location — has nothing
+        // the system could preview.
+        let dir = self.dir.as_deref()?;
+        self.thumbs.get(&dir.join(name), modified, crate::thumbs::Grade::Small)
     }
 }
 

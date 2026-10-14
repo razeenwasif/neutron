@@ -153,6 +153,12 @@ pub trait IconSource {
     /// UV rect for this entry's icon, or `None` while it is still unresolved —
     /// in which case the row falls back to the drawn glyph.
     fn uv_for(&self, name: &str, kind: EntryKind) -> Option<egui::Rect>;
+    /// A preview of what is inside the file, or `None` while there is none
+    /// yet — asking is what requests it, as with `uv_for`. `modified` keys it,
+    /// so an edited file is previewed afresh.
+    fn preview(&self, _name: &str, _kind: EntryKind, _modified: i64) -> Option<crate::thumb::Thumb> {
+        None
+    }
 }
 
 /// Draws the listing in whichever view mode is active.
@@ -1041,17 +1047,28 @@ fn draw_row(
     // a folder of mixed files can be scanned by colour. Applications keep the
     // icon they ship with: theirs is the only way to tell one from another.
     let tile = Rect::from_center_size(pos2(x + ICON_SLOT / 2.0 - 4.0, outer.center().y), vec2(28.0, 28.0));
+    // Pictures and films show themselves, cropped to the tile's square.
+    let file_kind = icons::FileKind::of(list.name(idx), kind);
+    // Not for a file whose contents are still in the cloud: previewing it
+    // could fetch it.
+    let thumb = icons
+        .filter(|_| matches!(file_kind, icons::FileKind::Image | icons::FileKind::Video))
+        .filter(|_| list.sync(idx) != SyncState::CloudOnly)
+        .and_then(|src| src.preview(list.name(idx), kind, list.modified(idx)));
     let real = icons
         .filter(|_| is_application(list.name(idx)))
         .and_then(|src| src.uv_for(list.name(idx), kind).map(|uv| (src, uv)));
-    match real {
-        Some((src, uv)) => {
+    match (thumb, real) {
+        (Some(thumb), _) => {
+            crate::thumb::paint(ui.painter(), tile, thumb, 9.0, true, hidden);
+        }
+        (None, Some((src, uv))) => {
             let mut mesh = egui::Mesh::with_texture(src.texture());
             let tint = if hidden { Color32::from_white_alpha(110) } else { Color32::WHITE };
             mesh.add_rect_with_uv(tile.shrink(1.0), uv, tint);
             ui.painter().add(egui::Shape::mesh(mesh));
         }
-        None => icons::tile(ui.painter(), tile, icons::FileKind::of(list.name(idx), kind), p, hidden),
+        (None, None) => icons::tile(ui.painter(), tile, file_kind, p, hidden),
     }
     x += ICON_SLOT + 6.0;
 
@@ -1394,19 +1411,29 @@ fn draw_tile(
 
     // A tinted plate for the kind, as in the list. Applications keep the icon
     // they ship with.
+    //
+    // A file with something to look at shows it instead, as large as the
+    // tile's art area allows.
     let icon_centre = pos2(rect.center().x, rect.top() + 14.0 + TILE_ICON / 2.0);
+    let art = Rect::from_center_size(icon_centre, vec2(TILE_W - 24.0, TILE_ICON + 8.0));
+    let thumb = icons
+        .filter(|_| crate::thumb::wants_preview(name, kind) && list.sync(idx) != SyncState::CloudOnly)
+        .and_then(|src| src.preview(name, kind, list.modified(idx)));
     let real = icons
         .filter(|_| is_application(name))
         .and_then(|src| src.uv_for(name, kind).map(|uv| (src, uv)));
-    match real {
-        Some((src, uv)) => {
+    match (thumb, real) {
+        (Some(thumb), _) => {
+            crate::thumb::paint(ui.painter(), art, thumb, 8.0, false, hidden);
+        }
+        (None, Some((src, uv))) => {
             let icon_rect = Rect::from_center_size(icon_centre, vec2(TILE_APP_ICON, TILE_APP_ICON));
             let mut mesh = egui::Mesh::with_texture(src.texture());
             let tint = if hidden { Color32::from_white_alpha(110) } else { Color32::WHITE };
             mesh.add_rect_with_uv(icon_rect, uv, tint);
             ui.painter().add(egui::Shape::mesh(mesh));
         }
-        None => icons::tile(
+        (None, None) => icons::tile(
             ui.painter(),
             Rect::from_center_size(icon_centre, vec2(TILE_ICON, TILE_ICON)),
             icons::FileKind::of(name, kind),

@@ -2,6 +2,7 @@
 // stdout. Secrets never appear in command-line arguments or diagnostic output.
 import AppKit
 import Foundation
+import QuickLookThumbnailing
 import Security
 
 struct Request: Decodable {
@@ -14,6 +15,10 @@ struct Request: Decodable {
     var target: String? = nil
     var secret: String? = nil
     var text: String? = nil
+    // Optional rather than defaulted: synthesized decoding still requires a
+    // key that has a default value, and most requests have no use for these.
+    var outputs: [String]? = nil
+    var size: Int? = nil
 }
 struct BridgeError: LocalizedError {
     let message: String
@@ -68,6 +73,33 @@ func each(_ jobs: [(URL, URL)], verb: String, suffix: String = "", _ body: (URL,
     if jobs.count == 1 { throw BridgeError(message: failures[0]) }
     throw BridgeError(message: "Could not \(verb) \(failures.count) of \(jobs.count) items\(suffix): " + failures.joined(separator: "; "))
 }
+/// Quick Look's own preview of `url` — the picture, the first page of a PDF, a
+/// frame of a film — at most `side` pixels across, written to `out` as a PNG.
+///
+/// Only a real preview counts. Where Quick Look has nothing better than the
+/// file's icon the answer is false, and the app keeps its own tile.
+func thumbnail(_ url: URL, side: CGFloat, to out: URL) -> Bool {
+    let request = QLThumbnailGenerator.Request(
+        fileAt: url, size: CGSize(width: side, height: side), scale: 1, representationTypes: .thumbnail)
+    final class Box: @unchecked Sendable { var image: CGImage? }
+    let box = Box()
+    let done = DispatchSemaphore(value: 0)
+    QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
+        box.image = representation?.cgImage
+        done.signal()
+    }
+    // A preview that has not arrived by now is not arriving usefully: a disk
+    // that is asleep, or a preview extension that has hung.
+    if done.wait(timeout: .now() + 8) == .timedOut {
+        QLThumbnailGenerator.shared.cancel(request)
+        return false
+    }
+    guard let image = box.image,
+          let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+    else { return false }
+    return (try? png.write(to: out, options: .atomic)) != nil
+}
+
 func run(_ r: Request) throws -> Any {
     let fm = FileManager.default
     let urls = r.paths.map { URL(fileURLWithPath: $0) }
@@ -169,6 +201,15 @@ func run(_ r: Request) throws -> Any {
         let pb = NSPasteboard.general
         let items = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
         return ["paths": items.map { $0.path }, "move": pb.string(forType: cutType) == "move"] as [String: Any]
+    case "thumbnails":
+        // Many to a request: starting this helper costs more than most
+        // previews do to make.
+        let outputs = r.outputs ?? []
+        guard outputs.count == r.paths.count else { throw BridgeError(message: "Each preview needs somewhere to go") }
+        let side = CGFloat(max(16, min(r.size ?? 256, 2048)))
+        return zip(r.paths, outputs).map { path, out in
+            thumbnail(URL(fileURLWithPath: path), side: side, to: URL(fileURLWithPath: out))
+        }
     case "credential-store", "credential-load", "credential-clear":
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Neutron", kSecAttrAccount as String: try require(r.target)]

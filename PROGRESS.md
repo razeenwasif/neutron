@@ -114,10 +114,17 @@
   never becomes a 48MB texture. The pane reports the file's real dimensions.
 - Text is capped at 256KB, monospaced and unwrapped — a config file is read for
   its structure, and soft-wrapping destroys exactly that.
-- Not done: `IPreviewHandler`, which is how Explorer shows PDFs and Office
-  documents. Those render into an `HWND` the host supplies, which would mean
-  parenting a child window over the wgpu surface and keeping it aligned through
-  every scroll and split.
+- On the Mac, what the pane cannot read itself — PDFs, Office and iWork
+  documents, films, pictures in formats it has no decoder for, or too large to
+  decode — is shown as Quick Look's own preview. The same previews stand in for
+  the tile in the grid, beside pictures and films in the list, and in the
+  column view's info column. They are made by the Swift helper in batches,
+  cached on disk under `~/Library/Caches/Neutron/thumbnails` by path, date and
+  size, and only what is on screen this frame is asked for.
+- Not done on Windows: `IPreviewHandler`, which is how Explorer shows PDFs and
+  Office documents. Those render into an `HWND` the host supplies, which would
+  mean parenting a child window over the wgpu surface and keeping it aligned
+  through every scroll and split.
 
 #### 8. Live Listings
 - Every folder a tab is showing is watched with `ReadDirectoryChangesW`, so a
