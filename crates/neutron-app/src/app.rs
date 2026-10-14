@@ -38,6 +38,19 @@ const TYPE_AHEAD_TIMEOUT: Duration = Duration::from_millis(900);
 /// Key under which the workspace layout is stored between sessions.
 const STORAGE_KEY: &str = "neutron.workspace";
 
+/// Key under which the windows after the first are stored.
+const WINDOWS_KEY: &str = "neutron.windows";
+
+/// A window after the first, as saved between sessions.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedWindow {
+    workspace: crate::workspace::PersistedWorkspace,
+    preview: bool,
+    /// Where its top-left corner was, and how big it was, in points.
+    at: Option<[f32; 2]>,
+    size: Option<[f32; 2]>,
+}
+
 enum Action {
     RunCommand(commands::CommandId),
     Navigate(NodeId),
@@ -673,6 +686,9 @@ impl NeutronApp {
         let plugins = crate::plugins::PluginRuntime::load();
         let palette = commands::catalogue(&plugins.palette_entries());
 
+        // Only a launch with no path asked for brings back the other windows:
+        // `neutron ~/Downloads` is someone asking for one window, there.
+        let restore_windows = start_path.is_none();
         let mut workspace = Self::initial_workspace(cc, start_path);
         let mut loader = Loader::spawn(cc.egui_ctx.clone());
         let sta = neutron_shell::sta::StaPool::spawn();
@@ -757,7 +773,7 @@ impl NeutronApp {
             }
         }
 
-        Self {
+        let mut app = Self {
             theme_mode,
             startup,
             hwnd,
@@ -856,6 +872,40 @@ impl NeutronApp {
             menu_reply: None,
             menu_tx,
             menu_rx,
+        };
+        if restore_windows {
+            app.restore_windows(cc);
+        }
+        app
+    }
+
+    /// Reopens the windows after the first that were open when the last
+    /// session ended, each with its tabs loading.
+    fn restore_windows(&mut self, cc: &eframe::CreationContext<'_>) {
+        let saved: Vec<SavedWindow> = cc
+            .storage
+            .and_then(|s| s.get_string(WINDOWS_KEY))
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        for saved in saved {
+            let Some(workspace) = Workspace::restore(&saved.workspace) else { continue };
+            self.windows_opened += 1;
+            let viewport = egui::ViewportId::from_hash_of(("neutron-window", self.windows_opened));
+            let origin = saved.at.map(|[x, y]| egui::pos2(x, y));
+            let mut window = WindowState::new(&self.ctx, viewport, origin, NodeId::Home);
+            window.workspace = workspace;
+            window.size = saved.size.map(|[w, h]| egui::vec2(w, h));
+            window.preview.open = saved.preview;
+            // Loaded with the window's state in place, so each load is for one
+            // of its tabs and lands there.
+            self.swap_window(&mut window);
+            let tabs: Vec<(TabId, NodeId)> =
+                self.workspace.tabs.values().map(|t| (t.id, t.location().clone())).collect();
+            for (tab, location) in tabs {
+                self.reload(tab, location);
+            }
+            self.swap_window(&mut window);
+            self.windows.push(window);
         }
     }
 
@@ -3498,6 +3548,24 @@ impl eframe::App for NeutronApp {
         if let Ok(json) = serde_json::to_string(&snapshot) {
             storage.set_string(STORAGE_KEY, json);
         }
+
+        // The other windows, where they are now and at their current size.
+        let windows: Vec<SavedWindow> = self
+            .windows
+            .iter()
+            .map(|w| {
+                let (outer, inner) = self.ctx.input_for(w.viewport, |i| (i.viewport().outer_rect, i.viewport().inner_rect));
+                SavedWindow {
+                    workspace: w.workspace.persist(),
+                    preview: w.preview.open,
+                    at: outer.or(w.origin.map(|o| egui::Rect::from_min_size(o, egui::Vec2::ZERO))).map(|r| [r.min.x, r.min.y]),
+                    size: inner.map(|r| [r.width(), r.height()]).or(w.size.map(|s| [s.x, s.y])),
+                }
+            })
+            .collect();
+        if let Ok(json) = serde_json::to_string(&windows) {
+            storage.set_string(WINDOWS_KEY, json);
+        }
     }
 
     /// What the window is cleared to before anything is drawn. On the Mac,
@@ -3545,6 +3613,8 @@ struct WindowState {
     viewport: egui::ViewportId,
     /// Where a new window first appears; the OS keeps it after that.
     origin: Option<egui::Pos2>,
+    /// Its size when it first appears, when restored from the last session.
+    size: Option<egui::Vec2>,
     workspace: Workspace,
     confirm: Option<(crate::confirm::Confirm, Box<Action>, Option<Subject>)>,
     address: Option<(GroupId, String)>,
@@ -3573,6 +3643,7 @@ impl WindowState {
         Self {
             viewport,
             origin,
+            size: None,
             workspace: Workspace::new(location),
             confirm: None,
             address: None,
@@ -3816,11 +3887,11 @@ impl NeutronApp {
         let mut i = 0;
         while i < self.windows.len() {
             let mut window = self.windows.remove(i);
-            self.swap_window(&mut window);
-            let mut builder = crate::window_builder().with_inner_size([1100.0, 720.0]);
-            if let Some(at) = self.origin {
+            let mut builder = crate::window_builder().with_inner_size(window.size.unwrap_or(egui::vec2(1100.0, 720.0)));
+            if let Some(at) = window.origin {
                 builder = builder.with_position(at);
             }
+            self.swap_window(&mut window);
             let mut closing = false;
             ctx.show_viewport_immediate(self.viewport, builder, |ui, _class| {
                 self.window_frame(ui);
@@ -8175,5 +8246,31 @@ mod screens {
         shoot(&mut harness, &out, "light.png");
         act(&mut harness, Action::ToggleTheme);
         settle(&mut harness);
+    }
+}
+
+#[cfg(test)]
+mod saved_window_tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_window_comes_back_where_it_was_with_its_tabs() {
+        let mut workspace = Workspace::new(NodeId::path("/tmp"));
+        let group = workspace.focused;
+        let view = workspace.view_for_new_tab();
+        workspace.open_tab(group, NodeId::path("/usr"), view);
+        let saved = SavedWindow {
+            workspace: workspace.persist(),
+            preview: true,
+            at: Some([40.0, 60.0]),
+            size: Some([900.0, 640.0]),
+        };
+        let json = serde_json::to_string(&vec![saved]).unwrap();
+        let back: Vec<SavedWindow> = serde_json::from_str(&json).unwrap();
+        assert_eq!((back[0].at, back[0].size, back[0].preview), (Some([40.0, 60.0]), Some([900.0, 640.0]), true));
+        let restored = Workspace::restore(&back[0].workspace).unwrap();
+        let mut places: Vec<String> = restored.tabs.values().map(|t| t.location().to_string()).collect();
+        places.sort();
+        assert_eq!(places, vec!["/tmp".to_owned(), "/usr".to_owned()]);
     }
 }
