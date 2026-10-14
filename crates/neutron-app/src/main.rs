@@ -114,16 +114,15 @@ fn main() -> eframe::Result<()> {
             .with_titlebar_shown(!cfg!(target_os = "macos"))
             .with_titlebar_buttons_shown(true)
             .with_resizable(true)
-            // On the Mac the window itself is see-through, so the sidebar, the
-            // action rail and the panes float over the desktop as three cards.
-            // Metal composites a transparent surface; see `NeutronApp::ui` for
-            // the ground that is no longer painted there.
+            // On the Mac the window is transparent so that Neutron can round
+            // its corners itself, and paints a solid ground inside them; see
+            // `theme::paint_ground`. Metal composites a transparent surface.
             .with_transparent(cfg!(target_os = "macos"))
-            // And no window shadow from the OS. On a transparent window macOS
-            // traces its shadow around everything drawn, including each card's
-            // own soft shadow, which put a dark outline around every card. The
-            // cards' shadows are the floating effect; this one only fought it.
-            .with_has_shadow(!cfg!(target_os = "macos"))
+            // The OS traces a transparent window's shadow around whatever is
+            // drawn. With the ground solid that is the rounded window, which is
+            // the shadow a window should have. (When the cards floated over the
+            // desktop it traced each card's own shadow instead, and was off.)
+            .with_has_shadow(true)
             .with_icon(app_icon()),
         // Not transparent on Windows. Measurement showed wgpu cannot provide a
         // surface with a transparent `CompositeAlphaMode` on any backend

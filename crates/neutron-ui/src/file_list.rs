@@ -40,19 +40,16 @@ use crate::icons;
 use crate::theme::{self, Palette, RADIUS_CONTROL, ROW_HEIGHT};
 
 /// Fixed column widths, in points.
-const W_SIZE: f32 = 92.0;
-const W_MODIFIED: f32 = 140.0;
-const W_KIND: f32 = 104.0;
-/// Space reserved for the icon at the start of a row.
-const ICON_SLOT: f32 = 32.0;
+const W_SIZE: f32 = 100.0;
+const W_MODIFIED: f32 = 150.0;
+const W_KIND: f32 = 120.0;
+/// Space reserved for the icon tile at the start of a row.
+const ICON_SLOT: f32 = 36.0;
 /// Padding inside the list, left and right.
 const LIST_PAD: f32 = 16.0;
 const CELL_PAD: f32 = 10.0;
 /// Name column never shrinks below this, so it stays readable on narrow panes.
 const MIN_NAME_WIDTH: f32 = 120.0;
-/// On-screen size of a system icon, in points. Smaller than the 32px source it
-/// is sampled from, which is what keeps it crisp on a high-DPI display.
-const ICON_DRAW: f32 = 20.0;
 
 /// How the listing is laid out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -652,6 +649,7 @@ fn header(
     let height = 32.0;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
 
+    // In the Finder's order: when, then how big, then what.
     let cols = [
         (
             SortColumn::Name,
@@ -659,17 +657,17 @@ fn header(
             ICON_SLOT + name_width,
             Align2::LEFT_CENTER,
         ),
-        (SortColumn::Size, "Size", W_SIZE, Align2::RIGHT_CENTER),
         (
             SortColumn::Modified,
             "Modified",
             W_MODIFIED,
             Align2::LEFT_CENTER,
         ),
-        (SortColumn::Kind, "Type", W_KIND, Align2::LEFT_CENTER),
+        (SortColumn::Size, "Size", W_SIZE, Align2::RIGHT_CENTER),
+        (SortColumn::Kind, "Kind", W_KIND, Align2::LEFT_CENTER),
     ];
 
-    let font = FontId::proportional(10.0);
+    let font = theme::strong(ui.ctx(), 10.5);
     let mut x = rect.left() + LIST_PAD;
 
     for (col, label, width, align) in cols {
@@ -682,7 +680,7 @@ fn header(
 
         let active = state.sort.column == col;
         let colour = if active || response.hovered() {
-            p.text_muted
+            p.text_soft()
         } else {
             p.text_faint
         };
@@ -702,25 +700,30 @@ fn header(
             .text(anchor, align, theme::micro_caps(label), font.clone(), colour);
 
         if active {
+            // Beside its label, not at the far edge of a wide column, where
+            // it reads as belonging to whatever is next to it.
+            let label_width = ui
+                .painter()
+                .layout_no_wrap(theme::micro_caps(label), font.clone(), colour)
+                .size()
+                .x;
+            let at = match align {
+                Align2::RIGHT_CENTER => text_rect.right() - 5.0,
+                _ => text_rect.left() + label_width + 9.0,
+            };
             icons::sort_arrow(
                 ui.painter(),
-                pos2(text_rect.right() - 5.0, text_rect.center().y),
+                pos2(at, text_rect.center().y),
                 state.sort.order == SortOrder::Ascending,
-                p.text_muted,
+                p.text_soft(),
             );
         }
 
         x += width;
     }
 
-    // Inset to the same padding as the rows, so it lines up with the content
-    // rather than running the full width of the card.
-    ui.painter().hline(
-        (rect.left() + LIST_PAD * 0.5)..=(rect.right() - LIST_PAD * 0.5),
-        rect.bottom() - 0.5,
-        Stroke::new(1.0, p.border),
-    );
-
+    // No rule under it: the labels are small, spaced capitals in the faint
+    // tone, and that is distinction enough from the rows.
     action
 }
 
@@ -988,20 +991,16 @@ fn draw_row(
     let selected = marks.selection.is_selected(idx);
     let is_cursor = marks.selection.cursor() == Some(idx);
 
+    // A wash of the accent and a faint ring of it, with no edge bar: the row
+    // reads as chosen without a hard mark down its side.
     if selected {
-        // Tint plus an edge, not a bordered pill. A stroke all the way round a
-        // row draws a box the eye has to read past to get to the filename;
-        // the edge marks the row and gets out of the way.
         ui.painter()
             .rect_filled(rect, RADIUS_CONTROL as f32, p.selection);
-        let edge = Rect::from_min_size(
-            pos2(rect.left(), rect.top() + 2.0),
-            vec2(2.5, rect.height() - 4.0),
-        );
-        ui.painter().rect_filled(
-            edge,
-            egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 },
-            p.accent,
+        ui.painter().rect_stroke(
+            rect,
+            RADIUS_CONTROL as f32,
+            Stroke::new(1.0, theme::with_alpha(p.accent, 56)),
+            egui::StrokeKind::Inside,
         );
     } else if response.hovered() {
         ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
@@ -1013,7 +1012,7 @@ fn draw_row(
         ui.painter().rect_stroke(
             rect,
             RADIUS_CONTROL as f32,
-            Stroke::new(1.0, p.accent),
+            Stroke::new(1.5, theme::with_alpha(p.accent, 128)),
             egui::StrokeKind::Inside,
         );
     }
@@ -1021,57 +1020,43 @@ fn draw_row(
     let kind = list.kind(idx);
     // A file that is cut is drawn like a hidden one: still there, but faded,
     // because that is exactly its status — it has not moved yet and it will
-    // stay put if the paste never comes. Reusing the dimming rather than
-    // inventing a second faded state keeps one meaning for one appearance.
+    // stay put if the paste never comes.
     let hidden = list.is_hidden(idx) || marks.is_cut(list.name(idx));
 
-    // Hidden files are dimmed rather than being identical to normal ones.
-    let name_colour = if hidden { p.text_muted } else { p.text };
-    let meta_colour = p.text_faint;
+    let name_colour = if hidden {
+        p.text_muted
+    } else if selected {
+        p.text
+    } else {
+        p.text_soft()
+    };
     let body = TextStyle::Body.resolve(ui.style());
-    let small = FontId::proportional(11.0);
+    let small = FontId::proportional(12.5);
 
     let mut x = outer.left() + LIST_PAD;
 
     // --- icon ---
     //
-    // The real system icon when it has been resolved, the drawn outline
-    // otherwise. Rows never wait: an unresolved icon is a normal state that
-    // lasts a frame or two, not an error.
-    let centre = pos2(x + ICON_SLOT / 2.0 - 5.0, outer.center().y);
-    let uv = icons.and_then(|src| src.uv_for(list.name(idx), kind));
-
-    match (icons, uv) {
-        (Some(src), Some(uv)) => {
-            let rect = Rect::from_center_size(centre, vec2(ICON_DRAW, ICON_DRAW));
+    // A tile tinted for the kind of file, the same in every row of a kind so
+    // a folder of mixed files can be scanned by colour. Applications keep the
+    // icon they ship with: theirs is the only way to tell one from another.
+    let tile = Rect::from_center_size(pos2(x + ICON_SLOT / 2.0 - 4.0, outer.center().y), vec2(28.0, 28.0));
+    let real = icons
+        .filter(|_| is_application(list.name(idx)))
+        .and_then(|src| src.uv_for(list.name(idx), kind).map(|uv| (src, uv)));
+    match real {
+        Some((src, uv)) => {
             let mut mesh = egui::Mesh::with_texture(src.texture());
-            // Hidden entries are dimmed by tinting the icon rather than by
-            // drawing a different one, matching how their name is dimmed.
-            let tint = if hidden {
-                Color32::from_white_alpha(110)
-            } else {
-                Color32::WHITE
-            };
-            mesh.add_rect_with_uv(rect, uv, tint);
+            let tint = if hidden { Color32::from_white_alpha(110) } else { Color32::WHITE };
+            mesh.add_rect_with_uv(tile.shrink(1.0), uv, tint);
             ui.painter().add(egui::Shape::mesh(mesh));
         }
-        _ => icons::draw(
-            ui.painter(),
-            centre,
-            icons::for_kind(kind),
-            if selected {
-                p.accent
-            } else if hidden {
-                p.text_faint
-            } else {
-                p.icon
-            },
-        ),
+        None => icons::tile(ui.painter(), tile, icons::FileKind::of(list.name(idx), kind), p, hidden),
     }
-    x += ICON_SLOT;
+    x += ICON_SLOT + 6.0;
 
     // --- name ---
-    let name_rect = Rect::from_min_size(pos2(x, outer.top()), vec2(name_width, ROW_HEIGHT));
+    let name_rect = Rect::from_min_size(pos2(x, outer.top()), vec2(name_width - 6.0, ROW_HEIGHT));
 
     let mut rename_action = None;
     if let Some((text, generation)) = marks.rename_text(idx) {
@@ -1093,28 +1078,14 @@ fn draw_row(
 
     // Cloud-only badge, right-aligned within the name column.
     if list.sync(idx) == SyncState::CloudOnly && marks.rename_text(idx).is_none() {
-        ui.painter().text(
-            pos2(name_rect.right() - 2.0, outer.center().y),
-            Align2::RIGHT_CENTER,
-            "☁",
-            small.clone(),
+        icons::draw(
+            ui.painter(),
+            pos2(name_rect.right() - 10.0, outer.center().y),
+            icons::Glyph::Cloud,
             p.cloud,
         );
     }
-    x += name_width;
-
-    // --- size (blank for containers) ---
-    let size_rect = Rect::from_min_size(pos2(x, outer.top()), vec2(W_SIZE, ROW_HEIGHT));
-    let size_text = format::size((!kind.is_container()).then(|| list.size(idx)));
-    draw_cell_text(
-        ui,
-        size_rect,
-        &size_text,
-        &small,
-        meta_colour,
-        Align2::RIGHT_CENTER,
-    );
-    x += W_SIZE;
+    x += name_width - 6.0;
 
     // --- modified ---
     let mod_rect = Rect::from_min_size(pos2(x, outer.top()), vec2(W_MODIFIED, ROW_HEIGHT));
@@ -1123,19 +1094,32 @@ fn draw_row(
         mod_rect,
         &format::timestamp(list.modified(idx)),
         &small,
-        meta_colour,
+        p.text_muted,
         Align2::LEFT_CENTER,
     );
     x += W_MODIFIED;
 
-    // --- type ---
+    // --- size (blank for containers) ---
+    let size_rect = Rect::from_min_size(pos2(x, outer.top()), vec2(W_SIZE, ROW_HEIGHT));
+    let size_text = format::size((!kind.is_container()).then(|| list.size(idx)));
+    draw_cell_text(
+        ui,
+        size_rect.shrink2(vec2(12.0, 0.0)),
+        &size_text,
+        &small,
+        p.text_muted,
+        Align2::RIGHT_CENTER,
+    );
+    x += W_SIZE;
+
+    // --- kind ---
     let kind_rect = Rect::from_min_size(pos2(x, outer.top()), vec2(W_KIND, ROW_HEIGHT));
     draw_cell_text(
         ui,
         kind_rect,
         &kind_label(kind, list.name(idx)),
         &small,
-        meta_colour,
+        p.text_faint,
         Align2::LEFT_CENTER,
     );
 
@@ -1183,14 +1167,15 @@ fn draw_row(
 // --- grid view ------------------------------------------------------------
 
 /// Tile geometry, in points.
-const TILE_W: f32 = 128.0;
-const TILE_H: f32 = 116.0;
+const TILE_W: f32 = 132.0;
+const TILE_H: f32 = 128.0;
 const TILE_GAP: f32 = 10.0;
-/// Icon size inside a tile. Sampled from the 32px atlas cell, so this is a
-/// modest upscale — soft rather than crisp, which is the price of one atlas
-/// shared with the list view. A second atlas at 64px would double its memory
-/// to sharpen an icon nobody reads at arm's length.
-const TILE_ICON: f32 = 44.0;
+/// The tinted plate inside a tile, as the list draws at 28.
+const TILE_ICON: f32 = 56.0;
+/// An application's own icon, sampled from the 32px atlas cell. Smaller than
+/// the plate because it is an upscale: soft rather than crisp, the price of
+/// one atlas shared with the list view.
+const TILE_APP_ICON: f32 = 48.0;
 
 /// Draws the grid, virtualized a row of tiles at a time.
 ///
@@ -1381,25 +1366,24 @@ fn draw_tile(
     let selected = marks.selection.is_selected(idx);
     let is_cursor = marks.selection.cursor() == Some(idx);
 
+    // The list's selection, at the tile's size: a wash with a faint ring.
+    let corners = egui::CornerRadius::same(theme::RADIUS_WELL);
     if selected {
-        // Tint and an accent edge. A tile is a much larger shape than a row,
-        // and a tint alone across that area is easy to miss against a card of
-        // other tinted things.
         ui.painter().rect(
             rect,
-            RADIUS_CONTROL as f32,
+            corners,
             p.selection,
-            Stroke::new(1.0, p.accent),
+            Stroke::new(1.0, theme::with_alpha(p.accent, 56)),
             egui::StrokeKind::Inside,
         );
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
+        ui.painter().rect_filled(rect, corners, p.hover);
     }
     if is_cursor && !selected {
         ui.painter().rect_stroke(
             rect,
-            RADIUS_CONTROL as f32,
-            Stroke::new(1.0, p.accent),
+            corners,
+            Stroke::new(1.5, theme::with_alpha(p.accent, 128)),
             egui::StrokeKind::Inside,
         );
     }
@@ -1408,37 +1392,33 @@ fn draw_tile(
     let hidden = list.is_hidden(idx);
     let name = list.name(idx);
 
+    // A tinted plate for the kind, as in the list. Applications keep the icon
+    // they ship with.
     let icon_centre = pos2(rect.center().x, rect.top() + 14.0 + TILE_ICON / 2.0);
-    let uv = icons.and_then(|src| src.uv_for(name, kind));
-
-    match (icons, uv) {
-        (Some(src), Some(uv)) => {
-            let icon_rect = Rect::from_center_size(icon_centre, vec2(TILE_ICON, TILE_ICON));
+    let real = icons
+        .filter(|_| is_application(name))
+        .and_then(|src| src.uv_for(name, kind).map(|uv| (src, uv)));
+    match real {
+        Some((src, uv)) => {
+            let icon_rect = Rect::from_center_size(icon_centre, vec2(TILE_APP_ICON, TILE_APP_ICON));
             let mut mesh = egui::Mesh::with_texture(src.texture());
-            let tint = if hidden {
-                Color32::from_white_alpha(110)
-            } else {
-                Color32::WHITE
-            };
+            let tint = if hidden { Color32::from_white_alpha(110) } else { Color32::WHITE };
             mesh.add_rect_with_uv(icon_rect, uv, tint);
             ui.painter().add(egui::Shape::mesh(mesh));
         }
-        // The drawn glyphs are built for a 16pt slot, so they are scaled up by
-        // drawing several concentric copies rather than stretched — simplest is
-        // to draw the outline at its natural size, centred. A placeholder is
-        // only on screen for a frame or two.
-        _ => icons::draw(
+        None => icons::tile(
             ui.painter(),
-            icon_centre,
-            icons::for_kind(kind),
-            if hidden { p.text_faint } else { p.icon },
+            Rect::from_center_size(icon_centre, vec2(TILE_ICON, TILE_ICON)),
+            icons::FileKind::of(name, kind),
+            p,
+            hidden,
         ),
     }
 
     // Renaming: the box takes the name's place under the icon. Without it a
     // rename started in the grid — F2, or New Folder — was open but invisible,
     // could not be finished, and held back the tab's refreshes until it was.
-    let name_top = rect.top() + 14.0 + TILE_ICON + 8.0;
+    let name_top = rect.top() + 14.0 + TILE_ICON + 10.0;
     if let Some((text, generation)) = marks.rename_text(idx) {
         let field = Rect::from_min_size(pos2(rect.left() + 6.0, name_top - 4.0), vec2(TILE_W - 12.0, 30.0));
         // As in the list: while the box is open the tile is not a target.
@@ -1448,10 +1428,16 @@ fn draw_tile(
     // Name: up to two lines, centred, ellipsised. Two rather than one because a
     // grid of truncated names is unusable — the distinguishing part of a
     // filename is very often at the end.
-    let colour = if hidden { p.text_muted } else { p.text };
+    let colour = if hidden {
+        p.text_faint
+    } else if selected {
+        p.text
+    } else {
+        p.text_soft()
+    };
     let mut job = egui::text::LayoutJob::simple(
         name.to_owned(),
-        FontId::proportional(11.5),
+        FontId::proportional(12.5),
         colour,
         TILE_W - 12.0,
     );
@@ -1473,9 +1459,9 @@ fn draw_tile(
     // left edge to carry an accent, and a tint spread across a whole tile is
     // the weakest selection cue in the application.
     if selected {
-        let badge = pos2(rect.right() - 15.0, rect.top() + 15.0);
+        let badge = pos2(rect.right() - 16.0, rect.top() + 16.0);
         ui.painter().circle_filled(badge, 9.0, p.accent);
-        icons::check(ui.painter(), badge, 9.0, Color32::WHITE);
+        icons::check(ui.painter(), badge, 9.0, p.inset);
     }
 
     if response.double_clicked() {
@@ -1501,6 +1487,13 @@ fn draw_tile(
         });
     }
     None
+}
+
+/// Whether `name` is an application bundle, which keeps its own icon.
+fn is_application(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, ext)| {
+        ext.eq_ignore_ascii_case("app") || ext.eq_ignore_ascii_case("appex") || ext.eq_ignore_ascii_case("prefpane")
+    })
 }
 
 /// Draws text clipped to its cell, with an ellipsis when it overflows.

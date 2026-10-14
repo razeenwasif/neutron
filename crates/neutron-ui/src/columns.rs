@@ -28,13 +28,15 @@ use neutron_core::{EntryList, SelectMode, Selection};
 
 use crate::file_list::{self, FileListAction, IconSource};
 use crate::icons::{self, Glyph};
-use crate::theme::{Palette, RADIUS_CONTROL};
+use crate::theme::Palette;
 
 /// Width of a column nobody has resized, in points.
 pub const COLUMN_WIDTH: f32 = 240.0;
 /// How narrow or wide a column can be dragged. Narrower than the minimum and
 /// an icon and three letters do not fit; wider than the maximum and one column
 /// is the whole pane.
+/// Narrowest the info column gets: enough to read a name and its facts.
+const INFO_MIN: f32 = 280.0;
 const MIN_WIDTH: f32 = 140.0;
 const MAX_WIDTH: f32 = 720.0;
 /// Width of the grab zone over a column's right edge.
@@ -48,7 +50,7 @@ const GRIP_INSET: f32 = 4.0;
 const FIT_SAMPLE: usize = 5_000;
 /// Row height. Tighter than the list's, because a column carries no metadata
 /// and a path five folders deep has to fit on one screen.
-const ROW: f32 = 30.0;
+const ROW: f32 = 34.0;
 /// Inset of the row highlight from the column edges.
 const PAD: f32 = 6.0;
 const ICON_SLOT: f32 = 26.0;
@@ -93,9 +95,29 @@ pub struct Column<'a> {
     pub icons: Option<&'a dyn IconSource>,
 }
 
+/// The file selected in the current column, described in a column of its own
+/// at the end — the Finder's preview column.
+pub struct Info<'a> {
+    pub name: &'a str,
+    pub kind: EntryKind,
+    /// "Markdown", "PNG image" — the list's Kind column.
+    pub kind_label: String,
+    pub size: Option<u64>,
+    /// Milliseconds since the epoch, as on an entry.
+    pub modified: i64,
+    /// Where the file is, for the "Where" line.
+    pub location: String,
+    /// Offer Quick Look: only where the system has it.
+    pub quick_look: bool,
+}
+
 /// Something the user did that the app must act on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnAction {
+    /// Open the file the info column describes.
+    Open,
+    /// Show it in Quick Look.
+    QuickLook,
     /// In the current column, in the list's own terms.
     Current(FileListAction),
     /// A click in any other column. Go to `dir` and select `entry`, or nothing
@@ -108,24 +130,36 @@ pub enum ColumnAction {
 }
 
 /// Draws the columns side by side. Returns the first action taken.
-pub fn show(ui: &mut Ui, p: &Palette, columns: &[Column<'_>]) -> Option<ColumnAction> {
+pub fn show(ui: &mut Ui, p: &Palette, columns: &[Column<'_>], info: Option<&Info<'_>>) -> Option<ColumnAction> {
     let mut action = None;
     let viewport = ui.available_rect_before_wrap();
     let widths = widths_of(ui.ctx(), columns);
     let total: f32 = widths.iter().sum();
 
+    // The columns sit in a panel pressed into the pane: a well, so the
+    // dividers between them are shifts of tone inside it rather than lines
+    // across the pane.
+    let corners = egui::CornerRadius::same(crate::theme::RADIUS_PANEL);
+    crate::theme::paint_well(ui.painter(), viewport, corners, p);
+    let viewport_clip = viewport.shrink(1.0);
+    ui.set_clip_rect(ui.clip_rect().intersect(viewport_clip));
+
     // The deepest column is the one being worked in, so it is brought into
     // view whenever the set of columns changes. Not every frame: the user may
     // have scrolled left to look at an earlier folder, and snapping back while
     // they read would be the view fighting them.
-    let shape = egui::Id::new(columns.iter().map(|c| c.dir).collect::<Vec<_>>());
+    // The info column counts: a file just picked is described past the last
+    // column, and scrolling to the column but not to the description of what
+    // was picked leaves it cut off at the pane's edge.
+    let info_width = info.map_or(0.0, |_| (viewport.width() - total).max(INFO_MIN));
+    let shape = egui::Id::new((columns.iter().map(|c| c.dir).collect::<Vec<_>>(), info.is_some()));
     let memory = ui.id().with("neutron-columns-shape");
     let mut outer = egui::ScrollArea::horizontal()
         .id_salt("neutron-columns")
         .auto_shrink([false; 2]);
     if ui.data(|d| d.get_temp::<egui::Id>(memory)) != Some(shape) {
         ui.data_mut(|d| d.insert_temp(memory, shape));
-        outer = outer.horizontal_scroll_offset((total - viewport.width()).max(0.0));
+        outer = outer.horizontal_scroll_offset((total + info_width - viewport.width()).max(0.0));
     }
 
     outer.show(ui, |ui| {
@@ -153,6 +187,15 @@ pub fn show(ui: &mut Ui, p: &Palette, columns: &[Column<'_>]) -> Option<ColumnAc
                 }
             }
 
+            // The selected file, described at the end: whatever room the
+            // columns leave, and never less than enough to read it.
+            if let Some(info) = info {
+                let (rect, _) = ui.allocate_exact_size(vec2(info_width, height), Sense::hover());
+                if let Some(a) = draw_info(ui, p, rect, info) {
+                    action = Some(a);
+                }
+            }
+
             // After every column, so each grip wins the pointer over the rows
             // on both sides of the edge it sits on.
             let origin = rects.first().map_or(0.0, |r| r.left());
@@ -164,6 +207,86 @@ pub fn show(ui: &mut Ui, p: &Palette, columns: &[Column<'_>]) -> Option<ColumnAc
         });
     });
 
+    action
+}
+
+/// The info column: a large tile for the file's kind, its name and size, a
+/// few facts, and Open and Quick Look.
+fn draw_info(ui: &mut Ui, p: &Palette, rect: Rect, info: &Info<'_>) -> Option<ColumnAction> {
+    let mut action = None;
+    let painter = ui.painter().clone();
+    let inner = rect.shrink2(vec2(26.0, 26.0));
+    let mut y = inner.top();
+
+    let kind = icons::FileKind::of(info.name, info.kind);
+    let tile = Rect::from_center_size(pos2(inner.center().x, y + 42.0), vec2(84.0, 84.0));
+    icons::tile(&painter, tile, kind, p, false);
+    y = tile.bottom() + 18.0;
+
+    let name = painter.layout(
+        info.name.to_owned(),
+        crate::theme::strong(ui.ctx(), 17.0),
+        p.text,
+        inner.width(),
+    );
+    painter.galley(pos2(inner.center().x - name.size().x / 2.0, y), name.clone(), p.text);
+    y += name.size().y + 4.0;
+
+    let detail = match info.size {
+        Some(bytes) => format!("{} · {}", info.kind_label, crate::format::size(Some(bytes))),
+        None => info.kind_label.clone(),
+    };
+    painter.text(pos2(inner.center().x, y + 8.0), Align2::CENTER_CENTER, detail, FontId::proportional(12.5), p.text_muted);
+    y += 36.0;
+
+    for (label, value) in [
+        ("Modified", crate::format::timestamp(info.modified)),
+        ("Where", info.location.clone()),
+    ] {
+        painter.text(pos2(inner.left(), y + 8.0), Align2::LEFT_CENTER, label, FontId::proportional(12.5), p.text_faint);
+        let room = inner.width() - 80.0;
+        let mut job = egui::text::LayoutJob::simple_singleline(value, FontId::proportional(12.5), p.text_soft());
+        job.wrap = egui::text::TextWrapping {
+            max_width: room.max(1.0),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        let galley = painter.layout_job(job);
+        painter.galley(pos2(inner.right() - galley.size().x, y + 8.0 - galley.size().y / 2.0), galley, p.text_soft());
+        y += 26.0;
+    }
+
+    // The buttons sit at the foot of the column.
+    let buttons = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 38.0), inner.max);
+    let halves = if info.quick_look {
+        let mid = buttons.center().x;
+        vec![
+            (Rect::from_min_max(buttons.min, pos2(mid - 4.0, buttons.bottom())), "Open", true),
+            (Rect::from_min_max(pos2(mid + 4.0, buttons.top()), buttons.max), "Quick Look", false),
+        ]
+    } else {
+        vec![(buttons, "Open", true)]
+    };
+    for (r, label, primary) in halves {
+        let response = ui.interact(r, ui.id().with(("info-button", label)), Sense::click());
+        let corners = crate::theme::pill(r.height());
+        if primary {
+            ui.painter().rect_filled(r, corners, if response.hovered() { p.accent_hover } else { p.accent });
+        } else {
+            ui.painter().rect_filled(r, corners, Color32::from_white_alpha(if response.hovered() { 20 } else { 13 }));
+        }
+        ui.painter().text(
+            r.center(),
+            Align2::CENTER_CENTER,
+            label,
+            crate::theme::strong(ui.ctx(), 13.0),
+            if primary { p.inset } else { p.text },
+        );
+        if response.clicked() {
+            action = Some(if primary { ColumnAction::Open } else { ColumnAction::QuickLook });
+        }
+    }
     action
 }
 
@@ -230,7 +353,7 @@ fn grip(ui: &mut Ui, p: &Palette, column: &Column<'_>, rect: Rect, index: usize,
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
     }
 
-    let colour = if active { p.accent } else { p.border };
+    let colour = if active { p.accent } else { Color32::from_white_alpha(11) };
     ui.painter().vline(
         rect.right() - 0.5,
         rect.y_range(),
@@ -492,30 +615,28 @@ fn draw_entry(
     };
     let chosen = matches!(column.role, Role::Named { highlight: Some(h) } if h == name);
 
-    // The current column's selection looks like the list's: a tint and an
-    // accent edge. A chosen row elsewhere gets the tint alone — it marks the
-    // way here, and only one column at a time is the one keys act on.
-    if selected || chosen {
-        ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.selection);
-    } else if response.hovered() {
-        ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
-    }
+    // The current column's selection looks like the list's: the accent wash
+    // and a faint ring of it. A chosen row elsewhere — the way here — is a
+    // neutral lift instead, because only one column is the one keys act on.
+    let corners = egui::CornerRadius::same(11);
     if selected {
-        let edge = Rect::from_min_size(
-            pos2(rect.left(), rect.top() + 2.0),
-            vec2(2.5, rect.height() - 4.0),
+        ui.painter().rect_filled(rect, corners, p.selection);
+        ui.painter().rect_stroke(
+            rect,
+            corners,
+            Stroke::new(1.0, crate::theme::with_alpha(p.accent, 60)),
+            egui::StrokeKind::Inside,
         );
-        ui.painter().rect_filled(
-            edge,
-            egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 },
-            p.accent,
-        );
+    } else if chosen {
+        ui.painter().rect_filled(rect, corners, Color32::from_white_alpha(14));
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, corners, p.hover);
     }
     if is_cursor && !selected {
         ui.painter().rect_stroke(
             rect,
-            RADIUS_CONTROL as f32,
-            Stroke::new(1.0, p.accent),
+            corners,
+            Stroke::new(1.5, crate::theme::with_alpha(p.accent, 128)),
             egui::StrokeKind::Inside,
         );
     }
@@ -524,7 +645,15 @@ fn draw_entry(
 
     // --- icon ---
     let centre = pos2(rect.left() + 6.0 + ICON_SLOT / 2.0, outer.center().y);
-    let uv = column.icons.and_then(|src| src.uv_for(name, kind));
+    // Applications keep their own icon; everything else is a glyph tinted for
+    // its kind, as in the list.
+    let application = name
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("app"));
+    let uv = column
+        .icons
+        .filter(|_| application)
+        .and_then(|src| src.uv_for(name, kind));
     match (column.icons, uv) {
         (Some(src), Some(uv)) => {
             let icon = Rect::from_center_size(centre, vec2(ICON_DRAW, ICON_DRAW));
@@ -537,18 +666,16 @@ fn draw_entry(
             mesh.add_rect_with_uv(icon, uv, tint);
             ui.painter().add(egui::Shape::mesh(mesh));
         }
-        _ => icons::draw(
-            ui.painter(),
-            centre,
-            icons::for_kind(kind),
-            if selected {
-                p.accent
-            } else if faded {
-                p.text_faint
-            } else {
-                p.icon
-            },
-        ),
+        _ => {
+            let kind_of = icons::FileKind::of(name, kind);
+            let tint = kind_of.tint(p);
+            icons::draw(
+                ui.painter(),
+                centre,
+                kind_of.glyph(),
+                if faded { crate::theme::with_alpha(tint, 130) } else { tint },
+            );
+        }
     }
 
     // --- name ---
@@ -568,7 +695,13 @@ fn draw_entry(
             name,
             kind,
             &body,
-            if faded { p.text_muted } else { p.text },
+            if faded {
+                p.text_muted
+            } else if selected || chosen {
+                p.text
+            } else {
+                p.text_soft()
+            },
             p.text_faint,
         );
     }
@@ -579,7 +712,7 @@ fn draw_entry(
             ui.painter(),
             pos2(rect.right() - CHEVRON_SLOT / 2.0, outer.center().y),
             Glyph::ChevronRight,
-            if selected { p.accent } else { p.text_faint },
+            if selected { p.accent } else { crate::theme::with_alpha(p.text_faint, 170) },
         );
     }
 
@@ -668,11 +801,11 @@ mod tests {
         };
         // A first frame to lay out, so the second has something to hit.
         let mut output = ctx.run_ui(input(Vec::new()), |ui| {
-            show(ui, &Palette::LIGHT, columns);
+            show(ui, &Palette::LIGHT, columns, None);
         });
         output.textures_delta.clear();
         let mut output = ctx.run_ui(input(events), |ui| {
-            action = show(ui, &Palette::LIGHT, columns);
+            action = show(ui, &Palette::LIGHT, columns, None);
         });
         output.textures_delta.clear();
         action
@@ -791,7 +924,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| action = show(ui, &Palette::LIGHT, &columns),
+                |ui| action = show(ui, &Palette::LIGHT, &columns, None),
             );
             output.textures_delta.clear();
             action
@@ -850,7 +983,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| action = show(ui, &Palette::LIGHT, columns),
+                |ui| action = show(ui, &Palette::LIGHT, columns, None),
             );
             output.textures_delta.clear();
             action

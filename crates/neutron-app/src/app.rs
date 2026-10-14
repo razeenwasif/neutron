@@ -113,6 +113,8 @@ enum Action {
     DeleteOnServer,
     /// Open the connect dialog on this saved server.
     EditSite(String),
+    /// Show a file in the system's Quick Look panel.
+    QuickLook(PathBuf),
     /// Clear the status line.
     DismissNotice,
     /// Open a terminal at the focused tab's folder.
@@ -511,6 +513,7 @@ impl NeutronApp {
             ThemeMode::Dark
         };
         theme::apply(&cc.egui_ctx, theme_mode);
+        theme::install_fonts(&cc.egui_ctx, interface_faces());
 
         let hwnd = window_handle(cc);
         if let Some(h) = hwnd {
@@ -1071,6 +1074,18 @@ impl NeutronApp {
             Action::Delete { .. } if self.on_server() => self.ask(Action::DeleteOnServer),
             Action::DeleteOnServer => self.remote_delete(),
             Action::EditSite(id) => self.edit_site(&id),
+            Action::QuickLook(path) => {
+                // `qlmanage` is the system's own Quick Look, run on a worker:
+                // starting a process is not something the paint thread waits on.
+                self.sta.submit(move || {
+                    let _ = std::process::Command::new("/usr/bin/qlmanage")
+                        .arg("-p")
+                        .arg(&path)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                });
+            }
             Action::Delete { permanent } => {
                 if !self.refuse_without_a_path("delete from") {
                     self.delete_selection(permanent);
@@ -2346,13 +2361,14 @@ impl eframe::App for NeutronApp {
             .clone()
             .with_layer_id(egui::LayerId::background());
         if cfg!(target_os = "macos") {
-            // The window is transparent here, and the cards float over the
-            // desktop. Not *fully* clear: the window server sends a click on a
-            // pixel with no alpha at all to whatever is behind the window, so
-            // the gutters and the title strip would stop belonging to Neutron —
-            // and the strip is how the window is dragged. One part in 255 of
-            // black keeps them ours and is invisible.
+            // The window is transparent here only so that its corners can be
+            // rounded: the ground is painted, solid, inside them. Under it, one
+            // part in 255 of black across the whole window — the window server
+            // sends a click on a pixel with no alpha at all to whatever is
+            // behind, and the very corners would otherwise stop belonging to
+            // Neutron.
             bg.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(1));
+            theme::paint_ground(&bg, screen, &p);
         } else {
             neutron_ui::ambient::paint(&bg, screen, &p);
         }
@@ -3089,7 +3105,10 @@ impl NeutronApp {
                 let count = visible_selection(self.workspace.active_tab()?).len();
                 Some(crate::confirm::Confirm {
                     title: "Delete permanently?".into(),
-                    body: format!("{count} selected items will be permanently deleted. This cannot be undone."),
+                    body: match count {
+                        1 => "The selected item will be permanently deleted. This cannot be undone.".to_owned(),
+                        n => format!("{n} selected items will be permanently deleted. This cannot be undone."),
+                    },
                     proceed: "Delete permanently".into(),
                 })
             }
@@ -3122,7 +3141,8 @@ impl NeutronApp {
                     title: format!("Delete from {name}?"),
                     body: format!(
                         "{what} will be deleted from {name}.{folders} A server \
-                         has no Recycle Bin, so this cannot be undone."
+                         has no {bin}, so this cannot be undone.",
+                        bin = if cfg!(target_os = "macos") { "Trash" } else { "Recycle Bin" }
                     ),
                     proceed: format!("Delete {what}"),
                 })
@@ -3137,9 +3157,11 @@ impl NeutronApp {
                     .unwrap_or_else(|| "that server".to_owned());
                 Some(crate::confirm::Confirm {
                     title: format!("Forget {name}?"),
-                    body: "Its saved password is removed from Credential Manager. \
-                           If you do not know the password, this cannot be undone."
-                        .to_owned(),
+                    body: format!(
+                        "Its saved password is removed from {}. \
+                         If you do not know the password, this cannot be undone.",
+                        if cfg!(target_os = "macos") { "your keychain" } else { "Credential Manager" }
+                    ),
                     proceed: "Forget it".to_owned(),
                 })
             }
@@ -3210,7 +3232,7 @@ impl NeutronApp {
                 } else {
                     "Pin to Quick access".to_owned()
                 },
-                accel: "Ctrl+Shift+D".to_owned(),
+                accel: neutron_ui::format::shortcut("Ctrl+Shift+D"),
                 enabled: true,
                 ..Default::default()
             });
@@ -3270,7 +3292,7 @@ impl NeutronApp {
                 } else {
                     format!("Pin {name} to Quick access")
                 },
-                accel: "Ctrl+Shift+D".to_owned(),
+                accel: neutron_ui::format::shortcut("Ctrl+Shift+D"),
                 enabled: true,
                 ..Default::default()
             },
@@ -3732,7 +3754,7 @@ impl NeutronApp {
 
         let output = egui::TextEdit::singleline(&mut text)
             .id(id)
-            .background_color(egui::Color32::TRANSPARENT)
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2)))
             .desired_width(field.width())
             .font(egui::FontId::proportional(16.0))
             .text_color(p.text)
@@ -3799,93 +3821,127 @@ impl NeutronApp {
         });
     }
 
+    /// Whether anything needs saying at the bottom of the window: a notice,
+    /// a job in progress, or frames running over budget.
+    fn has_status(&self) -> bool {
+        self.notices.current().is_some()
+            || self.archive_job.is_some()
+            || self.plugins.running_label().is_some()
+            || self.download.is_some()
+            || self.remote_job.is_some()
+            || self.startup.frame_percentiles().is_some_and(|(_, p99)| p99 > 8.0)
+    }
+
+    /// Notices and jobs, as a pill floating at the bottom of the window.
+    ///
+    /// Only there when there is something to say. What a folder holds is said
+    /// in that folder's own pane — see `pane_footer` — so with nothing going on
+    /// the window ends at the bottom of its panes.
     fn status_bar(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
-        let tab = self.workspace.active_tab();
+        if !self.has_status() {
+            return;
+        }
 
-        egui::Panel::bottom("status_bar")
-            // The cards float on nothing, so a panel's edge line would be the
-            // only thing drawn between them.
-            .show_separator_line(false)
-            .exact_size(30.0)
-            .frame(toolbar_frame(p))
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    let Some(t) = tab else { return };
-
-                    match &t.status {
-                        Status::Loading => {
-                            ui.add(egui::Spinner::new().size(12.0));
-                            ui.colored_label(p.text_muted, "Loading…");
-                        }
-                        Status::Error(e) => {
-                            ui.colored_label(p.danger, format!("⚠ {e}"));
-                        }
-                        Status::Loaded { entries, .. } => {
-                            let shown = t.list.order().len();
-                            ui.colored_label(
-                                p.text_muted,
-                                if shown == *entries {
-                                    format!("{shown} items")
-                                } else {
-                                    // Say so explicitly, or a filtered view
-                                    // looks like a folder that lost files.
-                                    format!("{shown} of {entries} items")
-                                },
-                            );
-                        }
-                    }
-
-                    if !t.selection.is_empty() {
-                        ui.colored_label(p.text_faint, "•");
-                        let n = t.selection.len();
-                        let bytes = t.selection.total_size(&t.list);
-                        let size = neutron_ui::format::size(Some(bytes));
-                        ui.colored_label(
-                            p.accent,
-                            if bytes > 0 {
-                                format!("{n} selected ({size})")
-                            } else {
-                                format!("{n} selected")
-                            },
-                        );
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Status::Loaded { elapsed, .. } = &t.status {
-                            ui.colored_label(
-                                p.text_faint,
-                                format!("{:.0}ms", elapsed.as_secs_f64() * 1000.0),
-                            )
-                            .on_hover_text("Enumerate + sort time");
-                        }
-                        // Frame pacing, shown only when it breaches the budget.
-                        // A permanent counter would be clutter; one that appears
-                        // when p99 exceeds 8ms is a warning.
-                        if self.icons.resolved() > 0 {
-                            ui.colored_label(
-                                p.text_faint,
-                                format!("{} icons", self.icons.resolved()),
-                            )
-                            .on_hover_text(
-                                "Distinct system icons resolved and cached in the atlas",
-                            );
-                        }
-                        if let Some((p50, p99)) = self.startup.frame_percentiles() {
-                            if p99 > 8.0 {
-                                ui.colored_label(p.warning, format!("{p99:.0}ms p99"))
-                                    .on_hover_text(format!(
-                                        "Frame build p50 {p50:.1}ms / p99 {p99:.1}ms — over the 8ms budget"
-                                    ));
+        // A toast over the foot of the window, sized to what it says, rather
+        // than a panel: a panel takes its height from every pane for as long
+        // as a notice stands, and sits wherever the layout puts it.
+        egui::Area::new(egui::Id::new("status_bar"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(560.0);
+                egui::Frame::new()
+                    .fill(p.raised)
+                    .corner_radius(theme::pill(34.0))
+                    .stroke(egui::Stroke::new(1.0, p.border))
+                    .inner_margin(egui::Margin::symmetric(16, 8))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 28,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(160),
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if let Some((p50, p99)) = self.startup.frame_percentiles() {
+                                if p99 > 8.0 {
+                                    ui.colored_label(p.warning, format!("{p99:.0}ms p99"))
+                                        .on_hover_text(format!(
+                                            "Frame build p50 {p50:.1}ms / p99 {p99:.1}ms — over the 8ms budget"
+                                        ));
+                                }
                             }
-                        }
-
-                        self.archive_status(ui, p, actions);
-                        self.plugin_status(ui, p, actions);
-                        self.download_status(ui, p, actions);
-                        self.notice_bar(ui, p, actions);
+                            self.notice_bar(ui, p, actions);
+                            self.download_status(ui, p, actions);
+                            self.plugin_status(ui, p, actions);
+                            self.archive_status(ui, p, actions);
+                        });
                     });
-                });
             });
+    }
+
+    /// The strip along the bottom of a folder pane: what the folder holds and
+    /// what is selected on the left, the keys worth knowing on the right.
+    fn pane_footer(&self, ui: &egui::Ui, p: &Palette, rect: egui::Rect, tab: &crate::workspace::Tab) {
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(12.0);
+        let y = rect.center().y;
+
+        let text = match &tab.status {
+            Status::Loading => "Loading…".to_owned(),
+            Status::Error(_) => String::new(),
+            Status::Loaded { entries, .. } => {
+                let shown = tab.list.order().len();
+                // Said explicitly when filtered, or a narrowed view looks like
+                // a folder that lost files.
+                let mut text = if shown == *entries {
+                    format!("{shown} items")
+                } else {
+                    format!("{shown} of {entries} items")
+                };
+                let selected = visible_selection(tab);
+                if !selected.is_empty() {
+                    let bytes = tab.selection.total_size(&tab.list);
+                    text.push_str(&format!(" · {} selected", selected.len()));
+                    if bytes > 0 {
+                        text.push_str(&format!(" · {}", neutron_ui::format::size(Some(bytes))));
+                    }
+                }
+                text
+            }
+        };
+        let counted = painter.text(pos(rect.left() + 12.0, y), egui::Align2::LEFT_CENTER, text, font.clone(), p.text_faint);
+        if let Status::Loaded { elapsed, .. } = &tab.status {
+            ui.interact(counted, ui.id().with("footer-count"), egui::Sense::hover())
+                .on_hover_text(format!("Listed and sorted in {:.0} ms", elapsed.as_secs_f64() * 1000.0));
+        }
+
+        // The keys, right-aligned: the two that open everything else.
+        let mac = cfg!(target_os = "macos");
+        let columns = tab.view.view == file_list::ViewMode::Columns;
+        let hints: Vec<(&str, &str)> = if columns {
+            vec![("←", ""), ("→", "move between columns")]
+        } else {
+            vec![
+                (if mac { "⌘P" } else { "Ctrl+P" }, "find"),
+                (if mac { "⌘⇧P" } else { "Ctrl+Shift+P" }, "commands"),
+            ]
+        };
+        let mut x = rect.right() - 10.0;
+        for (key, label) in hints.iter().rev() {
+            if !label.is_empty() {
+                let galley = painter.layout_no_wrap(label.to_string(), font.clone(), p.text_faint);
+                x -= galley.size().x;
+                painter.galley(pos(x, y - galley.size().y / 2.0), galley, p.text_faint);
+                x -= 6.0;
+            }
+            let cap = painter.layout_no_wrap(key.to_string(), theme::strong(ui.ctx(), 11.0), p.text_muted);
+            let size = cap.size() + egui::vec2(14.0, 4.0);
+            let cap_rect = egui::Rect::from_min_size(pos(x - size.x, y - size.y / 2.0), size);
+            painter.rect_filled(cap_rect, egui::CornerRadius::same(7), p.elevated);
+            painter.galley(pos(cap_rect.left() + 7.0, y - cap.size().y / 2.0), cap, p.text_muted);
+            x = cap_rect.left() - if label.is_empty() { 4.0 } else { 14.0 };
+        }
     }
 
     /// The running archive job, or what the last one did.
@@ -4466,7 +4522,7 @@ impl NeutronApp {
         // clicking a protocol chip — which takes focus away, being an ordinary
         // clickable — returns it to where there is still work to do rather than
         // dropping it into the file list behind.
-        let field_id = |field| egui::Id::new(("neutron-connect-field", field));
+        let field_id = crate::connect::field_id;
         let focused = ui.memory(|m| m.focused());
         let ours = crate::connect::FIELDS
             .iter()
@@ -4494,7 +4550,7 @@ impl NeutronApp {
             let output = egui::TextEdit::singleline(&mut text)
                 .id(id)
                 .password(crate::connect::is_secret(field))
-                .background_color(egui::Color32::TRANSPARENT)
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2)))
                 .desired_width(rect.width())
                 .font(egui::FontId::proportional(13.0))
                 .text_color(p.text)
@@ -4552,8 +4608,9 @@ impl NeutronApp {
             .add(
                 egui::Label::new(
                     egui::RichText::new(text)
-                        .color(if error { p.danger } else { p.text_muted }),
+                        .color(if error { p.danger } else { p.text_soft() }),
                 )
+                .truncate()
                 .sense(egui::Sense::click()),
             )
             .on_hover_text(if error {
@@ -4777,16 +4834,17 @@ impl NeutronApp {
             .default_size(320.0)
             .size_range(egui::Rangef::new(220.0, 640.0))
             .frame(
-                theme::card(p)
+                theme::bare_card()
                     .outer_margin(egui::Margin {
                         left: 0,
                         right: GUTTER as i8,
                         top: GUTTER as i8,
                         bottom: GUTTER as i8,
                     })
-                    .inner_margin(egui::Margin::symmetric(12, 12)),
+                    .inner_margin(egui::Margin::symmetric(14, 14)),
             )
             .show(ui, |ui| {
+                paint_panel_surface(ui, egui::Margin::symmetric(14, 14), p);
                 ui.set_min_width(ui.available_width());
                 crate::preview::show(ui, p, &self.preview, subject);
             });
@@ -4815,20 +4873,17 @@ impl NeutronApp {
             .resizable(false)
             .exact_size(crate::rail::WIDTH)
             .frame(
-                // No stroke: the wash inside already separates the strip
-                // from the sidebar, and a border around a 64px column beside a
-                // bordered sidebar is two lines doing one job.
-                theme::card(p)
-                    .stroke(egui::Stroke::NONE)
+                theme::bare_card()
                     .outer_margin(egui::Margin {
                         left: GUTTER as i8,
                         right: 0,
                         top: GUTTER as i8,
                         bottom: GUTTER as i8,
                     })
-                    .inner_margin(egui::Margin::symmetric(0, 10)),
+                    .inner_margin(egui::Margin::symmetric(0, 14)),
             )
             .show(ui, |ui| {
+                paint_panel_surface(ui, egui::Margin::symmetric(0, 14), p);
                 if let Some(chosen) = crate::rail::show(ui, p, &state) {
                     actions.push(Action::RunCommand(chosen.command()));
                 }
@@ -4874,20 +4929,25 @@ impl NeutronApp {
             .frame(
                 // A card like the panes, with the gutter carried on its outer
                 // margin so it lines up with them on every edge.
-                theme::card(p)
+                theme::bare_card()
                     .outer_margin(egui::Margin {
                         left: GUTTER as i8,
                         right: 0,
                         top: GUTTER as i8,
                         bottom: GUTTER as i8,
                     })
-                    .inner_margin(egui::Margin::symmetric(10, 12)),
+                    .inner_margin(egui::Margin { left: 12, right: 12, top: 18, bottom: 12 }),
             )
             .show(ui, |ui| {
+                paint_panel_surface(ui, egui::Margin { left: 12, right: 12, top: 18, bottom: 12 }, p);
                 ui.set_min_width(ui.available_width());
 
                 sidebar::brand(ui, p);
-                ui.add_space(6.0);
+                ui.add_space(14.0);
+                if sidebar::find_pill(ui, p) {
+                    actions.push(Action::ToggleFinder(Mode::Files));
+                }
+                ui.add_space(4.0);
 
                 // The footer is carved out of the bottom of the card before the
                 // list is drawn, so the storage panel stays pinned there rather
@@ -4911,8 +4971,10 @@ impl NeutronApp {
                     egui::pos2(body.left(), footer_top),
                     body.max,
                 );
-                if sidebar::footer(ui, p, footer, &self.drives, self.theme_mode) {
-                    actions.push(Action::ToggleTheme);
+                match sidebar::footer(ui, p, footer, &self.drives, self.theme_mode) {
+                    sidebar::FooterAction::Connect => actions.push(Action::OpenConnect),
+                    sidebar::FooterAction::ToggleTheme => actions.push(Action::ToggleTheme),
+                    sidebar::FooterAction::None => {}
                 }
             });
     }
@@ -4929,6 +4991,7 @@ impl NeutronApp {
             .auto_shrink([false, false])
             .id_salt("sidebar_scroll")
             .show(ui, |ui| {
+                sidebar::section(ui, p, "Places");
                 let dashboard = neutron_core::places::Place {
                     name: "Dashboard".to_owned(),
                     id: NodeId::Home,
@@ -4940,8 +5003,6 @@ impl NeutronApp {
                         sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(dashboard.id.clone(), at)),
                         sidebar::RowHit::None => {}
                 }
-
-                sidebar::section(ui, p, "Quick access");
                 for place in &self.known_folders {
                     match sidebar::row(ui, p, place, current) {
                             sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
@@ -4950,11 +5011,21 @@ impl NeutronApp {
                     }
                 }
 
-                for place in self.pinned_places() {
-                    match sidebar::row(ui, p, &place, current) {
-                            sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
-                            sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
-                            sidebar::RowHit::None => {}
+                // Pins get a group of their own, and only when there are any:
+                // they are the user's list, not the system's.
+                let pinned: Vec<Place> = self
+                    .pinned_places()
+                    .into_iter()
+                    .filter(|pin| !self.known_folders.iter().any(|k| k.id == pin.id))
+                    .collect();
+                if !pinned.is_empty() {
+                    sidebar::section(ui, p, "Pinned");
+                    for place in &pinned {
+                        match sidebar::row(ui, p, place, current) {
+                                sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
+                                sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
+                                sidebar::RowHit::None => {}
+                        }
                     }
                 }
 
@@ -4969,7 +5040,24 @@ impl NeutronApp {
                     }
                 }
 
-                sidebar::section(ui, p, "Cloud");
+                // Everywhere files live: the disks, the cloud, the servers.
+                sidebar::section(ui, p, "Locations");
+                for drive in &self.drives {
+                    match sidebar::row(ui, p, drive, current) {
+                            sidebar::RowHit::Open => actions.push(Action::Navigate(drive.id.clone())),
+                            sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(drive.id.clone(), at)),
+                            sidebar::RowHit::None => {}
+                    }
+                }
+                // Below the drives found so far, not above them: the slow
+                // devices are the ones still outstanding.
+                if self.scanning_drives {
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.add(egui::Spinner::new().size(10.0));
+                        ui.colored_label(p.text_faint, "Scanning…");
+                    });
+                }
                 for place in &self.cloud {
                     match sidebar::row(ui, p, place, current) {
                             sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
@@ -5030,10 +5118,6 @@ impl NeutronApp {
                     }
                 }
 
-                // Always shown, unlike Linux below: the section is where a
-                // server gets added, so hiding it when there are none would
-                // hide the only way to make one.
-                sidebar::section(ui, p, "Servers");
                 for site in &self.sites.sites {
                     let place = neutron_core::places::Place {
                         name: site.display().to_owned(),
@@ -5074,23 +5158,6 @@ impl NeutronApp {
                     }
                 }
 
-                sidebar::section(ui, p, "Drives");
-                for drive in &self.drives {
-                    match sidebar::row(ui, p, drive, current) {
-                            sidebar::RowHit::Open => actions.push(Action::Navigate(drive.id.clone())),
-                            sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(drive.id.clone(), at)),
-                            sidebar::RowHit::None => {}
-                    }
-                }
-                // Below the drives found so far, not above them: the slow
-                // devices are the ones still outstanding.
-                if self.scanning_drives {
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        ui.add(egui::Spinner::new().size(10.0));
-                        ui.colored_label(p.text_faint, "Scanning…");
-                    });
-                }
                 ui.add_space(8.0);
             });
     }
@@ -5106,6 +5173,7 @@ impl NeutronApp {
                 let mut pane_actions = Vec::new();
                 let mut group_actions = Vec::new();
 
+                panes::set_multi_pane(ui.ctx(), self.workspace.layout.len() > 1);
                 panes::show(
                     ui,
                     &self.workspace.layout,
@@ -5277,6 +5345,23 @@ impl NeutronApp {
             }
         }
 
+        // A folder's footer is carved off the bottom of its pane before the
+        // listing is laid out, so the rows end above it rather than under it.
+        let mut content_ui;
+        let ui = if matches!(tab.location(), NodeId::Home) {
+            ui
+        } else {
+            let area = ui.available_rect_before_wrap();
+            let footer = egui::Rect::from_min_max(egui::pos2(area.left(), area.bottom() - 34.0), area.max);
+            self.pane_footer(ui, p, footer, tab);
+            content_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(egui::Rect::from_min_max(area.min, egui::pos2(area.right(), footer.top())))
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            &mut content_ui
+        };
+
         if let Status::Error(e) = &tab.status {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
@@ -5298,12 +5383,21 @@ impl NeutronApp {
         // The dashboard is not a listing, so it does not go through the list
         // widget at all. It draws from what the sidebar scan already found.
         if matches!(tab.location(), NodeId::Home) {
+            // Cloud storage and saved servers, beside the disks.
+            let mut elsewhere: Vec<Place> = self.cloud.clone();
+            elsewhere.extend(self.sites.sites.iter().map(|site| Place {
+                name: site.display().to_owned(),
+                id: NodeId::remote(site.id.as_str(), site.start_path().as_str()),
+                kind: neutron_core::places::PlaceKind::Server,
+                capacity: None,
+            }));
             if let Some(hit) = crate::dashboard::show(
                 ui,
                 p,
                 &self.drives,
                 &self.quick_access(),
                 &self.recent.files,
+                &elsewhere,
             ) {
                 actions.push(match hit {
                     crate::dashboard::Chosen::Go(id) => Action::Navigate(id),
@@ -5472,14 +5566,44 @@ impl NeutronApp {
             })
             .collect();
 
-        if let Some(a) = neutron_ui::columns::show(ui, p, &columns) {
+        // The selected file, described in a column at the end — when exactly
+        // one thing is selected and it is not a folder, whose contents take
+        // that place instead.
+        let described = (!arriving && peek.is_none())
+            .then(|| visible_selection(tab))
+            .filter(|selected| selected.len() == 1)
+            .map(|selected| selected[0])
+            .filter(|&idx| !tab.list.kind(idx).is_container() || crate::columns::is_package(&dir.join(tab.list.name(idx))));
+        let info = described.map(|idx| neutron_ui::columns::Info {
+            name: tab.list.name(idx),
+            kind: tab.list.kind(idx),
+            kind_label: file_list::kind_label(tab.list.kind(idx), tab.list.name(idx)),
+            size: Some(tab.list.size(idx)),
+            modified: tab.list.modified(idx),
+            location: tidy_location(dir),
+            quick_look: cfg!(target_os = "macos"),
+        });
+
+        if let Some(a) = neutron_ui::columns::show(ui, p, &columns, info.as_ref()) {
             if group_id != self.workspace.focused {
                 actions.push(Action::FocusGroup(group_id));
             }
-            actions.push(match a {
-                ColumnAction::Current(a) => list_action(a),
-                ColumnAction::Pick { dir, entry, double } => Action::ColumnPick { dir, entry, double },
-            });
+            match a {
+                ColumnAction::Current(a) => actions.push(list_action(a)),
+                ColumnAction::Pick { dir, entry, double } => {
+                    actions.push(Action::ColumnPick { dir, entry, double })
+                }
+                ColumnAction::Open => {
+                    if let Some(idx) = described {
+                        actions.push(Action::Activate(idx));
+                    }
+                }
+                ColumnAction::QuickLook => {
+                    if let Some(idx) = described {
+                        actions.push(Action::QuickLook(dir.join(tab.list.name(idx))));
+                    }
+                }
+            }
         }
     }
 
@@ -5912,14 +6036,65 @@ impl file_list::IconSource for RowIcons<'_> {
     }
 }
 
-/// Chrome bars sit directly on the ground with no fill of their own.
+/// The interface's font files: Manrope where it has been bundled, otherwise
+/// the system's own face on the Mac, otherwise egui's built-in one. With
+/// Manrope, the system's face stands behind it for the symbols it lacks.
 ///
-/// Filled toolbar strips spanning the full window width are the most dated
-/// element a desktop app can have. Padding and the cards below provide all the
-/// separation needed.
-fn toolbar_frame(_p: &Palette) -> egui::Frame {
-    egui::Frame::new().inner_margin(egui::Margin::symmetric(GUTTER as i8 + 4, 4))
+/// Read once at start-up from the app bundle's resources, or from the source
+/// tree's `assets/fonts` during development.
+fn interface_faces() -> Option<theme::Faces> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(exe) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        dirs.push(exe.join("../Resources/fonts"));
+    }
+    dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts"));
+
+    let system = if cfg!(target_os = "macos") {
+        std::fs::read("/System/Library/Fonts/SFNS.ttf").ok()
+    } else {
+        None
+    };
+
+    for dir in dirs {
+        if let Ok(regular) = std::fs::read(dir.join("Manrope-Medium.ttf")) {
+            let strong = std::fs::read(dir.join("Manrope-Bold.ttf")).ok();
+            return Some(theme::Faces { regular, strong, fallback: system });
+        }
+    }
+
+    system.map(|regular| theme::Faces { regular, strong: None, fallback: None })
 }
+
+/// A folder's path as a person writes it: under the home folder, `~/…`.
+pub(crate) fn tidy_location(dir: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Ok(rest) = dir.strip_prefix(&home) {
+            return if rest.as_os_str().is_empty() {
+                "~".to_owned()
+            } else {
+                format!("~/{}", rest.display())
+            };
+        }
+    }
+    dir.display().to_string()
+}
+
+fn pos(x: f32, y: f32) -> egui::Pos2 {
+    egui::pos2(x, y)
+}
+
+/// Paints a side panel's pane surface under its contents.
+///
+/// The panel's frame paints nothing — a frame can only fill flat — so this
+/// runs first inside it, on the rectangle the frame would have filled, and
+/// everything the panel draws afterwards lands on top. Clipped to the window
+/// rather than to the panel, so the shadow is not cut off at the panel's edge.
+fn paint_panel_surface(ui: &egui::Ui, inner: egui::Margin, p: &Palette) {
+    let rect = ui.max_rect() + inner;
+    let painter = ui.painter().with_clip_rect(ui.ctx().content_rect());
+    theme::paint_pane(&painter, rect, theme::RADIUS_CARD as f32, p);
+}
+
 
 // --- small pieces ----------------------------------------------------------
 
@@ -6010,5 +6185,132 @@ mod certificate_tests {
         let message = format!("files.example.com presented a certificate nobody vouches for (SHA-256 {fp}). Edit the server to trust it.");
         assert_eq!(certificate_in(&message), Some(fp));
         assert_eq!(certificate_in("connection refused"), None);
+    }
+}
+
+#[cfg(test)]
+mod screens {
+    //! Renders the real interface to PNG files, for looking at a visual change
+    //! without driving the app by hand.
+    //!
+    //! Ignored by default: it needs a GPU and writes files. Run with
+    //! `NEUTRON_SHOTS=<dir> cargo test -p neutron-app screens -- --ignored`;
+    //! `NEUTRON_SHOTS_FOLDER` picks the folder shown (the repository otherwise).
+    use super::*;
+
+    fn settle(harness: &mut egui_kittest::Harness<'_, NeutronApp>) {
+        // Listings arrive from worker threads, so frames alone are not enough:
+        // give the workers wall-clock time between them.
+        for _ in 0..30 {
+            harness.run_steps(2);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    fn shoot(harness: &mut egui_kittest::Harness<'_, NeutronApp>, out: &Path, name: &str) {
+        let mut image = harness.render().expect("render");
+        // The window is transparent on the Mac; lay it over something like a
+        // dark desktop so the picture reads the way the app does.
+        for pixel in image.pixels_mut() {
+            let [r, g, b, a] = pixel.0;
+            let a = a as f32 / 255.0;
+            let over = |c: u8, bg: f32| (c as f32 + bg * (1.0 - a)).round().min(255.0) as u8;
+            pixel.0 = [over(r, 22.0), over(g, 22.0), over(b, 28.0), 255];
+        }
+        image.save(out.join(name)).expect("save");
+    }
+
+    fn act(harness: &mut egui_kittest::Harness<'_, NeutronApp>, action: Action) {
+        let ctx = harness.ctx.clone();
+        harness.state_mut().apply(&ctx, action);
+    }
+
+    #[test]
+    #[ignore]
+    fn screens() {
+        let Some(out) = std::env::var_os("NEUTRON_SHOTS").map(PathBuf::from) else {
+            return;
+        };
+        std::fs::create_dir_all(&out).unwrap();
+        let folder = std::env::var("NEUTRON_SHOTS_FOLDER").unwrap_or_else(|_| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap().display().to_string()
+        });
+
+        let (_keep, opened) = crossbeam_channel::unbounded();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .with_pixels_per_point(1.0)
+            .wgpu()
+            .build_eframe(|cc| NeutronApp::new(cc, StartupTimer::new(Instant::now()), Some(folder), opened));
+
+        act(&mut harness, Action::SetView(file_list::ViewMode::List));
+        settle(&mut harness);
+        // A selected row, so the selection is in the picture.
+        let idx = {
+            let t = harness.state().workspace.active_tab().unwrap();
+            (0..t.list.len()).find(|&i| t.list.name(i) == "Cargo.toml").unwrap_or(0)
+        };
+        act(&mut harness, Action::Select { idx, mode: SelectMode::Replace });
+        settle(&mut harness);
+        shoot(&mut harness, &out, "list.png");
+
+        act(&mut harness, Action::TogglePreview);
+        harness.state_mut().notices.info("Copied 1 item");
+        settle(&mut harness);
+        shoot(&mut harness, &out, "preview.png");
+        act(&mut harness, Action::TogglePreview);
+        act(&mut harness, Action::DismissNotice);
+
+        act(&mut harness, Action::SetView(file_list::ViewMode::Columns));
+        settle(&mut harness);
+        shoot(&mut harness, &out, "columns.png");
+
+        act(&mut harness, Action::SetView(file_list::ViewMode::Grid));
+        settle(&mut harness);
+        shoot(&mut harness, &out, "grid.png");
+
+        // The overlays, over the list.
+        act(&mut harness, Action::SetView(file_list::ViewMode::List));
+        act(&mut harness, Action::ContextMenu { idx: Some(idx), pos: egui::pos2(760.0, 470.0) });
+        settle(&mut harness);
+        shoot(&mut harness, &out, "menu.png");
+        // Dropping the reply releases the thread parked on the menu.
+        harness.state_mut().menu = None;
+        harness.state_mut().menu_reply = None;
+
+        act(&mut harness, Action::ToggleFinder(crate::finder::Mode::Files));
+        settle(&mut harness);
+        shoot(&mut harness, &out, "finder.png");
+        act(&mut harness, Action::CloseFinder);
+
+        // The question alone, set directly: `apply` would delete. What follows
+        // a yes is made harmless in case anything answers it.
+        {
+            let app = harness.state_mut();
+            let question = app.question_for(&Action::Delete { permanent: true });
+            let subject = app.subject();
+            app.confirm = question.map(|q| (q, Box::new(Action::DismissNotice), subject));
+        }
+        settle(&mut harness);
+        shoot(&mut harness, &out, "confirm.png");
+        harness.state_mut().confirm = None;
+
+        act(&mut harness, Action::OpenConnect);
+        settle(&mut harness);
+        shoot(&mut harness, &out, "connect.png");
+        harness.state_mut().connect.close();
+
+        act(&mut harness, Action::Navigate(NodeId::Home));
+        settle(&mut harness);
+        shoot(&mut harness, &out, "dashboard.png");
+
+        // The other theme, back where the list was. Flipped back afterwards:
+        // the choice is saved, and a test has no business changing it.
+        act(&mut harness, Action::Back);
+        act(&mut harness, Action::ToggleTheme);
+        settle(&mut harness);
+        shoot(&mut harness, &out, "light.png");
+        act(&mut harness, Action::ToggleTheme);
+        settle(&mut harness);
     }
 }

@@ -80,10 +80,32 @@ fn install_dir() -> Result<PathBuf, String> {
 
 fn target_dir(debug: bool) -> PathBuf {
     let profile = if debug { "debug" } else { "release" };
-    let base = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from)
+    let base = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .or_else(configured_target_dir)
         .unwrap_or_else(|| workspace_root().join("target"));
     let base = if base.is_absolute() { base } else { workspace_root().join(base) };
     base.join(profile)
+}
+
+/// Where cargo actually puts its output, asked of cargo itself.
+///
+/// A `build.target-dir` in a user's `~/.cargo/config.toml` moves every build
+/// out of `target/`, and nothing in the environment says so. Assuming
+/// `target/` then looks for a binary that was built somewhere else entirely.
+fn configured_target_dir() -> Option<PathBuf> {
+    let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .current_dir(workspace_root())
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let json = String::from_utf8(output.stdout).ok()?;
+    // One field out of a large document; not worth a JSON dependency for.
+    let key = "\"target_directory\":\"";
+    let start = json.find(key)? + key.len();
+    let end = start + json[start..].find('"')?;
+    Some(PathBuf::from(json[start..end].replace("\\\\", "\\")))
 }
 
 /// The workspace root, from this crate's manifest rather than the current

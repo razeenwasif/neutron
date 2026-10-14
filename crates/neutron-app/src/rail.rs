@@ -24,13 +24,13 @@ use neutron_ui::icons::{self, Glyph};
 use neutron_ui::theme::{self, Palette};
 
 /// Width of the strip, including its padding.
-pub const WIDTH: f32 = 64.0;
+pub const WIDTH: f32 = 76.0;
 
 /// Height of one button: glyph, then its label, with room to breathe.
-const ITEM: f32 = 52.0;
+const ITEM: f32 = 68.0;
 
 /// Space between buttons within a group.
-const SPACING: f32 = 4.0;
+const SPACING: f32 = 2.0;
 
 /// What the rail is asking for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +148,7 @@ fn items() -> Vec<Option<Item>> {
         }),
         Some(Item {
             glyph: Glyph::Trash,
-            label: "Delete",
+            label: if cfg!(target_os = "macos") { "Trash" } else { "Delete" },
             action: RailAction::Delete,
             hint: if cfg!(target_os = "macos") {
                 "Move to Trash (Cmd+Backspace)"
@@ -183,14 +183,7 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
     let mut chosen = None;
     let full = ui.available_rect_before_wrap();
 
-    // A whisper of a gradient down the strip, so the rail reads as a distinct
-    // surface from the sidebar beside it without needing a heavier fill or a
-    // second border to say so.
-    // The card, not an expanded copy of it: anything painted outside the
-    // frame lands on the ground as a band down each side, and squares off the
-    // corners on the way.
-    theme::vertical_wash(ui.painter(), full, theme::RADIUS_CARD as f32, p);
-
+    let _ = full;
     egui::ScrollArea::vertical()
         .id_salt("action-rail-scroll")
         .auto_shrink([false; 2])
@@ -200,7 +193,7 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
 
             for entry in items() {
                 let Some(item) = entry else {
-                    y += 14.0;
+                    y += 12.0;
                     continue;
                 };
 
@@ -219,41 +212,44 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
                     },
                 );
 
-                if enabled && response.hovered() {
+                // Each verb sits in a soft well. Under the pointer the well
+                // lifts and its glyph takes the accent; an unavailable verb's
+                // well all but disappears and its glyph and label go faint.
+                let well = egui::Rect::from_center_size(
+                    pos2(rect.center().x, rect.top() + 6.0 + 20.0),
+                    vec2(40.0, 40.0),
+                );
+                let corners = egui::CornerRadius::same(14);
+                let hovered = enabled && response.hovered();
+                if hovered {
+                    theme::paint_raised(ui.painter(), well, corners, p);
+                } else {
                     ui.painter().rect_filled(
-                        rect.shrink2(vec2(6.0, 1.0)),
-                        theme::RADIUS_CONTROL,
-                        p.hover,
+                        well,
+                        corners,
+                        egui::Color32::from_white_alpha(if enabled { 10 } else { 5 }),
                     );
                 }
 
-                // Dimming is done by choosing a fainter colour rather than by fading
-                // the whole row: egui has no opacity on a painter, and a grey glyph
-                // beside grey text is the same signal.
                 let (glyph_colour, text_colour) = if !enabled {
-                    (p.text_faint, p.text_faint)
-                } else if response.hovered() {
-                    (p.text, p.text)
+                    (theme::with_alpha(p.text_faint, 130), theme::with_alpha(p.text_faint, 130))
+                } else if hovered {
+                    (p.accent, p.text)
                 } else {
-                    (p.icon, p.text_muted)
+                    (p.text_soft(), p.text_soft())
                 };
 
-                icons::draw(
-                    ui.painter(),
-                    pos2(rect.center().x, rect.top() + 17.0),
-                    item.glyph,
-                    glyph_colour,
-                );
+                icons::draw(ui.painter(), well.center(), item.glyph, glyph_colour);
 
                 let galley = ui.painter().layout_no_wrap(
                     item.label.to_owned(),
-                    egui::FontId::proportional(9.5),
+                    theme::strong(ui.ctx(), 10.5),
                     text_colour,
                 );
                 ui.painter().galley(
                     pos2(
                         (rect.center().x - galley.size().x / 2.0).round(),
-                        rect.top() + 32.0,
+                        well.bottom() + 5.0,
                     ),
                     galley,
                     text_colour,
@@ -263,11 +259,7 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
                     egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, item.label)
                 });
                 let hint = unavailable.unwrap_or(item.hint);
-                let hint = if cfg!(target_os = "macos") {
-                    hint.replace("Ctrl+", "Cmd+")
-                } else {
-                    hint.to_owned()
-                };
+                let hint = neutron_ui::format::shortcut(hint);
                 let response = response.on_hover_text(hint);
                 if enabled && response.clicked() {
                     chosen = Some(item.action);

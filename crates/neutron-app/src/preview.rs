@@ -824,8 +824,7 @@ fn header(ui: &mut egui::Ui, p: &neutron_ui::Palette, subject: &Subject<'_>) {
     ui.label(
         egui::RichText::new(subject.name)
             .color(p.text)
-            .size(13.0)
-            .strong(),
+            .font(neutron_ui::theme::strong(ui.ctx(), 15.0)),
     );
 
     // One line of facts rather than a table: the pane is narrow, and a label
@@ -839,7 +838,7 @@ fn header(ui: &mut egui::Ui, p: &neutron_ui::Palette, subject: &Subject<'_>) {
     ui.label(
         egui::RichText::new(facts.join("  ·  "))
             .color(p.text_muted)
-            .size(11.0),
+            .size(12.0),
     );
 }
 
@@ -852,10 +851,12 @@ fn text_body(ui: &mut egui::Ui, p: &neutron_ui::Palette, text: &str, truncated: 
         );
     }
 
+    // Pressed into the pane, as every well is.
     egui::Frame::new()
         .fill(p.inset)
-        .corner_radius(egui::CornerRadius::same(neutron_ui::theme::RADIUS_SMALL))
-        .inner_margin(egui::Margin::same(8))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(9)))
+        .corner_radius(egui::CornerRadius::same(neutron_ui::theme::RADIUS_WELL))
+        .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
             egui::ScrollArea::both()
                 .auto_shrink([false; 2])
@@ -867,8 +868,8 @@ fn text_body(ui: &mut egui::Ui, p: &neutron_ui::Palette, text: &str, truncated: 
                         egui::Label::new(
                             egui::RichText::new(text)
                                 .monospace()
-                                .size(11.0)
-                                .color(p.text),
+                                .size(11.5)
+                                .color(p.text_soft()),
                         )
                         .wrap_mode(egui::TextWrapMode::Extend),
                     );

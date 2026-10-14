@@ -67,11 +67,36 @@ pub enum Glyph {
     NewFolder,
     Extract,
     Compress,
+
+    // --- velvet: places and kinds of file, drawn from 24-unit outlines ---
+    /// Tiles of different sizes — the dashboard.
+    Dashboard,
+    Desktop,
+    Download,
+    /// A page with lines on it.
+    Document,
+    Image,
+    Music,
+    Film,
+    /// A page with brackets on it — source and configuration.
+    Code,
+    /// A box with a zip down it.
+    Archive,
+    /// A page with its corner folded — anything else.
+    Page,
+    Plus,
+    Close,
+    /// Three crossed orbits — Neutron's mark when its icon is not to hand.
+    Atom,
 }
 
 /// Draws `glyph` centred on `centre`.
 pub fn draw(painter: &Painter, centre: Pos2, glyph: Glyph, colour: Color32) {
-    let stroke = Stroke::new(STROKE_WIDTH, colour);
+    draw_with(painter, centre, glyph, Stroke::new(STROKE_WIDTH, colour));
+}
+
+fn draw_with(painter: &Painter, centre: Pos2, glyph: Glyph, stroke: Stroke) {
+    let colour = stroke.color;
     match glyph {
         Glyph::Home => home(painter, centre, stroke),
         Glyph::Folder => folder(painter, centre, stroke),
@@ -101,7 +126,71 @@ pub fn draw(painter: &Painter, centre: Pos2, glyph: Glyph, colour: Color32) {
         Glyph::NewFolder => folder_plus(painter, centre, stroke),
         Glyph::Extract => extract(painter, centre, stroke),
         Glyph::Compress => compress(painter, centre, stroke),
+        Glyph::Dashboard => outlines::dashboard(painter, centre, stroke),
+        Glyph::Desktop => outlines::desktop(painter, centre, stroke),
+        Glyph::Download => outlines::download(painter, centre, stroke),
+        Glyph::Document => outlines::document(painter, centre, stroke),
+        Glyph::Image => outlines::image(painter, centre, stroke),
+        Glyph::Music => outlines::music(painter, centre, stroke),
+        Glyph::Film => outlines::film(painter, centre, stroke),
+        Glyph::Code => outlines::code(painter, centre, stroke),
+        Glyph::Archive => outlines::archive(painter, centre, stroke),
+        Glyph::Page => outlines::page(painter, centre, stroke),
+        Glyph::Plus => outlines::plus(painter, centre, stroke),
+        Glyph::Close => outlines::close(painter, centre, stroke),
+        Glyph::Atom => outlines::atom(painter, centre, stroke),
     }
+}
+
+/// Draws `glyph` at `scale` times its usual size — for a large tile.
+pub fn draw_scaled(painter: &Painter, centre: Pos2, glyph: Glyph, colour: Color32, scale: f32) {
+    // Lines thicken with size, but less than in proportion: a glyph twice the
+    // size with lines twice as heavy reads as bold, not as larger.
+    let width = STROKE_WIDTH * scale.max(1.0).sqrt();
+    if is_outline(glyph) {
+        outlines::with_scale(scale, || draw_with(painter, centre, glyph, Stroke::new(width, colour)));
+        return;
+    }
+
+    // The older glyphs are drawn to a fixed envelope, so they are drawn at
+    // their usual size and the shapes scaled about the centre afterwards. Each
+    // keeps the clip it was drawn with: scaling the clip as well would let a
+    // glyph at the edge of a scrolled list paint over whatever is past it.
+    let start = painter.add(Shape::Noop).0;
+    draw_with(painter, centre, glyph, Stroke::new(width / scale, colour));
+    let transform = egui::emath::TSTransform::new(centre.to_vec2() * (1.0 - scale), scale);
+    painter.ctx().graphics_mut(|g| {
+        let list = g.entry(painter.layer_id());
+        let drawn: Vec<_> = list
+            .all_entries()
+            .skip(start)
+            .map(|c| (c.clip_rect, c.shape.clone()))
+            .collect();
+        for (offset, (clip, mut shape)) in drawn.into_iter().enumerate() {
+            shape.transform(transform);
+            list.set(egui::layers::ShapeIdx(start + offset), clip, shape);
+        }
+    });
+}
+
+/// Whether `glyph` is drawn from the 24-unit outlines, which scale themselves.
+fn is_outline(glyph: Glyph) -> bool {
+    matches!(
+        glyph,
+        Glyph::Dashboard
+            | Glyph::Desktop
+            | Glyph::Download
+            | Glyph::Document
+            | Glyph::Image
+            | Glyph::Music
+            | Glyph::Film
+            | Glyph::Code
+            | Glyph::Archive
+            | Glyph::Page
+            | Glyph::Plus
+            | Glyph::Close
+            | Glyph::Atom
+    )
 }
 
 /// A tick sized to fit inside a circle of `radius`.
@@ -121,6 +210,95 @@ pub fn check(painter: &Painter, centre: Pos2, radius: f32, colour: Color32) {
         ],
         stroke,
     ));
+}
+
+/// What kind of thing an entry is, for the tinted tile it is drawn on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    Folder,
+    Code,
+    Document,
+    Image,
+    Video,
+    Audio,
+    Archive,
+    Link,
+    Drive,
+    Plain,
+}
+
+impl FileKind {
+    /// Sorts an entry by its kind on disk and, for a file, its extension.
+    pub fn of(name: &str, kind: EntryKind) -> FileKind {
+        match kind {
+            EntryKind::Directory => return FileKind::Folder,
+            EntryKind::Drive => return FileKind::Drive,
+            EntryKind::Junction | EntryKind::Symlink => return FileKind::Link,
+            EntryKind::Virtual => return FileKind::Plain,
+            EntryKind::File => {}
+        }
+        let lower = name.to_ascii_lowercase();
+        if matches!(lower.as_str(), "makefile" | "dockerfile" | "justfile" | "license" | "licence") {
+            return if lower.starts_with("lic") { FileKind::Document } else { FileKind::Code };
+        }
+        let Some((_, ext)) = lower.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()) else {
+            return FileKind::Plain;
+        };
+        match ext {
+            "rs" | "toml" | "lock" | "json" | "yaml" | "yml" | "js" | "mjs" | "cjs" | "ts" | "tsx"
+            | "jsx" | "py" | "go" | "c" | "h" | "cc" | "cpp" | "hpp" | "swift" | "kt" | "java"
+            | "sh" | "zsh" | "bash" | "fish" | "css" | "scss" | "html" | "htm" | "xml" | "sql"
+            | "rb" | "php" | "lua" | "cs" | "m" | "mm" | "plist" | "ini" | "cfg" | "conf"
+            | "env" | "gradle" | "vue" | "svelte" | "zig" | "nix" | "wgsl" | "glsl" => FileKind::Code,
+            "md" | "markdown" | "txt" | "pdf" | "doc" | "docx" | "rtf" | "pages" | "odt" | "tex"
+            | "epub" | "csv" | "tsv" | "key" | "numbers" | "xls" | "xlsx" | "ppt" | "pptx" => {
+                FileKind::Document
+            }
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif" | "tif" | "tiff" | "bmp"
+            | "svg" | "ico" | "icns" | "psd" | "raw" | "avif" => FileKind::Image,
+            "mp4" | "mov" | "mkv" | "avi" | "webm" | "m4v" => FileKind::Video,
+            "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "aiff" => FileKind::Audio,
+            "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "dmg" | "pkg" | "iso"
+            | "zst" => FileKind::Archive,
+            _ => FileKind::Plain,
+        }
+    }
+
+    pub fn glyph(self) -> Glyph {
+        match self {
+            FileKind::Folder => Glyph::Folder,
+            FileKind::Code => Glyph::Code,
+            FileKind::Document => Glyph::Document,
+            FileKind::Image => Glyph::Image,
+            FileKind::Video => Glyph::Film,
+            FileKind::Audio => Glyph::Music,
+            FileKind::Archive => Glyph::Archive,
+            FileKind::Link => Glyph::Link,
+            FileKind::Drive => Glyph::Drive,
+            FileKind::Plain => Glyph::Page,
+        }
+    }
+
+    pub fn tint(self, p: &crate::theme::Palette) -> Color32 {
+        match self {
+            FileKind::Folder => p.tints.folder,
+            FileKind::Code => p.tints.code,
+            FileKind::Document => p.tints.document,
+            FileKind::Image | FileKind::Video | FileKind::Audio => p.tints.image,
+            FileKind::Archive => p.tints.archive,
+            FileKind::Link | FileKind::Drive | FileKind::Plain => p.tints.plain,
+        }
+    }
+}
+
+/// A file's icon tile: its kind's tint at low strength behind its glyph.
+pub fn tile(painter: &Painter, rect: Rect, kind: FileKind, p: &crate::theme::Palette, dim: bool) {
+    let tint = kind.tint(p);
+    let radius = (rect.height() * 0.32).round();
+    painter.rect_filled(rect, radius, crate::theme::with_alpha(tint, if dim { 18 } else { 33 }));
+    let scale = rect.height() / 28.0;
+    let colour = if dim { crate::theme::with_alpha(tint, 140) } else { tint };
+    draw_scaled(painter, rect.center(), kind.glyph(), colour, scale);
 }
 
 /// The glyph for a directory entry.
@@ -591,6 +769,16 @@ mod tests {
     /// Drawn from the radius rather than at a fixed size, because the same
     /// helper is what any future badge would use.
     #[test]
+    fn kinds_follow_the_extension_and_ignore_its_case() {
+        assert_eq!(FileKind::of("main.RS", EntryKind::File), FileKind::Code);
+        assert_eq!(FileKind::of("README.md", EntryKind::File), FileKind::Document);
+        assert_eq!(FileKind::of("icon.PNG", EntryKind::File), FileKind::Image);
+        assert_eq!(FileKind::of("release.tar.gz", EntryKind::File), FileKind::Archive);
+        assert_eq!(FileKind::of(".gitignore", EntryKind::File), FileKind::Plain);
+        assert_eq!(FileKind::of("src", EntryKind::Directory), FileKind::Folder);
+    }
+
+    #[test]
     fn a_check_stays_inside_its_badge() {
         for radius in [6.0f32, 9.0, 14.0, 24.0] {
             let s = radius * 0.52;
@@ -664,5 +852,167 @@ mod tests {
         // They were the same glyph before the sidebar needed to distinguish a
         // volume from a directory.
         assert_ne!(for_kind(EntryKind::Drive), for_kind(EntryKind::Directory));
+    }
+}
+
+
+/// Glyphs drawn from the same 24-unit outlines as the design mockups, so the
+/// app and the design agree on every shape.
+mod outlines {
+    use std::cell::Cell;
+
+    use egui::{Painter, Pos2, Rect, Shape, Stroke, pos2};
+
+    /// Points per outline unit at the usual size: a 24-unit outline drawn in
+    /// about 17 points, the size the mockups draw them in a row.
+    const K: f32 = 0.72;
+
+    thread_local! { static SCALE: Cell<f32> = const { Cell::new(1.0) }; }
+
+    pub fn with_scale(scale: f32, f: impl FnOnce()) {
+        let before = SCALE.with(|s| s.replace(scale));
+        f();
+        SCALE.with(|s| s.set(before));
+    }
+
+    fn k() -> f32 {
+        K * SCALE.with(Cell::get)
+    }
+
+    /// An outline point, relative to the 24-unit box's centre at (12, 12).
+    fn u(c: Pos2, x: f32, y: f32) -> Pos2 {
+        let k = k();
+        pos2(c.x + (x - 12.0) * k, c.y + (y - 12.0) * k)
+    }
+
+    // An SVG `<rect>`'s attributes, one argument each, so a shape can be
+    // copied from the mockups' outlines as written.
+    #[allow(clippy::too_many_arguments)]
+    fn rect(painter: &Painter, c: Pos2, x: f32, y: f32, w: f32, h: f32, r: f32, stroke: Stroke) {
+        painter.rect_stroke(
+            Rect::from_min_max(u(c, x, y), u(c, x + w, y + h)),
+            r * k(),
+            stroke,
+            egui::StrokeKind::Middle,
+        );
+    }
+
+    fn line(painter: &Painter, c: Pos2, points: &[(f32, f32)], stroke: Stroke) {
+        painter.add(Shape::line(points.iter().map(|&(x, y)| u(c, x, y)).collect(), stroke));
+    }
+
+    fn closed(painter: &Painter, c: Pos2, points: &[(f32, f32)], stroke: Stroke) {
+        painter.add(Shape::closed_line(points.iter().map(|&(x, y)| u(c, x, y)).collect(), stroke));
+    }
+
+    fn circle(painter: &Painter, c: Pos2, x: f32, y: f32, r: f32, stroke: Stroke) {
+        painter.circle_stroke(u(c, x, y), r * k(), stroke);
+    }
+
+    /// A page with a folded corner, its other corners softened.
+    fn sheet(painter: &Painter, c: Pos2, stroke: Stroke) {
+        closed(
+            painter,
+            c,
+            &[
+                (7.0, 3.5),
+                (13.5, 3.5),
+                (18.0, 8.0),
+                (18.0, 18.6),
+                (17.4, 20.0),
+                (16.0, 20.5),
+                (7.0, 20.5),
+                (5.6, 20.0),
+                (5.0, 18.6),
+                (5.0, 5.4),
+                (5.6, 4.0),
+            ],
+            stroke,
+        );
+    }
+
+    pub fn dashboard(p: &Painter, c: Pos2, s: Stroke) {
+        rect(p, c, 3.5, 3.5, 7.5, 9.0, 2.0, s);
+        rect(p, c, 13.0, 3.5, 7.5, 5.5, 2.0, s);
+        rect(p, c, 13.0, 11.0, 7.5, 9.5, 2.0, s);
+        rect(p, c, 3.5, 14.5, 7.5, 6.0, 2.0, s);
+    }
+
+    pub fn desktop(p: &Painter, c: Pos2, s: Stroke) {
+        rect(p, c, 3.5, 4.5, 17.0, 11.5, 2.5, s);
+        line(p, c, &[(9.0, 20.0), (15.0, 20.0)], s);
+        line(p, c, &[(12.0, 16.0), (12.0, 20.0)], s);
+    }
+
+    pub fn download(p: &Painter, c: Pos2, s: Stroke) {
+        line(p, c, &[(12.0, 4.0), (12.0, 15.0)], s);
+        line(p, c, &[(7.5, 10.5), (12.0, 15.0), (16.5, 10.5)], s);
+        line(p, c, &[(5.0, 19.5), (19.0, 19.5)], s);
+    }
+
+    pub fn document(p: &Painter, c: Pos2, s: Stroke) {
+        sheet(p, c, s);
+        line(p, c, &[(8.5, 12.5), (15.5, 12.5)], s);
+        line(p, c, &[(8.5, 15.5), (13.5, 15.5)], s);
+    }
+
+    pub fn code(p: &Painter, c: Pos2, s: Stroke) {
+        sheet(p, c, s);
+        line(p, c, &[(10.2, 12.5), (8.4, 14.3), (10.2, 16.1)], s);
+        line(p, c, &[(13.8, 12.5), (15.6, 14.3), (13.8, 16.1)], s);
+    }
+
+    pub fn page(p: &Painter, c: Pos2, s: Stroke) {
+        sheet(p, c, s);
+        line(p, c, &[(13.5, 3.5), (13.5, 8.0), (18.0, 8.0)], s);
+    }
+
+    pub fn image(p: &Painter, c: Pos2, s: Stroke) {
+        rect(p, c, 3.5, 4.5, 17.0, 15.0, 3.0, s);
+        circle(p, c, 9.0, 10.0, 1.6, s);
+        line(p, c, &[(20.0, 15.0), (16.0, 11.0), (8.5, 18.5)], s);
+    }
+
+    pub fn archive(p: &Painter, c: Pos2, s: Stroke) {
+        rect(p, c, 4.5, 3.5, 15.0, 17.0, 3.0, s);
+        line(p, c, &[(12.0, 3.5), (12.0, 6.0)], s);
+        line(p, c, &[(12.0, 8.5), (12.0, 10.5)], s);
+        line(p, c, &[(12.0, 13.0), (12.0, 15.0)], s);
+    }
+
+    pub fn music(p: &Painter, c: Pos2, s: Stroke) {
+        line(p, c, &[(9.0, 17.0), (9.0, 6.0), (18.0, 4.5), (18.0, 15.5)], s);
+        circle(p, c, 7.0, 17.0, 2.0, s);
+        circle(p, c, 16.0, 15.5, 2.0, s);
+    }
+
+    pub fn film(p: &Painter, c: Pos2, s: Stroke) {
+        rect(p, c, 3.5, 5.0, 17.0, 14.0, 3.0, s);
+        line(p, c, &[(8.0, 5.0), (8.0, 19.0)], s);
+        line(p, c, &[(16.0, 5.0), (16.0, 19.0)], s);
+    }
+
+    pub fn plus(p: &Painter, c: Pos2, s: Stroke) {
+        line(p, c, &[(12.0, 6.0), (12.0, 18.0)], s);
+        line(p, c, &[(6.0, 12.0), (18.0, 12.0)], s);
+    }
+
+    pub fn close(p: &Painter, c: Pos2, s: Stroke) {
+        line(p, c, &[(7.5, 7.5), (16.5, 16.5)], s);
+        line(p, c, &[(16.5, 7.5), (7.5, 16.5)], s);
+    }
+
+    pub fn atom(p: &Painter, c: Pos2, s: Stroke) {
+        for angle in [0.0f32, 60.0, 120.0] {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let points: Vec<Pos2> = (0..=40)
+                .map(|i| {
+                    let t = i as f32 / 40.0 * std::f32::consts::TAU;
+                    let (x, y) = (9.0 * t.cos(), 3.6 * t.sin());
+                    u(c, 12.0 + x * cos - y * sin, 12.0 + x * sin + y * cos)
+                })
+                .collect();
+            p.add(Shape::line(points, s));
+        }
     }
 }

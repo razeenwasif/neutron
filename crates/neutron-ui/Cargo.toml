@@ -9,3 +9,6 @@ license.workspace = true
 neutron-core.workspace = true
 egui.workspace = true
 serde.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

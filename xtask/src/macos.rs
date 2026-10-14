@@ -31,6 +31,12 @@ pub fn bundle(args: &[String]) -> Result<PathBuf, String> {
         .arg("crates/neutron-shell/macos/bridge.swift")
         .arg("-o").arg(macos.join("neutron-macos")))?;
     icon(&resources, &built)?;
+    // The interface font, and the licence it is distributed under.
+    let fonts = resources.join("fonts");
+    std::fs::create_dir_all(&fonts).map_err(|e| e.to_string())?;
+    for name in ["Manrope-Medium.ttf", "Manrope-Bold.ttf", "OFL.txt"] {
+        copy(&workspace_root().join("assets/fonts").join(name), &fonts.join(name))?;
+    }
     let plist = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>

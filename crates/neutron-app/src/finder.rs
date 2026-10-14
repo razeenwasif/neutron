@@ -27,7 +27,8 @@
 
 use egui::{Align2, Color32, Rect, Sense, Ui, pos2, vec2};
 use neutron_ui::icons::{self, Glyph};
-use neutron_ui::theme::{Palette, RADIUS_CARD, RADIUS_CONTROL};
+use egui::CornerRadius;
+use neutron_ui::theme::{self, Palette, RADIUS_CARD, RADIUS_CONTROL};
 
 /// Which corpus the overlay is searching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,9 +194,12 @@ impl Finder {
 
 /// Geometry, shared with the app so it can place the text field.
 const WIDTH: f32 = 780.0;
-const PROMPT_H: f32 = 54.0;
-const STATUS_H: f32 = 26.0;
-const ROW_H: f32 = 46.0;
+const PROMPT_H: f32 = 64.0;
+const STATUS_H: f32 = 30.0;
+const ROW_H: f32 = 52.0;
+/// The search well across the top of the card.
+const WELL_INSET: f32 = 12.0;
+const WELL_H: f32 = 44.0;
 const MAX_H: f32 = 600.0;
 const TOP: f32 = 72.0;
 
@@ -217,9 +221,12 @@ pub fn visible_rows(screen: Rect) -> usize {
 /// Where the app draws the text field.
 pub fn field_rect(screen: Rect, rows: usize) -> Rect {
     let card = card_rect(screen, rows);
+    // A 16pt line sits 12pt below the field's top, so this puts it on the
+    // well's centre line.
+    let centre = card.top() + WELL_INSET + WELL_H / 2.0;
     Rect::from_min_max(
-        pos2(card.left() + 50.0, card.top() + 11.0),
-        pos2(card.right() - 110.0, card.top() + PROMPT_H - 9.0),
+        pos2(card.left() + 56.0, centre - 12.0),
+        pos2(card.right() - 100.0, centre + 14.0),
     )
 }
 
@@ -246,20 +253,7 @@ pub fn show(ui: &mut Ui, p: &Palette, finder: &Finder) -> Option<FinderAction> {
     // Scrim. Dark in both themes — it dims the window behind, and a light scrim
     // over a light UI reads as fog rather than depth.
     painter.rect_filled(screen, 0.0, Color32::from_black_alpha(104));
-    let shadow = egui::epaint::Shadow {
-        offset: [0, 16],
-        blur: 48,
-        spread: 0,
-        color: Color32::from_black_alpha(90),
-    };
-    painter.add(shadow.as_shape(card, egui::CornerRadius::same(RADIUS_CARD)));
-    painter.rect(
-        card,
-        RADIUS_CARD as f32,
-        p.elevated,
-        egui::Stroke::new(1.0, p.border_strong),
-        egui::StrokeKind::Inside,
-    );
+    theme::paint_pane(&painter, card, RADIUS_CARD as f32, p);
 
     let scrim = ui.interact(screen, ui.id().with("finder-scrim"), Sense::click());
 
@@ -284,42 +278,35 @@ pub fn show(ui: &mut Ui, p: &Palette, finder: &Finder) -> Option<FinderAction> {
 fn prompt(ui: &Ui, p: &Palette, card: Rect, finder: &Finder) {
     let painter = ui.painter();
 
-    icons::draw(
-        painter,
-        pos2(card.left() + 28.0, card.top() + PROMPT_H / 2.0),
-        finder.mode.glyph(),
-        p.text_faint,
+    // The field sits in a well, as the folder filter does: the one place on
+    // the card that takes typing is the one pressed into it.
+    let well = Rect::from_min_max(
+        pos2(card.left() + WELL_INSET, card.top() + WELL_INSET),
+        pos2(card.right() - WELL_INSET, card.top() + WELL_INSET + WELL_H),
     );
+    theme::paint_well(painter, well, theme::pill(WELL_H), p);
 
-    // Mode chip, right-aligned in the prompt row.
+    icons::draw(painter, pos2(well.left() + 22.0, well.center().y), finder.mode.glyph(), p.text_faint);
+
+    // Mode chip, at the well's right end.
     let chip_text = finder.mode.chip();
-    let galley = painter.layout_no_wrap(
-        chip_text.to_owned(),
-        egui::FontId::proportional(9.5),
-        p.accent,
-    );
+    let galley = painter.layout_no_wrap(chip_text.to_owned(), theme::strong(ui.ctx(), 10.0), p.accent);
     let chip = Rect::from_center_size(
-        pos2(card.right() - 24.0 - galley.size().x / 2.0, card.top() + PROMPT_H / 2.0),
-        vec2(galley.size().x + 16.0, 20.0),
+        pos2(well.right() - 12.0 - (galley.size().x + 18.0) / 2.0, well.center().y),
+        vec2(galley.size().x + 18.0, 24.0),
     );
-    painter.rect_filled(chip, RADIUS_CONTROL as f32, p.selection);
+    painter.rect_filled(chip, theme::pill(24.0), p.selection);
     painter.galley(
         pos2(chip.center().x - galley.size().x / 2.0, chip.center().y - galley.size().y / 2.0),
         galley,
         p.accent,
     );
 
-    painter.hline(
-        (card.left() + 14.0)..=(card.right() - 14.0),
-        card.top() + PROMPT_H,
-        egui::Stroke::new(1.0, p.border),
-    );
-
     painter.text(
-        pos2(card.left() + 50.0, card.top() + PROMPT_H + STATUS_H / 2.0),
+        pos2(card.left() + 24.0, card.top() + PROMPT_H + STATUS_H / 2.0 - 2.0),
         Align2::LEFT_CENTER,
         &finder.status,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(11.5),
         p.text_faint,
     );
 }
@@ -358,34 +345,35 @@ fn rows(
         let response = ui.interact(rect, ui.id().with(("finder-row", index)), Sense::click());
         let selected = index == finder.cursor;
 
+        // The list's selection: a wash with a faint ring.
+        let band = rect.shrink2(vec2(4.0, 2.0));
+        let corners = CornerRadius::same(RADIUS_CONTROL);
         if selected {
-            ui.painter().rect_filled(
-                rect.shrink2(vec2(4.0, 3.0)),
-                RADIUS_CONTROL as f32,
+            ui.painter().rect(
+                band,
+                corners,
                 p.selection,
+                egui::Stroke::new(1.0, theme::with_alpha(p.accent, 56)),
+                egui::StrokeKind::Inside,
             );
         } else if response.hovered() {
-            ui.painter()
-                .rect_filled(rect.shrink2(vec2(4.0, 3.0)), RADIUS_CONTROL as f32, p.hover);
+            ui.painter().rect_filled(band, corners, p.hover);
         }
 
-        icons::draw(
-            ui.painter(),
-            pos2(rect.left() + 26.0, rect.center().y),
-            if finder.mode == Mode::Commands {
-                Glyph::ChevronRight
-            } else if row.is_dir {
-                Glyph::Folder
-            } else {
-                Glyph::File
-            },
-            if selected { p.accent } else { p.icon },
-        );
+        // Files get the list's tinted tile; commands a quiet plate.
+        let tile = Rect::from_center_size(pos2(rect.left() + 28.0, rect.center().y), vec2(30.0, 30.0));
+        if finder.mode == Mode::Commands {
+            ui.painter().rect_filled(tile, CornerRadius::same(10), Color32::from_white_alpha(10));
+            icons::draw(ui.painter(), tile.center(), Glyph::ChevronRight, if selected { p.accent } else { p.text_muted });
+        } else {
+            let kind = if row.is_dir { neutron_core::EntryKind::Directory } else { neutron_core::EntryKind::File };
+            icons::tile(ui.painter(), tile, icons::FileKind::of(&row.primary, kind), p, false);
+        }
 
         draw_highlighted(
             ui,
-            pos2(rect.left() + 48.0, rect.center().y - 9.0),
-            rect.right() - 60.0,
+            pos2(rect.left() + 56.0, rect.center().y - 10.0),
+            rect.right() - 70.0,
             &row.primary,
             &row.matched,
             p,
@@ -407,10 +395,10 @@ fn rows(
                 clipped(
                     ui,
                     Rect::from_min_max(
-                        pos2(rect.left() + 48.0, rect.center().y + 3.0),
+                        pos2(rect.left() + 56.0, rect.center().y + 4.0),
                         pos2(rect.right() - 16.0, rect.bottom()),
                     ),
-                    &row.secondary,
+                    &crate::app::tidy_location(std::path::Path::new(&row.secondary)),
                     p.text_faint,
                 );
             }
@@ -475,7 +463,7 @@ fn draw_highlighted(
 fn clipped(ui: &Ui, rect: Rect, text: &str, colour: Color32) {
     let mut job = egui::text::LayoutJob::simple_singleline(
         text.to_owned(),
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(12.0),
         colour,
     );
     job.wrap = egui::text::TextWrapping {

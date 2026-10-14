@@ -95,28 +95,12 @@ pub fn show(
 }
 
 /// Paints a pane card: shadow, translucent fill, glass highlight, and hairline.
-fn draw_card(ui: &Ui, rect: Rect, p: &Palette, focused: bool) {
-    let radius = egui::CornerRadius::same(RADIUS_CARD);
-
-    let shadow = theme::card_shadow(p);
-    ui.painter().add(shadow.as_shape(rect, radius));
-
-    ui.painter().rect_filled(rect, radius, p.card);
-
-    // One hairline, the same in both states. An accent ring plus a glow around
-    // the focused pane put the loudest colour on screen around the largest
-    // element — it read as a selection box rather than as a pane, and with a
-    // single pane open it framed the entire window.
-    //
-    // Focus still has to be visible with several panes open. It is carried by
-    // the active tab's accent underline in the tab strip, which is small,
-    // unambiguous, and already there.
-    ui.painter().rect_stroke(
-        rect,
-        radius,
-        egui::Stroke::new(1.0, if focused { p.border_strong } else { p.border }),
-        egui::StrokeKind::Inside,
-    );
+fn draw_card(ui: &Ui, rect: Rect, p: &Palette, _focused: bool) {
+    // The same surface in both states. Focus with several panes open is
+    // carried by the active tab, which is small and unambiguous; a ring
+    // around the largest thing on screen read as a selection box.
+    let painter = ui.painter().with_clip_rect(ui.ctx().content_rect());
+    theme::paint_pane(&painter, rect, RADIUS_CARD as f32, p);
 }
 
 /// Splits `rect` into two child rects with the gutter between them.
@@ -212,7 +196,18 @@ fn divider(
 }
 
 /// Height of a tab strip, in points.
-pub const TAB_STRIP_HEIGHT: f32 = 38.0;
+pub const TAB_STRIP_HEIGHT: f32 = 44.0;
+
+/// Whether more than one pane is open. Only then does the active tab need to
+/// say which pane has focus. Recorded by the app each frame with
+/// [`set_multi_pane`].
+fn multi_pane(ui: &Ui) -> bool {
+    ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("neutron-multi-pane"))).unwrap_or(false)
+}
+
+pub fn set_multi_pane(ctx: &egui::Context, multi: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("neutron-multi-pane"), multi));
+}
 
 /// Narrowest a tab is squeezed to before tabs start going off the strip. Wide
 /// enough for a few letters of the title and the close button.
@@ -362,10 +357,14 @@ pub fn tab_strip(
     // Every tab's natural width, then shrunk together to fit. Tabs that did
     // not fit used to be dropped from the strip altogether — still open, but
     // reachable only by Ctrl+1…9.
-    let font = egui::FontId::proportional(12.0);
+    // Measured in the active tab's heavier weight, so a tab is the same width
+    // whichever is active and an active title is never the one cut short. The
+    // padding is the text's inset on the left and the close button's slot.
+    let font = egui::FontId::proportional(12.5);
+    let measure = theme::strong(ui.ctx(), 12.5);
     let natural: Vec<f32> = titles
         .iter()
-        .map(|t| (ui.painter().layout_no_wrap(t.clone(), font.clone(), p.text).size().x + 40.0).clamp(88.0, 200.0))
+        .map(|t| (ui.painter().layout_no_wrap(t.clone(), measure.clone(), p.text).size().x + 16.0 + 30.0).clamp(88.0, 200.0))
         .collect();
     let room = (rect.width() - 8.0 - 34.0).max(0.0);
     let widths = fit_tabs(&natural, room);
@@ -416,40 +415,41 @@ pub fn tab_strip(
         );
         let dragging_this = drag == Some(TabDrag { group: group_id, index: i });
 
+        // Tabs are pills; the active one is raised out of the strip. With
+        // several panes open, a small accent dot marks the focused pane's
+        // active tab, so two panes cannot both look current.
+        let pill = theme::pill(tab_rect.height());
         if is_active {
-            ui.painter()
-                .rect_filled(tab_rect, RADIUS_CONTROL as f32, p.card_hover);
-            // A short accent underline marks the active tab of the *focused*
-            // pane only, so two panes cannot both look current.
-            if focused {
-                ui.painter().rect_filled(
-                    Rect::from_min_max(
-                        pos2(tab_rect.left() + 12.0, tab_rect.bottom() - 2.0),
-                        pos2(tab_rect.right() - 12.0, tab_rect.bottom()),
-                    ),
-                    1.0,
+            theme::paint_raised(ui.painter(), tab_rect, pill, p);
+            if focused && multi_pane(ui) {
+                ui.painter().circle_filled(
+                    pos2(tab_rect.left() + 10.0, tab_rect.center().y),
+                    2.5,
                     p.accent,
                 );
             }
         } else if response.hovered() {
-            ui.painter()
-                .rect_filled(tab_rect, RADIUS_CONTROL as f32, p.hover);
+            ui.painter().rect_filled(tab_rect, pill, p.hover);
         }
 
         if dragging_this {
             // Ghost the source tab rather than removing it: reflowing the strip
             // mid-drag moves every other tab out from under the cursor.
             ui.painter()
-                .rect_filled(tab_rect, RADIUS_CONTROL as f32, p.hover);
+                .rect_filled(tab_rect, theme::pill(tab_rect.height()), p.hover);
         }
 
-        let text_colour = if is_active { p.text } else { p.text_muted };
-        let close_w = 22.0;
+        let (text_colour, text_font) = if is_active {
+            (p.text, theme::strong(ui.ctx(), 12.5))
+        } else {
+            (p.text_muted, font.clone())
+        };
+        let close_w = 24.0;
         let text_rect = Rect::from_min_max(
-            pos2(tab_rect.left() + 12.0, tab_rect.top()),
+            pos2(tab_rect.left() + 16.0, tab_rect.top()),
             pos2(tab_rect.right() - close_w, tab_rect.bottom()),
         );
-        draw_clipped(ui, text_rect, title, &font, text_colour);
+        draw_clipped(ui, text_rect, title, &text_font, text_colour);
 
         // Close button: an X drawn as two strokes, for the same reason the row
         // icons are drawn — the obvious glyphs are missing from egui's fonts.
@@ -459,7 +459,7 @@ pub fn tab_strip(
         );
         let close = ui.interact(close_rect, ui.id().with(("tabclose", group_id.0, i)), Sense::click());
         if close.hovered() {
-            ui.painter().rect_filled(close_rect, 4.0, p.hover);
+            ui.painter().circle_filled(close_rect.center(), 9.0, p.hover);
         }
         // Only shown on the active tab or on hover: an X on every tab is
         // clutter, and they are the smallest targets in the strip.
@@ -527,8 +527,7 @@ pub fn tab_strip(
     );
     let plus = ui.interact(plus_rect, ui.id().with(("newtab", group_id.0)), Sense::click());
     if plus.hovered() {
-        ui.painter()
-            .rect_filled(plus_rect, RADIUS_CONTROL as f32, p.hover);
+        ui.painter().circle_filled(plus_rect.center(), 16.0, p.hover);
     }
     let c = plus_rect.center();
     let stroke = egui::Stroke::new(

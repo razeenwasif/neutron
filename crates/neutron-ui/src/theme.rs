@@ -1,4 +1,17 @@
-//! Neutron's design system — purple glassmorphism.
+//! Neutron's design system.
+//!
+//! # Velvet, after dark
+//!
+//! The dark theme is the primary one: matte, low-contrast surfaces that catch
+//! a little light along their top edge, one lavender accent kept for what is
+//! chosen, and every shape rounded. Separation comes from shifts in tone — a
+//! pane a few levels lighter than the desktop showing through around it, a
+//! well a few levels darker than the pane it is pressed into — rather than
+//! from lines. [`paint_pane`] draws the surface; the tokens on [`Palette`]
+//! name the rest.
+//!
+//! The notes below describe the earlier glass design, of which the light
+//! theme is what remains.
 //!
 //! # The model: depth through translucency in three layers
 //!
@@ -22,12 +35,12 @@
 
 use egui::{Color32, CornerRadius, Stroke, Visuals, pos2};
 
-/// Light is the default. Both of the concepts this design came from are light,
-/// and a file manager is read far more than it is looked at.
+/// Dark is the default: the velvet design is a dark one, and the light theme
+/// is kept for whoever prefers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeMode {
-    #[default]
     Light,
+    #[default]
     Dark,
 }
 
@@ -75,8 +88,14 @@ pub struct Palette {
     /// Translucent glass, so the coloured lights drifting beneath refract
     /// through and tint the surface dynamically.
     pub card: Color32,
+    /// The top of a pane's vertical sheen; [`Palette::card`] is the bottom.
+    /// The same as `card` where a theme has no sheen.
+    pub card_top: Color32,
     /// Card fill under the pointer.
     pub card_hover: Color32,
+    /// A control lifted off the surface: the chosen segment of a segmented
+    /// control, a rail button under the pointer, the active tab.
+    pub raised: Color32,
     /// Menus and popovers, one step above a card.
     pub elevated: Color32,
     /// A recessed well on a card: the filter field, a capacity bar's track.
@@ -114,6 +133,24 @@ pub struct Palette {
     pub warning: Color32,
     pub danger: Color32,
     pub cloud: Color32,
+
+    /// One colour per kind of file, for the tile behind its glyph.
+    pub tints: Tints,
+}
+
+/// Colours that tell kinds of file apart at a glance.
+///
+/// Muted and of a like lightness, so no kind shouts over the others; they
+/// differ in hue for scanning, and the glyph inside each tile differs in shape
+/// for anyone who cannot tell the hues apart.
+#[derive(Debug, Clone, Copy)]
+pub struct Tints {
+    pub folder: Color32,
+    pub code: Color32,
+    pub document: Color32,
+    pub image: Color32,
+    pub archive: Color32,
+    pub plain: Color32,
 }
 
 impl Palette {
@@ -138,7 +175,9 @@ impl Palette {
         ground_deep: Color32::from_rgb(0xE6, 0xE9, 0xEF),
 
         card: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+        card_top: Color32::from_rgb(0xFF, 0xFF, 0xFF),
         card_hover: Color32::from_rgb(0xF5, 0xF6, 0xF9),
+        raised: Color32::from_rgb(0xFF, 0xFF, 0xFF),
         elevated: Color32::from_rgb(0xFF, 0xFF, 0xFF),
         inset: Color32::from_rgb(0xF2, 0xF3, 0xF7),
 
@@ -188,6 +227,15 @@ impl Palette {
         warning: Color32::from_rgb(0xA8, 0x5C, 0x12),
         danger: Color32::from_rgb(0xC0, 0x35, 0x4C),
         cloud: Color32::from_rgb(0x72, 0x50, 0xE6),
+
+        tints: Tints {
+            folder: Color32::from_rgb(0x72, 0x50, 0xE6),
+            code: Color32::from_rgb(0x1F, 0x86, 0x78),
+            document: Color32::from_rgb(0x3E, 0x5C, 0xB8),
+            image: Color32::from_rgb(0xB8, 0x45, 0x70),
+            archive: Color32::from_rgb(0x9A, 0x6A, 0x1E),
+            plain: Color32::from_rgb(0x6B, 0x6C, 0x7B),
+        },
     };
 
     /// The same design language after dark: opaque cards, a still ground, one
@@ -195,52 +243,75 @@ impl Palette {
     /// around the same structure, so a hairline still separates a card from the
     /// ground and nothing moves.
     pub const DARK: Palette = Palette {
-        ground: Color32::from_rgb(0x14, 0x15, 0x1A),
-        ground_deep: Color32::from_rgb(0x0E, 0x0F, 0x13),
+        // Shows only where the window is not transparent — elsewhere the
+        // desktop is the ground.
+        ground: Color32::from_rgb(0x0A, 0x09, 0x0F),
+        ground_deep: Color32::from_rgb(0x0A, 0x09, 0x0F),
 
-        card: Color32::from_rgb(0x1C, 0x1D, 0x24),
-        card_hover: Color32::from_rgb(0x24, 0x25, 0x2E),
-        elevated: Color32::from_rgb(0x24, 0x25, 0x2E),
-        inset: Color32::from_rgb(0x16, 0x17, 0x1D),
+        // A pane runs from #1A1822 at the top to this at the bottom.
+        card: Color32::from_rgb(0x14, 0x12, 0x1A),
+        card_top: Color32::from_rgb(0x1A, 0x18, 0x22),
+        card_hover: Color32::from_rgb(0x1F, 0x1C, 0x28),
+        raised: Color32::from_rgb(0x2A, 0x26, 0x36),
+        elevated: Color32::from_rgb(0x22, 0x1F, 0x2B),
+        inset: Color32::from_rgb(0x0F, 0x0E, 0x15),
 
-        shadow: Color32::from_black_alpha(90),
+        shadow: Color32::from_black_alpha(150),
 
         orbs: [
             Orb {
-                x: 0.14,
-                y: -0.06,
-                radius: 0.95,
-                colour: Color32::from_rgba_unmultiplied_const(0x7C, 0x5C, 0xF0, 30),
+                x: 0.5,
+                y: -0.2,
+                radius: 0.9,
+                colour: Color32::from_rgba_unmultiplied_const(0x2A, 0x22, 0x40, 40),
             },
             Orb {
-                x: 0.94,
-                y: 0.10,
-                radius: 0.88,
-                colour: Color32::from_rgba_unmultiplied_const(0x3A, 0x6E, 0xB8, 24),
+                x: 0.9,
+                y: 0.1,
+                radius: 0.6,
+                colour: Color32::from_rgba_unmultiplied_const(0x22, 0x1E, 0x38, 24),
             },
         ],
 
-        border: Color32::from_rgb(0x2C, 0x2D, 0x37),
-        border_strong: Color32::from_rgb(0x3C, 0x3D, 0x4A),
+        // Barely lines at all: a pane's edge is where its tone stops.
+        border: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 9),
+        border_strong: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 18),
 
-        text: Color32::from_rgb(0xF2, 0xF2, 0xF6),
-        text_muted: Color32::from_rgb(0xA3, 0xA4, 0xB4),
-        text_faint: Color32::from_rgb(0x84, 0x85, 0x95),
+        text: Color32::from_rgb(0xEE, 0xEA, 0xF6),
+        text_muted: Color32::from_rgb(0xA3, 0x9C, 0xB4),
+        text_faint: Color32::from_rgb(0x85, 0x7E, 0x97),
 
-        icon: Color32::from_rgb(0xA3, 0xA4, 0xB4),
+        icon: Color32::from_rgb(0xA3, 0x9C, 0xB4),
 
-        accent: Color32::from_rgb(0xA4, 0x8C, 0xFF),
-        accent_hover: Color32::from_rgb(0xB9, 0xA7, 0xFF),
-        accent_pressed: Color32::from_rgb(0x8B, 0x6B, 0xF5),
+        accent: Color32::from_rgb(0xB9, 0xA6, 0xF5),
+        accent_hover: Color32::from_rgb(0xCB, 0xBC, 0xF8),
+        accent_pressed: Color32::from_rgb(0xA2, 0x8C, 0xEB),
 
-        selection: Color32::from_rgb(0x2A, 0x25, 0x45),
-        hover: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 12),
+        // The accent at 14%: a wash the row's own text stays readable on.
+        selection: Color32::from_rgba_unmultiplied_const(0xB9, 0xA6, 0xF5, 36),
+        hover: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 9),
 
-        success: Color32::from_rgb(0x3D, 0xD6, 0xA0),
-        warning: Color32::from_rgb(0xF0, 0xB4, 0x3C),
-        danger: Color32::from_rgb(0xF4, 0x76, 0x8C),
-        cloud: Color32::from_rgb(0xA4, 0x8C, 0xFF),
+        success: Color32::from_rgb(0x8F, 0xCF, 0xC0),
+        warning: Color32::from_rgb(0xE2, 0xC0, 0x8D),
+        danger: Color32::from_rgb(0xE6, 0xA8, 0xBF),
+        cloud: Color32::from_rgb(0x9D, 0xB4, 0xF2),
+
+        tints: Tints {
+            folder: Color32::from_rgb(0xB9, 0xA6, 0xF5),
+            code: Color32::from_rgb(0x8F, 0xC9, 0xC0),
+            document: Color32::from_rgb(0xA9, 0xB8, 0xE8),
+            image: Color32::from_rgb(0xE6, 0xA8, 0xBF),
+            archive: Color32::from_rgb(0xE2, 0xC0, 0x8D),
+            plain: Color32::from_rgb(0xA3, 0x9C, 0xB4),
+        },
     };
+
+    /// Text a step quieter than [`Palette::text`], for the many rows that
+    /// are not the one being looked at: sidebar destinations, unselected
+    /// file names.
+    pub fn text_soft(&self) -> Color32 {
+        lerp_colour(self.text, self.text_muted, 0.45)
+    }
 
     pub const fn for_mode(mode: ThemeMode) -> Palette {
         match mode {
@@ -291,30 +362,191 @@ pub fn composite(fg: Color32, bg: Color32) -> Color32 {
 
 // --- metrics ---------------------------------------------------------------
 
-pub const ROW_HEIGHT: f32 = 36.0;
+pub const ROW_HEIGHT: f32 = 42.0;
 pub const NAV_HEIGHT: f32 = 32.0;
-pub const GUTTER: f32 = 16.0;
-pub const RADIUS_CARD: u8 = 14;
-pub const RADIUS_CONTROL: u8 = 10;
-pub const RADIUS_SMALL: u8 = 8;
+pub const GUTTER: f32 = 14.0;
+/// A pane: the sidebar, the rail, a file pane.
+pub const RADIUS_CARD: u8 = 26;
+/// A row, a button, a menu item.
+pub const RADIUS_CONTROL: u8 = 13;
+/// A file's icon tile, a key cap.
+pub const RADIUS_SMALL: u8 = 9;
+/// A recessed well, a card inside a pane.
+pub const RADIUS_WELL: u8 = 16;
+/// A panel set into a pane: the column view's columns.
+pub const RADIUS_PANEL: u8 = 20;
 
-/// The soft, wide glass shadow a card casts on the ground.
+/// Corner radius that makes a shape of `height` a pill.
+pub fn pill(height: f32) -> CornerRadius {
+    CornerRadius::same((height / 2.0).round().clamp(0.0, 255.0) as u8)
+}
+
+/// The soft, wide shadow a pane casts on whatever is behind it.
 pub fn card_shadow(p: &Palette) -> egui::epaint::Shadow {
     egui::epaint::Shadow {
-        offset: [0, 8],
-        blur: 32,
+        offset: [0, 14],
+        blur: 40,
         spread: 0,
         color: p.shadow,
     }
 }
 
-/// A glass card: translucent fill, subtle glass border, rounded corners, soft shadow.
+/// A card as an egui frame: a solid fill, a faint edge, rounded corners and a
+/// soft shadow. For surfaces drawn through a frame; a pane drawn by hand uses
+/// [`paint_pane`], which adds the sheen a frame cannot.
 pub fn card(p: &Palette) -> egui::Frame {
     egui::Frame::new()
         .fill(p.card)
         .stroke(Stroke::new(1.0, p.border))
         .corner_radius(CornerRadius::same(RADIUS_CARD))
         .shadow(card_shadow(p))
+}
+
+/// The same frame with nothing painted: margins only, for a panel whose
+/// surface is drawn by [`paint_pane`] inside it.
+pub fn bare_card() -> egui::Frame {
+    egui::Frame::new()
+}
+
+/// Paints a pane: its shadow, a surface that runs from [`Palette::card_top`]
+/// down to [`Palette::card`], a faint edge, and a lit line along the top.
+///
+/// The sheen is what makes the surface read as velvet rather than flat paint,
+/// and egui has no rounded gradient to draw it with. So the pane is filled
+/// solid in its bottom colour first — that fill is the anti-aliased edge — and
+/// the gradient is laid inside it as a mesh following the same rounded outline
+/// a point in from the edge. The mesh's own edge is not smoothed, but it sits
+/// on a colour a few levels away from its own, where no stair-step can be seen.
+pub fn paint_pane(painter: &egui::Painter, rect: egui::Rect, radius: f32, p: &Palette) {
+    let corners = CornerRadius::same(radius.round().clamp(0.0, 255.0) as u8);
+    painter.add(card_shadow(p).as_shape(rect, corners));
+    painter.rect_filled(rect, corners, p.card);
+
+    if p.card_top != p.card {
+        let inner = rect.shrink(1.0);
+        let mut outline = Vec::new();
+        egui::epaint::tessellator::path::rounded_rectangle(
+            &mut outline,
+            inner,
+            egui::epaint::CornerRadiusF32::same((radius - 1.0).max(0.0)),
+        );
+        let colour_at = |y: f32| {
+            let t = ((y - inner.top()) / inner.height().max(1.0)).clamp(0.0, 1.0);
+            lerp_colour(p.card_top, p.card, t)
+        };
+        let mut mesh = egui::Mesh::default();
+        let centre = inner.center();
+        mesh.colored_vertex(centre, colour_at(centre.y));
+        for point in &outline {
+            mesh.colored_vertex(*point, colour_at(point.y));
+        }
+        let n = outline.len() as u32;
+        for i in 0..n {
+            mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+
+    painter.rect_stroke(rect, corners, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+    // The lit top edge, round the corners.
+    let inner = CornerRadius::same(corners.nw.saturating_sub(1));
+    paint_top_edge(painter, rect.shrink(1.0), inner, Color32::from_rgba_unmultiplied(255, 255, 255, 12));
+}
+
+/// Corner radius of the window itself, as the mockups' frame has it.
+pub const RADIUS_WINDOW: u8 = 22;
+
+/// The window's own surface: the ground the panes sit on, with rounded
+/// corners and a faint glow down from the top, as the mockups' frame has.
+///
+/// The glow is a band across the top whose colour is a function of height
+/// alone, so a fan of flat triangles reproduces it exactly, and it ends on the
+/// ground's own colour, so there is no seam where it stops.
+pub fn paint_ground(painter: &egui::Painter, rect: egui::Rect, p: &Palette) {
+    let radius = RADIUS_WINDOW as f32;
+    let corners = CornerRadius::same(RADIUS_WINDOW);
+    painter.rect_filled(rect, corners, p.ground);
+
+    let glow = lerp_colour(p.ground, p.card_top, 0.6);
+    let band = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), rect.height() * 0.4));
+    let mut outline = Vec::new();
+    egui::epaint::tessellator::path::rounded_rectangle(
+        &mut outline,
+        band,
+        egui::epaint::CornerRadiusF32 { nw: radius, ne: radius, sw: 0.0, se: 0.0 },
+    );
+    let colour_at = |y: f32| {
+        let t = ((y - band.top()) / band.height().max(1.0)).clamp(0.0, 1.0);
+        lerp_colour(glow, p.ground, t)
+    };
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(band.center(), colour_at(band.center().y));
+    for point in &outline {
+        mesh.colored_vertex(*point, colour_at(point.y));
+    }
+    let n = outline.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+
+    // A hairline edge, so the window still reads against a dark wallpaper.
+    painter.rect_stroke(rect, corners, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+}
+
+/// A recessed well: the filter field, the view switcher, a progress track.
+/// A step darker than the surface it sits in, with a shadow along its inside
+/// top edge where the surface would overhang it.
+pub fn paint_well(painter: &egui::Painter, rect: egui::Rect, corners: CornerRadius, p: &Palette) {
+    painter.rect_filled(rect, corners, p.inset);
+    painter.rect_stroke(
+        rect,
+        corners,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 9)),
+        egui::StrokeKind::Inside,
+    );
+    // The overhang's shadow follows the outline round the top corners and
+    // fades out down the sides, rather than being a straight rule that stops
+    // short of them — on a pill, that rule was a hard edge of its own.
+    let dark = p.ground.r() < 128;
+    paint_top_edge(painter, rect.translate(egui::vec2(0.0, 1.0)), corners, Color32::from_black_alpha(if dark { 80 } else { 16 }));
+}
+
+/// A one-point line along the top of a rounded `rect`, round its corners, and
+/// clipped before the straight sides.
+fn paint_top_edge(painter: &egui::Painter, rect: egui::Rect, corners: CornerRadius, colour: Color32) {
+    let depth = (corners.nw.max(corners.ne) as f32).max(4.0) * 0.8;
+    let band = egui::Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + depth));
+    painter
+        .with_clip_rect(band.intersect(painter.clip_rect()))
+        .rect_stroke(rect, corners, Stroke::new(1.0, colour), egui::StrokeKind::Inside);
+}
+
+/// A control lifted off the surface — the chosen segment, the active tab, a
+/// rail button under the pointer: [`Palette::raised`] with a lit top edge and
+/// a small shadow under it.
+pub fn paint_raised(painter: &egui::Painter, rect: egui::Rect, corners: CornerRadius, p: &Palette) {
+    painter.add(
+        egui::epaint::Shadow {
+            offset: [0, 2],
+            blur: 6,
+            spread: 0,
+            color: Color32::from_black_alpha(90),
+        }
+        .as_shape(rect, corners),
+    );
+    painter.rect_filled(rect, corners, p.raised);
+    paint_top_edge(painter, rect, corners, Color32::from_rgba_unmultiplied(255, 255, 255, 18));
+}
+
+/// `colour` at `alpha` out of 255, for a tint laid over a surface.
+pub fn with_alpha(colour: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), alpha)
+}
+
+fn lerp_colour(a: Color32, b: Color32, t: f32) -> Color32 {
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 /// A faint vertical gradient across `rect`, from the card colour to a slightly
@@ -416,13 +648,13 @@ pub fn popover(p: &Palette) -> egui::Frame {
     egui::Frame::new()
         .fill(p.elevated)
         .stroke(Stroke::new(1.0, p.border_strong))
-        .corner_radius(CornerRadius::same(RADIUS_CONTROL))
+        .corner_radius(CornerRadius::same(RADIUS_WELL))
         .inner_margin(egui::Margin::same(8))
         .shadow(egui::epaint::Shadow {
-            offset: [0, 16],
+            offset: [0, 18],
             blur: 48,
             spread: 0,
-            color: Color32::from_black_alpha(72),
+            color: Color32::from_black_alpha(140),
         })
 }
 
@@ -437,6 +669,85 @@ pub fn micro_caps(label: &str) -> String {
         out.push(c);
     }
     out
+}
+
+// --- type --------------------------------------------------------------------
+
+/// The font family for headings and anything set heavier than body text.
+///
+/// egui draws one weight per family, so weight is a family of its own. Always
+/// defined by [`install_fonts`] — falling back to the body face when no heavier
+/// one is supplied — because naming a family egui does not have is a panic.
+pub const STRONG: &str = "neutron-strong";
+
+/// Font files for the interface.
+pub struct Faces {
+    /// Body text: names, menus, rows.
+    pub regular: Vec<u8>,
+    /// Headings and labels. The body face is used when absent.
+    pub strong: Option<Vec<u8>>,
+    /// Tried before egui's own faces for characters these lack: Manrope has
+    /// no ⌘, ⇧ or ⌥, and a shortcut drawn as boxes is worse than one drawn
+    /// in the system's face.
+    pub fallback: Option<Vec<u8>>,
+}
+
+/// Installs the interface faces, keeping egui's own as fallbacks for any
+/// character they lack — symbols, scripts the face does not cover.
+pub fn install_fonts(ctx: &egui::Context, faces: Option<Faces>) {
+    use egui::{FontData, FontDefinitions, FontFamily};
+    use std::sync::Arc;
+
+    let mut fonts = FontDefinitions::default();
+    let mut strong_first: Option<&str> = None;
+    if let Some(faces) = faces {
+        fonts
+            .font_data
+            .insert("neutron-regular".into(), Arc::new(FontData::from_owned(faces.regular)));
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "neutron-regular".into());
+        if let Some(fallback) = faces.fallback {
+            fonts
+                .font_data
+                .insert("neutron-fallback".into(), Arc::new(FontData::from_owned(fallback)));
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .insert(1, "neutron-fallback".into());
+        }
+        if let Some(strong) = faces.strong {
+            fonts
+                .font_data
+                .insert("neutron-strong".into(), Arc::new(FontData::from_owned(strong)));
+            strong_first = Some("neutron-strong");
+        }
+    }
+    let mut strong_family = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(first) = strong_first {
+        strong_family.insert(0, first.into());
+    }
+    fonts.families.insert(FontFamily::Name(STRONG.into()), strong_family);
+    ctx.set_fonts(fonts);
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(STRONG), true));
+}
+
+/// The heavier face at `size` — or the body face in a context that never had
+/// [`install_fonts`] run, where asking for the family would be a panic.
+pub fn strong(ctx: &egui::Context, size: f32) -> egui::FontId {
+    let installed = ctx.data(|d| d.get_temp::<bool>(egui::Id::new(STRONG))).unwrap_or(false);
+    if installed {
+        egui::FontId::new(size, egui::FontFamily::Name(STRONG.into()))
+    } else {
+        egui::FontId::proportional(size)
+    }
 }
 
 /// Applies the palette to an egui context.
@@ -472,9 +783,12 @@ fn build_visuals(mode: ThemeMode) -> Visuals {
     visuals.faint_bg_color = Color32::TRANSPARENT;
     visuals.window_stroke = Stroke::new(1.0, p.border);
     visuals.selection.bg_fill = p.selection;
-    visuals.selection.stroke = Stroke::new(1.0, p.accent);
+    // Also the focus ring of a stock text field: a soft one, as the app's
+    // own fields draw.
+    visuals.selection.stroke = Stroke::new(1.0, with_alpha(p.accent, 120));
+    visuals.text_edit_bg_color = Some(p.inset);
     visuals.hyperlink_color = p.accent;
-    visuals.window_corner_radius = CornerRadius::same(RADIUS_CONTROL);
+    visuals.window_corner_radius = CornerRadius::same(RADIUS_WELL);
 
     let radius = CornerRadius::same(RADIUS_CONTROL);
 
@@ -650,8 +964,8 @@ mod tests {
     }
 
     #[test]
-    fn light_is_the_default_theme() {
-        assert_eq!(ThemeMode::default(), ThemeMode::Light);
+    fn dark_is_the_default_theme() {
+        assert_eq!(ThemeMode::default(), ThemeMode::Dark);
     }
 
     #[test]

@@ -1,79 +1,117 @@
 //! The places sidebar.
 //!
-//! Modelled on the first reference design: a white card holding a wordmark, a
-//! few short labelled groups of destinations, and a storage summary pinned to
-//! the bottom.
+//! A pane holding the wordmark, a way into the finder, a few labelled groups of
+//! destinations, and a storage card pinned to the bottom.
 //!
 //! # Rules
 //!
 //! * **Every row has an icon.** A column of bare text reads as a list of
 //!   strings; the glyph is what makes it read as a place you can go.
-//! * **Group labels are tracked micro-caps.** Small enough to be structure
-//!   rather than content, which is what lets four groups sit in one column
-//!   without the sidebar looking like an outline.
-//! * **The selected row is a pill, not a highlight bar.** A full-bleed
-//!   highlight inside a rounded card fights the card's own shape.
-//!
-//! The storage panel at the bottom is the design's segmented capacity bar,
-//! reinterpreted: one segment per fixed volume, sized by bytes used, over a
-//! track that represents the combined capacity of the machine. It is the single
-//! place in Neutron where colour is spent on decoration, and it earns it by
-//! also being the only view that answers "how full is this machine".
+//! * **Group labels are small spaced capitals.** Structure rather than
+//!   content, which is what lets several groups share one column without the
+//!   sidebar looking like an outline.
+//! * **The place you are in is a soft pill.** An accent wash, a faint ring of
+//!   the accent and a dot at the end — no bar down the side, no hard edge.
 
-use egui::{Color32, Rect, Sense, Ui, pos2, vec2};
+use egui::{Color32, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
 use neutron_core::NodeId;
 use neutron_core::places::{Place, PlaceKind};
 use neutron_ui::icons::{self, Glyph};
-use neutron_ui::theme::{Palette, NAV_HEIGHT, RADIUS_CONTROL, RADIUS_SMALL, ThemeMode, micro_caps};
+use neutron_ui::theme::{self, Palette, ThemeMode, micro_caps};
 
-/// Space reserved at the bottom for the storage panel and the theme toggle.
-const FOOTER_HEIGHT: f32 = 96.0;
+/// Height of a destination row.
+const ROW: f32 = 36.0;
+/// Room the footer needs: the storage card, a gap, the button row.
+const FOOTER_HEIGHT: f32 = 122.0;
 
-/// The wordmark at the top of the sidebar.
+/// The wordmark: the app's own icon and its name.
 pub fn brand(ui: &mut Ui, p: &Palette) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
 
-    let mark = Rect::from_min_size(pos2(rect.left() - 2.0, rect.center().y - 18.0), vec2(36.0, 36.0));
-    // Cache the texture once; the sidebar, Dock, and executable share one mark.
-    let texture: egui::TextureHandle = ui.ctx().data(|data| data.get_temp(egui::Id::new("neutron-brand-icon")))
+    let mark = Rect::from_min_size(pos2(rect.left() + 6.0, rect.center().y - 16.0), vec2(32.0, 32.0));
+    let texture: egui::TextureHandle = ui
+        .ctx()
+        .data(|data| data.get_temp(egui::Id::new("neutron-brand-icon")))
         .unwrap_or_else(|| {
-            let image = egui::ColorImage::from_rgba_unmultiplied([256, 256], include_bytes!("../../../assets/icon_256.rgba"));
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [256, 256],
+                include_bytes!("../../../assets/icon_256.rgba"),
+            );
             let texture = ui.ctx().load_texture("neutron-brand", image, egui::TextureOptions::LINEAR);
-            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("neutron-brand-icon"), texture.clone()));
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(egui::Id::new("neutron-brand-icon"), texture.clone()));
             texture
         });
-    ui.painter().image(texture.id(), mark, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    ui.painter()
+        .image(texture.id(), mark, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
 
     ui.painter().text(
-        pos2(mark.right() + 10.0, rect.center().y),
+        pos2(mark.right() + 11.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         "Neutron",
-        egui::FontId::proportional(15.0),
+        theme::strong(ui.ctx(), 16.0),
         p.text,
     );
 }
 
-/// A group heading.
+/// A well that opens the finder: the way in to searching, for whoever has
+/// not learned its shortcut yet. Returns whether it was clicked.
+pub fn find_pill(ui: &mut Ui, p: &Palette) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
+    let corners = CornerRadius::same(14);
+    theme::paint_well(ui.painter(), rect, corners, p);
+    if response.hovered() {
+        ui.painter().rect_filled(rect, corners, p.hover);
+    }
+
+    icons::draw(ui.painter(), pos2(rect.left() + 20.0, rect.center().y), Glyph::Search, p.text_faint);
+    ui.painter().text(
+        pos2(rect.left() + 36.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Find anything",
+        egui::FontId::proportional(13.0),
+        if response.hovered() { p.text_muted } else { p.text_faint },
+    );
+    key_cap(ui, p, pos2(rect.right() - 10.0, rect.center().y), if cfg!(target_os = "macos") { "⌘P" } else { "Ctrl+P" });
+
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Find anything"));
+    response.clicked()
+}
+
+/// A key cap, right-aligned on `right_centre`. Shared with the pane footer.
+pub fn key_cap(ui: &Ui, p: &Palette, right_centre: egui::Pos2, label: &str) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), theme::strong(ui.ctx(), 11.0), p.text_muted);
+    let size = galley.size() + vec2(14.0, 4.0);
+    let cap = Rect::from_min_size(pos2(right_centre.x - size.x, right_centre.y - size.y / 2.0), size);
+    ui.painter().rect_filled(cap, CornerRadius::same(8), p.elevated);
+    ui.painter().galley(
+        pos2(cap.left() + 7.0, cap.center().y - galley.size().y / 2.0),
+        galley,
+        p.text_muted,
+    );
+}
+
+/// A group label: small spaced capitals in the faint tone.
 pub fn section(ui: &mut Ui, p: &Palette, label: &str) {
-    ui.add_space(6.0);
+    ui.add_space(14.0);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
     ui.painter().text(
         pos2(rect.left() + 10.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         micro_caps(label),
-        egui::FontId::proportional(9.5),
+        theme::strong(ui.ctx(), 10.0),
         p.text_faint,
     );
-    ui.add_space(2.0);
+    ui.add_space(4.0);
 }
 
-/// What a click on a sidebar row asked for.
+/// What a click on a row asked for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RowHit {
     None,
-    /// Go there.
     Open,
-    /// Right-clicked, at this position.
     Menu(egui::Pos2),
 }
 
@@ -95,67 +133,50 @@ impl RowHit {
 
 /// One destination.
 pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) -> RowHit {
-    let (rect, response) = ui.allocate_exact_size(
-        vec2(ui.available_width(), NAV_HEIGHT),
-        Sense::click(),
-    );
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
     if !ui.is_rect_visible(rect) {
         return RowHit::of(&response, rect);
     }
 
     let selected = current == Some(&place.id);
-    let pill = Rect::from_min_max(pos2(rect.left(), rect.top()), pos2(rect.right(), rect.bottom()));
+    let corners = CornerRadius::same(12);
 
     if selected {
-        // A soft accent fill and no stroke. The row is already the only tinted
-        // thing in the column; a border around it as well is a second line
-        // saying what the first one said.
+        ui.painter().rect_filled(rect, corners, p.selection);
+        ui.painter().rect_stroke(
+            rect,
+            corners,
+            Stroke::new(1.0, theme::with_alpha(p.accent, 51)),
+            egui::StrokeKind::Inside,
+        );
         ui.painter()
-            .rect_filled(pill, RADIUS_CONTROL as f32, p.selection);
-
-        // The tick sits flush against the card's inner edge rather than inset
-        // into the pill, so it reads as the sidebar marking its place rather
-        // than as a decoration on the row.
-        let bar_h = (pill.height() * 0.52).round();
-        let bar = Rect::from_min_size(
-            pos2(pill.left() - 10.0, (pill.center().y - bar_h / 2.0).round()),
-            vec2(3.0, bar_h),
-        );
-        ui.painter().rect_filled(
-            bar,
-            egui::CornerRadius { nw: 0, sw: 0, ne: 2, se: 2 },
-            p.accent,
-        );
+            .circle_filled(pos2(rect.right() - 14.0, rect.center().y), 3.0, p.accent);
     } else if response.hovered() {
-        ui.painter().rect_filled(pill, RADIUS_CONTROL as f32, p.hover);
+        ui.painter().rect_filled(rect, corners, p.hover);
     }
 
-    // The active row takes the accent for both glyph and label, which is how
-    // both reference designs mark a current destination.
-    let colour = if selected { p.accent } else { p.text_muted };
     icons::draw(
         ui.painter(),
-        pos2(rect.left() + 18.0, rect.center().y),
+        pos2(rect.left() + 19.0, rect.center().y),
         glyph_for(place),
         if selected { p.accent } else { p.icon },
     );
 
-    // Clipped through a layout job so a long volume label ellipsises rather
-    // than running under the sidebar's right edge.
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        place.name.clone(),
-        egui::FontId::proportional(12.5),
-        colour,
-    );
+    let (font, colour) = if selected {
+        (theme::strong(ui.ctx(), 13.5), p.text)
+    } else {
+        (egui::FontId::proportional(13.5), p.text_soft())
+    };
+    let mut job = egui::text::LayoutJob::simple_singleline(place.name.clone(), font, colour);
     job.wrap = egui::text::TextWrapping {
-        max_width: (rect.width() - 44.0).max(1.0),
+        max_width: (rect.width() - 62.0).max(1.0),
         max_rows: 1,
         break_anywhere: true,
         overflow_character: Some('…'),
     };
     let galley = ui.painter().layout_job(job);
     ui.painter().galley(
-        pos2(rect.left() + 34.0, rect.center().y - galley.size().y / 2.0),
+        pos2(rect.left() + 39.0, rect.center().y - galley.size().y / 2.0),
         galley,
         colour,
     );
@@ -171,15 +192,7 @@ pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) ->
     RowHit::of(&response, rect)
 }
 
-/// The mark for a shell root.
-///
-/// Keyed on the CLSID, not the label. `::{645FF040-...}` is the Recycle Bin on
-/// every Windows in every language; "Recycle Bin" is the name on an English
-/// one and nothing anywhere else.
-///
-/// Without this they were four identical diamonds, and the Recycle Bin — the
-/// one of them a person actually goes to — was indistinguishable from Control
-/// Panel.
+/// The well-known Windows shell roots, by their parsing names.
 fn shell_glyph(place: &Place) -> Glyph {
     match place.id.parsing_name().unwrap_or_default() {
         "::{645FF040-5081-101B-9F08-00AA002F954E}" => Glyph::Trash,
@@ -190,38 +203,79 @@ fn shell_glyph(place: &Place) -> Glyph {
 }
 
 fn glyph_for(place: &Place) -> Glyph {
+    if place.id == NodeId::Home {
+        return Glyph::Dashboard;
+    }
     match place.kind {
         PlaceKind::Drive => Glyph::Drive,
         PlaceKind::Cloud => Glyph::Cloud,
         PlaceKind::Wsl => Glyph::Terminal,
         PlaceKind::Shell => shell_glyph(place),
         PlaceKind::Server => Glyph::Server,
-        // Home gets its own glyph; the other known folders are folders.
-        PlaceKind::KnownFolder if place.name == "Home" => Glyph::Home,
-        PlaceKind::KnownFolder => Glyph::Folder,
+        PlaceKind::KnownFolder => match place.name.as_str() {
+            "Home" => Glyph::Home,
+            "Desktop" => Glyph::Desktop,
+            "Downloads" => Glyph::Download,
+            "Documents" => Glyph::Document,
+            "Pictures" => Glyph::Image,
+            "Music" => Glyph::Music,
+            "Movies" | "Videos" => Glyph::Film,
+            "Applications" => Glyph::Grid,
+            _ => Glyph::Folder,
+        },
     }
 }
 
-/// Height the footer needs, so the scrolling area above it can be sized.
 pub fn footer_height() -> f32 {
     FOOTER_HEIGHT
 }
 
-/// The storage panel and the theme toggle, pinned to the bottom of the card.
-///
-/// Returns true when the theme toggle was clicked. The theme lives here rather
-/// than in a pane header because it is the one control in the application that
-/// is not about a location — putting it beside the storage summary keeps every
-/// pane header purely about the folder it is showing.
-pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: ThemeMode) -> bool {
-    let mut toggled = false;
+/// What the footer was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterAction {
+    None,
+    Connect,
+    ToggleTheme,
+}
 
-    // --- theme toggle, on its own row under the panel ---
-    let toggle = Rect::from_min_size(pos2(rect.left(), rect.bottom() - 28.0), vec2(28.0, 28.0));
+/// The storage card and, under it, Connect and the theme switch.
+pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: ThemeMode) -> FooterAction {
+    let mut action = FooterAction::None;
+
+    let card = Rect::from_min_size(rect.min, vec2(rect.width(), 76.0));
+    storage_card(ui, p, card, drives);
+
+    let buttons = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 34.0), rect.max);
+    let toggle = Rect::from_min_size(pos2(buttons.right() - 34.0, buttons.top()), vec2(34.0, 34.0));
+    let connect = Rect::from_min_max(buttons.min, pos2(toggle.left() - 6.0, buttons.bottom()));
+
+    let response = ui.interact(connect, ui.id().with("sidebar-connect"), Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(connect, CornerRadius::same(12), p.hover);
+    }
+    let label = ui.painter().layout_no_wrap(
+        "Connect".to_owned(),
+        egui::FontId::proportional(12.5),
+        if response.hovered() { p.text } else { p.text_muted },
+    );
+    let width = 16.0 + 8.0 + label.size().x;
+    let left = connect.center().x - width / 2.0;
+    icons::draw(
+        ui.painter(),
+        pos2(left + 8.0, connect.center().y),
+        Glyph::Plus,
+        if response.hovered() { p.text } else { p.text_muted },
+    );
+    ui.painter()
+        .galley(pos2(left + 24.0, connect.center().y - label.size().y / 2.0), label, p.text_muted);
+    if response.clicked() {
+        action = FooterAction::Connect;
+    }
+    response.on_hover_text("Connect to a server");
+
     let response = ui.interact(toggle, ui.id().with("theme"), Sense::click());
     if response.hovered() {
-        ui.painter()
-            .rect_filled(toggle, RADIUS_CONTROL as f32, p.hover);
+        ui.painter().rect_filled(toggle, CornerRadius::same(12), p.hover);
     }
     let (glyph, tip) = match mode {
         ThemeMode::Dark => (Glyph::Sun, "Switch to light (Ctrl+D)"),
@@ -234,136 +288,127 @@ pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: Them
         if response.hovered() { p.text } else { p.icon },
     );
     if response.clicked() {
-        toggled = true;
+        action = FooterAction::ToggleTheme;
     }
-    response.on_hover_text(tip);
+    response.on_hover_text(neutron_ui::format::shortcut(tip));
 
-    let panel = Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - 36.0));
-    storage_panel(ui, p, panel, drives);
-
-    toggled
+    action
 }
 
-/// Combined capacity across the fixed volumes, as a segmented bar.
-fn storage_panel(ui: &Ui, p: &Palette, rect: Rect, drives: &[Place]) {
+/// The main volume's name, how full it is, and how much is left.
+///
+/// The first volume that reported a capacity — the startup disk on a Mac,
+/// listed first by the scan. The dashboard shows every volume; this is the
+/// one figure worth keeping in sight everywhere.
+fn storage_card(ui: &Ui, p: &Palette, rect: Rect, drives: &[Place]) {
     let painter = ui.painter();
+    let corners = CornerRadius::same(theme::RADIUS_WELL);
+    painter.rect_filled(rect, corners, Color32::from_white_alpha(6));
+    painter.rect_stroke(rect, corners, Stroke::new(1.0, Color32::from_white_alpha(10)), egui::StrokeKind::Inside);
 
-    painter.rect(
-        rect,
-        RADIUS_CONTROL as f32,
-        p.inset,
-        egui::Stroke::new(1.0, p.border),
-        egui::StrokeKind::Inside,
-    );
-
-    painter.text(
-        pos2(rect.left() + 12.0, rect.top() + 13.0),
-        egui::Align2::LEFT_CENTER,
-        micro_caps("Storage"),
-        egui::FontId::proportional(9.5),
-        p.text_faint,
-    );
-
-    // Only volumes that reported a capacity: a card reader with no media has
-    // none, and counting it as zero would drag the total down for no reason.
-    let with_capacity: Vec<_> = drives.iter().filter_map(|d| d.capacity).collect();
-    let total: u64 = with_capacity.iter().map(|c| c.total).sum();
-    let free: u64 = with_capacity.iter().map(|c| c.free).sum();
-
-    let track = Rect::from_min_max(
-        pos2(rect.left() + 12.0, rect.top() + 24.0),
-        pos2(rect.right() - 12.0, rect.top() + 32.0),
-    );
-    painter.rect_filled(track, 4.0, p.hover);
-
-    if total > 0 {
-        // One segment per volume, laid left to right in the order the sidebar
-        // lists them, so a segment can be matched to a drive by eye.
-        let mut x = track.left();
-        for (i, cap) in with_capacity.iter().enumerate() {
-            let used = cap.total.saturating_sub(cap.free);
-            let w = track.width() * (used as f64 / total as f64) as f32;
-            if w <= 0.5 {
-                continue;
-            }
-            let seg = Rect::from_min_max(pos2(x, track.top()), pos2(x + w, track.bottom()));
-            painter.rect_filled(seg, 4.0, segment_colour(p, i, with_capacity.len()));
-            x += w;
-        }
-
+    let Some((name, cap)) = drives.iter().find_map(|d| d.capacity.map(|c| (d.name.as_str(), c))) else {
         painter.text(
-            pos2(rect.left() + 12.0, rect.bottom() - 12.0),
-            egui::Align2::LEFT_CENTER,
-            format!(
-                "{} free of {}",
-                neutron_ui::format::size(Some(free)),
-                neutron_ui::format::size(Some(total))
-            ),
-            egui::FontId::proportional(11.0),
-            p.text_muted,
-        );
-    } else {
-        painter.text(
-            pos2(rect.left() + 12.0, rect.bottom() - 12.0),
+            pos2(rect.left() + 12.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             "Scanning volumes…",
-            egui::FontId::proportional(11.0),
+            egui::FontId::proportional(11.5),
             p.text_faint,
         );
-    }
-}
+        return;
+    };
 
-/// A ramp across the accent's hue, light to dark.
-///
-/// Deliberately a ramp of one colour rather than the reference design's four
-/// unrelated hues: those are categories of one store and read as a legend,
-/// whereas these are volumes of one machine and reading them as a single
-/// quantity split into parts is more truthful — and it keeps the sidebar from
-/// becoming the most colourful thing on screen.
-pub fn segment_colour(p: &Palette, index: usize, count: usize) -> Color32 {
-    if count <= 1 {
-        return p.accent;
-    }
-    // 0.0 at the first segment, 1.0 at the last.
-    let t = index as f32 / (count - 1) as f32;
-    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-    let (from, to) = (p.accent, p.accent_pressed);
-    Color32::from_rgb(
-        lerp(from.r(), to.r()),
-        lerp(from.g(), to.g()),
-        lerp(from.b(), to.b()),
-    )
-}
+    let used = cap.total.saturating_sub(cap.free);
+    let fraction = if cap.total > 0 { used as f64 / cap.total as f64 } else { 0.0 };
 
-/// A disabled row, for providers that are not connected yet.
-pub fn placeholder_row(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph, why: &str) {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), NAV_HEIGHT), Sense::hover());
-    icons::draw(
-        ui.painter(),
-        pos2(rect.left() + 18.0, rect.center().y),
-        glyph,
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_owned(), theme::strong(ui.ctx(), 12.0), p.text_soft());
+    job.wrap = egui::text::TextWrapping {
+        max_width: (rect.width() - 70.0).max(1.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = painter.layout_job(job);
+    painter.galley(pos2(rect.left() + 12.0, rect.top() + 12.0), galley, p.text_soft());
+    painter.text(
+        pos2(rect.right() - 12.0, rect.top() + 19.0),
+        egui::Align2::RIGHT_CENTER,
+        format!("{:.0}%", fraction * 100.0),
+        theme::strong(ui.ctx(), 12.0),
+        p.text_muted,
+    );
+
+    let track = Rect::from_min_max(
+        pos2(rect.left() + 12.0, rect.top() + 34.0),
+        pos2(rect.right() - 12.0, rect.top() + 40.0),
+    );
+    painter.rect_filled(track, theme::pill(track.height()), p.inset);
+    let fill = Rect::from_min_max(
+        track.min,
+        pos2(track.left() + track.width() * fraction as f32, track.bottom()),
+    );
+    if fill.width() > 1.0 {
+        painter.rect_filled(fill, theme::pill(track.height()), theme::with_alpha(p.accent, 220));
+    }
+
+    painter.text(
+        pos2(rect.left() + 12.0, rect.bottom() - 15.0),
+        egui::Align2::LEFT_CENTER,
+        format!(
+            "{} free of {}",
+            neutron_ui::format::size(Some(cap.free)),
+            neutron_ui::format::size(Some(cap.total))
+        ),
+        egui::FontId::proportional(11.5),
         p.text_faint,
     );
+}
+
+/// A row for something not available yet, saying why on hover.
+pub fn placeholder_row(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph, why: &str) {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::hover());
+    icons::draw(ui.painter(), pos2(rect.left() + 19.0, rect.center().y), glyph, p.text_faint);
     ui.painter().text(
-        pos2(rect.left() + 34.0, rect.center().y),
+        pos2(rect.left() + 39.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(12.5),
+        egui::FontId::proportional(13.5),
         p.text_faint,
     );
-    let _ = RADIUS_SMALL;
     response.on_hover_text(why);
 }
 
-// As in `preview.rs`: what is below is drawing, and these tests are about the
-// choices above them.
-#[allow(clippy::items_after_test_module)]
+/// A row that does something rather than going somewhere: "Add a server…".
+pub fn action_row(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph) -> bool {
+    action_row_with_hint(ui, p, label, glyph, "")
+}
+
+pub fn action_row_with_hint(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph, hint: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
+
+    if response.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(12), p.hover);
+    }
+
+    icons::draw(ui.painter(), pos2(rect.left() + 19.0, rect.center().y), glyph, p.accent);
+    ui.painter().text(
+        pos2(rect.left() + 39.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.5),
+        if response.hovered() { p.text } else { p.text_muted },
+    );
+
+    let clicked = response.clicked();
+    if !hint.is_empty() {
+        response.on_hover_text(hint);
+    }
+    clicked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use neutron_core::places::Capacity;
-    use neutron_ui::theme::Palette;
 
     fn place(name: &str, kind: PlaceKind) -> Place {
         Place {
@@ -377,47 +422,20 @@ mod tests {
     #[test]
     fn each_place_kind_gets_its_own_glyph() {
         assert_eq!(glyph_for(&place("Home", PlaceKind::KnownFolder)), Glyph::Home);
-        assert_eq!(
-            glyph_for(&place("Downloads", PlaceKind::KnownFolder)),
-            Glyph::Folder
-        );
+        assert_eq!(glyph_for(&place("Downloads", PlaceKind::KnownFolder)), Glyph::Download);
+        assert_eq!(glyph_for(&place("Research", PlaceKind::KnownFolder)), Glyph::Folder);
         assert_eq!(glyph_for(&place("C:", PlaceKind::Drive)), Glyph::Drive);
         assert_eq!(glyph_for(&place("OneDrive", PlaceKind::Cloud)), Glyph::Cloud);
-        // The whole point of pinning WSL is that it is recognisable at a
-        // glance; sharing the folder glyph would defeat that.
-        assert_eq!(
-            glyph_for(&place("Ubuntu-24.04", PlaceKind::Wsl)),
-            Glyph::Terminal
-        );
-    }
-
-    #[test]
-    fn a_single_volume_uses_the_plain_accent() {
-        // Guards the divide-by-zero in the ramp.
-        assert_eq!(segment_colour(&Palette::LIGHT, 0, 1), Palette::LIGHT.accent);
-    }
-
-    #[test]
-    fn the_segment_ramp_spans_the_accent_range() {
-        let p = Palette::LIGHT;
-        assert_eq!(segment_colour(&p, 0, 4), p.accent);
-        assert_eq!(segment_colour(&p, 3, 4), p.accent_pressed);
-        // Intermediate segments must actually differ, or the bar reads as one
-        // block and the per-volume split is lost.
-        assert_ne!(segment_colour(&p, 1, 4), segment_colour(&p, 2, 4));
+        assert_eq!(glyph_for(&place("Ubuntu-24.04", PlaceKind::Wsl)), Glyph::Terminal);
+        let dashboard = Place { id: NodeId::Home, ..place("Dashboard", PlaceKind::KnownFolder) };
+        assert_eq!(glyph_for(&dashboard), Glyph::Dashboard);
     }
 
     #[test]
     fn capacity_totals_ignore_volumes_that_did_not_report() {
-        // An empty card reader has no capacity; treating it as zero total
-        // would be harmless, but treating it as a zero-free volume would show
-        // the machine as full.
         let drives = [
             Place {
-                capacity: Some(Capacity {
-                    total: 1000,
-                    free: 400,
-                }),
+                capacity: Some(Capacity { total: 1000, free: 400 }),
                 ..place("C:", PlaceKind::Drive)
             },
             place("E:", PlaceKind::Drive),
@@ -426,49 +444,4 @@ mod tests {
         assert_eq!(with.len(), 1);
         assert_eq!(with.iter().map(|c| c.total).sum::<u64>(), 1000);
     }
-}
-
-/// A row that starts something rather than navigating somewhere.
-///
-/// Visually distinct from a destination: the accent glyph says this is a
-/// control, not a place you can already go.
-pub fn action_row(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph) -> bool {
-    action_row_with_hint(ui, p, label, glyph, "")
-}
-
-/// As [`action_row`], with hover text explaining why it is being offered.
-pub fn action_row_with_hint(
-    ui: &mut Ui,
-    p: &Palette,
-    label: &str,
-    glyph: Glyph,
-    hint: &str,
-) -> bool {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), NAV_HEIGHT), Sense::click());
-
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
-    }
-
-    icons::draw(
-        ui.painter(),
-        pos2(rect.left() + 18.0, rect.center().y),
-        glyph,
-        p.accent,
-    );
-    ui.painter().text(
-        pos2(rect.left() + 34.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(12.5),
-        if response.hovered() { p.text } else { p.text_muted },
-    );
-
-    let clicked = response.clicked();
-    if !hint.is_empty() {
-        response.on_hover_text(hint);
-    }
-    clicked
 }

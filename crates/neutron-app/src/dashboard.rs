@@ -20,15 +20,17 @@
 //! asleep.
 
 use egui::{Rect, Sense, Ui, pos2, vec2};
-use neutron_core::places::{Capacity, Place, PlaceKind};
+use neutron_core::places::{Place, PlaceKind};
 use neutron_core::NodeId;
 use neutron_ui::icons::{self, Glyph};
-use neutron_ui::theme::{self, Palette, RADIUS_CARD, RADIUS_CONTROL, micro_caps};
+use neutron_ui::theme::{self, Palette, micro_caps};
 
 /// Height of a quick-destination tile.
-const TILE: f32 = 84.0;
+const TILE: f32 = 64.0;
+/// Height of a recent-file card: a tile, a name and a line under it.
+const RECENT_H: f32 = 100.0;
 /// Smallest tile width before the grid drops a column.
-const TILE_MIN: f32 = 150.0;
+const TILE_MIN: f32 = 190.0;
 /// Space between tiles, and between rows of them.
 const GAP: f32 = 12.0;
 /// Widest the dashboard's content is allowed to get.
@@ -45,6 +47,7 @@ pub fn show(
     volumes: &[Place],
     known: &[Place],
     recent: &[crate::recent::Visit],
+    elsewhere: &[Place],
 ) -> Option<Chosen> {
     egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
@@ -59,7 +62,7 @@ pub fn show(
             // — so the tiles were laid out for a width they never had and ran
             // off the edge. Nothing to centre, nothing to nest.
             if margin <= 0.5 {
-                return body(ui, p, volumes, known, recent);
+                return body(ui, p, volumes, known, recent, elsewhere);
             }
 
             let mut chosen = None;
@@ -71,7 +74,7 @@ pub fn show(
                 ui.add_space(margin);
                 ui.vertical(|ui| {
                     ui.set_width(content);
-                    chosen = body(ui, p, volumes, known, recent);
+                    chosen = body(ui, p, volumes, known, recent, elsewhere);
                 });
             });
             chosen
@@ -95,215 +98,185 @@ fn body(
     volumes: &[Place],
     known: &[Place],
     recent: &[crate::recent::Visit],
+    elsewhere: &[Place],
 ) -> Option<Chosen> {
-    {
-        {
-            ui.add_space(4.0);
-            greeting(ui, p);
-            ui.add_space(18.0);
+    ui.add_space(12.0);
+    greeting(ui, p);
+    ui.add_space(24.0);
 
-            if let Some(volume) = volumes.iter().find(|v| v.capacity.is_some()) {
-                storage_card(ui, p, volume, volumes);
-                ui.add_space(20.0);
-            }
-
-            section(ui, p, "Quick access");
-            ui.add_space(8.0);
-            let mut chosen = tiles(ui, p, known).map(Chosen::Go);
-
-            if !recent.is_empty() {
-                ui.add_space(20.0);
-                section(ui, p, "Recent files");
-                ui.add_space(8.0);
-                chosen = recent_rail(ui, p, recent).or(chosen);
-            }
-
-            if !volumes.is_empty() {
-                ui.add_space(20.0);
-                section(ui, p, "Drives");
-                ui.add_space(8.0);
-                chosen = tiles(ui, p, volumes).map(Chosen::Go).or(chosen);
-            }
-
-            ui.add_space(16.0);
-            chosen
-        }
-    }
-}
-
-fn greeting(ui: &mut Ui, p: &Palette) {
-    ui.label(
-        egui::RichText::new("Welcome back.")
-            .size(25.0)
-            .color(p.text)
-            .strong(),
-    );
-    ui.add_space(2.0);
-    ui.label(
-        egui::RichText::new("Everything on this machine, and everywhere you have connected.")
-            .size(12.5)
-            .color(p.text_muted),
-    );
-}
-
-fn section(ui: &mut Ui, p: &Palette, label: &str) {
-    ui.label(
-        egui::RichText::new(micro_caps(label))
-            .size(9.5)
-            .color(p.text_faint)
-            .strong(),
-    );
-}
-
-/// One card: a segmented bar across the volume's use, with a legend.
-///
-/// The bar is the concept's, and it earns its place here for a reason the
-/// concept did not have: Neutron already knows every fixed volume, and "how
-/// full is this machine" is a question a file manager is uniquely able to
-/// answer at a glance.
-fn storage_card(ui: &mut Ui, p: &Palette, primary: &Place, volumes: &[Place]) {
-    theme::card(p)
-        .inner_margin(egui::Margin::symmetric(16, 14))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(
-                egui::RichText::new("Storage")
-                    .size(15.0)
-                    .color(p.text)
-                    .strong(),
-            );
-            ui.add_space(10.0);
-
-            // The legend first, then the bar — the order the concept uses, and
-            // the right one: the labels say what the colours are about to mean.
-            let with_capacity: Vec<&Place> = volumes
-                .iter()
-                .filter(|v| v.capacity.is_some())
-                .collect();
-
-            ui.horizontal_wrapped(|ui| {
-                for (i, volume) in with_capacity.iter().enumerate() {
-                    let Some(cap) = volume.capacity else { continue };
-                    let colour = crate::sidebar::segment_colour(p, i, with_capacity.len());
-                    legend_entry(ui, p, &volume.name, cap, colour);
-                    ui.add_space(14.0);
-                }
-            });
-
-            ui.add_space(10.0);
-            segmented_bar(ui, p, &with_capacity);
-            let _ = primary;
-        });
-}
-
-fn legend_entry(ui: &mut Ui, p: &Palette, name: &str, cap: Capacity, colour: egui::Color32) {
-    let used = cap.total.saturating_sub(cap.free);
-    ui.horizontal(|ui| {
-        let (dot, _) = ui.allocate_exact_size(vec2(7.0, 7.0), Sense::hover());
-        ui.painter().circle_filled(dot.center(), 3.5, colour);
-        ui.add_space(2.0);
-        ui.label(egui::RichText::new(name).size(11.5).color(p.text));
-        ui.label(
-            egui::RichText::new(neutron_ui::format::size(Some(used)))
-                .size(11.0)
-                .color(p.text_muted),
-        );
-    });
-}
-
-/// The bar itself: one segment per volume, widths proportional to what is used.
-fn segmented_bar(ui: &mut Ui, p: &Palette, volumes: &[&Place]) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 8.0), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 4.0, p.inset);
-
-    let total: u64 = volumes
-        .iter()
-        .filter_map(|v| v.capacity)
-        .map(|c| c.total)
-        .sum();
-    if total == 0 {
-        return;
+    if let Some(volume) = volumes.iter().find(|v| v.capacity.is_some()) {
+        storage_card(ui, p, volume);
+        ui.add_space(28.0);
     }
 
-    let mut x = rect.left();
-    for (i, volume) in volumes.iter().enumerate() {
-        let Some(cap) = volume.capacity else { continue };
-        let used = cap.total.saturating_sub(cap.free);
-        let width = rect.width() * (used as f32 / total as f32);
-        if width < 1.0 {
-            continue;
-        }
-        let seg = Rect::from_min_size(pos2(x, rect.top()), vec2(width, rect.height()));
-        // Square inner edges, rounded outer ones, so the run reads as one bar
-        // divided rather than as a row of separate pills.
-        let radius = egui::CornerRadius {
-            nw: if i == 0 { 4 } else { 0 },
-            sw: if i == 0 { 4 } else { 0 },
-            ne: 0,
-            se: 0,
-        };
-        ui.painter().rect_filled(
-            seg,
-            radius,
-            crate::sidebar::segment_colour(p, i, volumes.len()),
-        );
-        x += width + 1.5;
+    // Two rows of four. Everything past that is a scroll away in the sidebar,
+    // and a dashboard that lists every pin is a second sidebar.
+    section(ui, p, "Quick access");
+    let mut chosen = tiles(ui, p, &known[..known.len().min(8)], 4).map(Chosen::Go);
+
+    if !recent.is_empty() {
+        ui.add_space(16.0);
+        section(ui, p, "Recent files");
+        chosen = recent_cards(ui, p, recent).or(chosen);
     }
-}
 
+    let places: Vec<Place> = volumes.iter().chain(elsewhere).cloned().collect();
+    if !places.is_empty() {
+        ui.add_space(16.0);
+        section(ui, p, "Drives and servers");
+        chosen = tiles(ui, p, &places, 3).map(Chosen::Go).or(chosen);
+    }
 
-/// Height of a recent-file card.
-const RECENT_H: f32 = 62.0;
-/// Width of one. Fixed rather than shared out, because the rail scrolls: a
-/// card that got narrower as more files arrived would be a list pretending to
-/// be a rail.
-const RECENT_W: f32 = 190.0;
-
-/// Recently opened files, as a horizontally scrolling strip.
-///
-/// A strip rather than a table. The dashboard's other two groups are already
-/// tiles, and a table underneath them would read as a different screen stapled
-/// on. It also fails better: a long list of files pushes the storage card and
-/// the destinations off the top, and those are what the dashboard is *for*.
-fn recent_rail(ui: &mut Ui, p: &Palette, recent: &[crate::recent::Visit]) -> Option<Chosen> {
-    let mut chosen = None;
-
-    egui::ScrollArea::horizontal()
-        .id_salt("recent-rail")
-        .max_height(RECENT_H + 4.0)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                for (i, visit) in recent.iter().enumerate() {
-                    if i > 0 {
-                        ui.add_space(GAP);
-                    }
-                    if let Some(hit) = recent_card(ui, p, visit) {
-                        chosen = Some(hit);
-                    }
-                }
-            });
-        });
-
+    ui.add_space(16.0);
     chosen
 }
 
-fn recent_card(ui: &mut Ui, p: &Palette, visit: &crate::recent::Visit) -> Option<Chosen> {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(RECENT_W, RECENT_H), Sense::click());
+/// "Good morning", by the clock where the user is.
+fn greeting(ui: &mut Ui, p: &Palette) {
+    let hello = match neutron_ui::format::local_hour() {
+        5..=11 => "Good morning",
+        12..=17 => "Good afternoon",
+        _ => "Good evening",
+    };
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::hover());
+    ui.painter().text(
+        pos2(rect.left() + 4.0, rect.top() + 18.0),
+        egui::Align2::LEFT_CENTER,
+        hello,
+        theme::strong(ui.ctx(), 30.0),
+        p.text,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 4.0, rect.top() + 50.0),
+        egui::Align2::LEFT_CENTER,
+        "Everything on this Mac, and everywhere you have connected.",
+        egui::FontId::proportional(14.0),
+        p.text_muted,
+    );
+}
+
+/// A group label, in the sidebar's small spaced capitals.
+fn section(ui: &mut Ui, p: &Palette, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+    ui.painter().text(
+        pos2(rect.left() + 4.0, rect.top() + 8.0),
+        egui::Align2::LEFT_CENTER,
+        micro_caps(label),
+        theme::strong(ui.ctx(), 10.0),
+        p.text_faint,
+    );
+}
+
+/// The startup volume: how much is free in large type, how full in a bar.
+fn storage_card(ui: &mut Ui, p: &Palette, volume: &Place) {
+    let Some(cap) = volume.capacity else {
+        return;
+    };
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 108.0), Sense::hover());
+    let corners = egui::CornerRadius::same(22);
+    let painter = ui.painter();
+    painter.add(
+        egui::epaint::Shadow {
+            offset: [0, 12],
+            blur: 30,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(120),
+        }
+        .as_shape(rect, corners),
+    );
+    painter.rect_filled(rect, corners, p.card_hover);
+    painter.rect_stroke(rect, corners, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+    painter.line_segment(
+        [pos2(rect.left() + 18.0, rect.top() + 1.0), pos2(rect.right() - 18.0, rect.top() + 1.0)],
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(14)),
+    );
+
+    let left = rect.left() + 24.0;
+    painter.text(
+        pos2(left, rect.top() + 30.0),
+        egui::Align2::LEFT_CENTER,
+        micro_caps(&volume.name),
+        theme::strong(ui.ctx(), 10.0),
+        p.text_faint,
+    );
+    let free = neutron_ui::format::size(Some(cap.free));
+    let big = painter.layout_no_wrap(free, theme::strong(ui.ctx(), 32.0), p.text);
+    let big_width = big.size().x;
+    painter.galley(pos2(left, rect.top() + 44.0), big, p.text);
+    let of = format!("free of {}", neutron_ui::format::size(Some(cap.total)));
+    let of_galley = painter.layout_no_wrap(of, egui::FontId::proportional(13.5), p.text_muted);
+    let of_width = of_galley.size().x;
+    painter.galley(pos2(left + big_width + 8.0, rect.top() + 60.0), of_galley, p.text_muted);
+
+    // The bar takes what the text leaves.
+    let bar_left = (left + big_width + of_width + 44.0).max(rect.left() + rect.width() * 0.45);
+    let track = Rect::from_min_max(
+        pos2(bar_left, rect.center().y - 14.0),
+        pos2(rect.right() - 24.0, rect.center().y - 2.0),
+    );
+    if track.width() > 60.0 {
+        let used = cap.total.saturating_sub(cap.free);
+        let fraction = if cap.total > 0 { used as f32 / cap.total as f32 } else { 0.0 };
+        theme::paint_well(painter, track, theme::pill(track.height()), p);
+        let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * fraction, track.bottom()));
+        if fill.width() > 2.0 {
+            painter.add(
+                egui::epaint::Shadow {
+                    offset: [0, 0],
+                    blur: 16,
+                    spread: 0,
+                    color: theme::with_alpha(p.accent, 60),
+                }
+                .as_shape(fill, theme::pill(track.height())),
+            );
+            painter.rect_filled(fill, theme::pill(track.height()), p.accent);
+        }
+        let mut x = track.left();
+        for (colour, text) in [
+            (p.accent, format!("{} used", neutron_ui::format::size(Some(used)))),
+            (p.raised, format!("{} free", neutron_ui::format::size(Some(cap.free)))),
+        ] {
+            let y = track.bottom() + 20.0;
+            painter.circle_filled(pos2(x + 4.0, y), 4.0, colour);
+            let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.5), p.text_muted);
+            let width = galley.size().x;
+            painter.galley(pos2(x + 14.0, y - galley.size().y / 2.0), galley, p.text_muted);
+            x += 14.0 + width + 18.0;
+        }
+    }
+}
+
+/// Recent files, as a grid of cards.
+fn recent_cards(ui: &mut Ui, p: &Palette, recent: &[crate::recent::Visit]) -> Option<Chosen> {
+    let mut chosen = None;
+    let shown = &recent[..recent.len().min(8)];
+    // Columns by width alone, not by how many there are: one recent file is a
+    // card, not a banner across the pane.
+    let columns = columns_for(ui.available_width(), 4);
+    let width = ((ui.available_width() - GAP * (columns - 1) as f32) / columns as f32).floor();
+    for row in shown.chunks(columns) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (n, visit) in row.iter().enumerate() {
+                if n > 0 {
+                    ui.add_space(GAP);
+                }
+                if let Some(hit) = recent_card(ui, p, visit, width) {
+                    chosen = Some(hit);
+                }
+            }
+        });
+        ui.add_space(GAP);
+    }
+    chosen
+}
+
+fn recent_card(ui: &mut Ui, p: &Palette, visit: &crate::recent::Visit, width: f32) -> Option<Chosen> {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, RECENT_H), Sense::click());
     if !ui.is_rect_visible(rect) {
         return None;
     }
-
-    let hovered = response.hovered();
-    ui.painter().rect(
-        rect,
-        RADIUS_CARD as f32,
-        if hovered { p.card_hover } else { p.card },
-        egui::Stroke::new(1.0, if hovered { p.border_strong } else { p.border }),
-        egui::StrokeKind::Inside,
-    );
+    card(ui, p, rect, response.hovered());
 
     let name = visit
         .path
@@ -311,53 +284,46 @@ fn recent_card(ui: &mut Ui, p: &Palette, visit: &crate::recent::Visit) -> Option
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| visit.path.to_string_lossy().into_owned());
 
-    icons::draw(
+    let tile = Rect::from_min_size(pos2(rect.left() + 14.0, rect.top() + 14.0), vec2(36.0, 36.0));
+    icons::tile(
         ui.painter(),
-        pos2(rect.left() + 22.0, rect.top() + 22.0),
-        Glyph::File,
-        p.icon,
+        tile,
+        icons::FileKind::of(&name, neutron_core::EntryKind::File),
+        p,
+        false,
     );
 
     // Clipped through a layout job: a long filename would otherwise run past
     // the card and over the next one.
-    let text_left = rect.left() + 40.0;
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        name,
-        egui::FontId::proportional(12.5),
-        p.text,
-    );
-    job.wrap = egui::text::TextWrapping {
-        max_width: rect.right() - text_left - 12.0,
-        max_rows: 1,
-        break_anywhere: true,
-        overflow_character: Some('…'),
+    let text_left = rect.left() + 14.0;
+    let room = rect.width() - 28.0;
+    let line = |text: String, font: egui::FontId, colour: egui::Color32| {
+        let mut job = egui::text::LayoutJob::simple_singleline(text, font, colour);
+        job.wrap = egui::text::TextWrapping {
+            max_width: room.max(1.0),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        ui.painter().layout_job(job)
     };
-    let galley = ui.painter().layout_job(job);
-    ui.painter()
-        .galley(pos2(text_left, rect.top() + 14.0), galley, p.text);
+    let title = line(name, theme::strong(ui.ctx(), 13.5), p.text);
+    ui.painter().galley(pos2(text_left, rect.top() + 60.0), title, p.text);
 
     // The folder, not the whole path: the filename is above it, and what is
-    // actually needed is which of the four places called `notes.txt` this is.
+    // needed is which of the places called `notes.txt` this one is.
     let folder = visit
         .path
         .parent()
         .and_then(|d| d.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "—".to_owned());
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        format!("{folder}  ·  {}", neutron_ui::format::timestamp(visit.at)),
-        egui::FontId::proportional(10.5),
+    let detail = line(
+        format!("{folder} · {}", neutron_ui::format::timestamp(visit.at)),
+        egui::FontId::proportional(12.0),
         p.text_faint,
     );
-    job.wrap = egui::text::TextWrapping {
-        max_width: rect.right() - text_left - 12.0,
-        max_rows: 1,
-        break_anywhere: true,
-        overflow_character: Some('…'),
-    };
-    let galley = ui.painter().layout_job(job);
-    ui.painter()
-        .galley(pos2(text_left, rect.top() + 34.0), galley, p.text_faint);
+    ui.painter().galley(pos2(text_left, rect.top() + 80.0), detail, p.text_faint);
 
     let response = response.on_hover_text(visit.path.to_string_lossy());
     if response.clicked() {
@@ -372,16 +338,29 @@ fn recent_card(ui: &mut Ui, p: &Palette, visit: &crate::recent::Visit) -> Option
     None
 }
 
-/// Quick destinations, as a responsive grid of tiles.
-fn tiles(ui: &mut Ui, p: &Palette, places: &[Place]) -> Option<NodeId> {
+/// A card on the dashboard: a faint lift off the pane, a little more under
+/// the pointer.
+fn card(ui: &Ui, p: &Palette, rect: Rect, hovered: bool) {
+    let corners = egui::CornerRadius::same(18);
+    ui.painter().rect_filled(rect, corners, egui::Color32::from_white_alpha(if hovered { 13 } else { 8 }));
+    ui.painter().rect_stroke(
+        rect,
+        corners,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(9)),
+        egui::StrokeKind::Inside,
+    );
+    let _ = p;
+}
+
+/// Quick destinations, as a grid of tiles at most `max_columns` across.
+fn tiles(ui: &mut Ui, p: &Palette, places: &[Place], max_columns: usize) -> Option<NodeId> {
     if places.is_empty() {
         return None;
     }
     let mut chosen = None;
 
-    let columns = columns_for(ui.available_width(), places.len());
-    let width =
-        ((ui.available_width() - GAP * (columns - 1) as f32) / columns as f32).floor();
+    let columns = columns_for(ui.available_width(), places.len()).min(max_columns);
+    let width = ((ui.available_width() - GAP * (columns - 1) as f32) / columns as f32).floor();
 
     for row in places.chunks(columns) {
         ui.horizontal(|ui| {
@@ -418,46 +397,71 @@ fn tile(ui: &mut Ui, p: &Palette, place: &Place, width: f32) -> bool {
     if !ui.is_rect_visible(rect) {
         return response.clicked();
     }
+    card(ui, p, rect, response.hovered());
 
-    let hovered = response.hovered();
-    ui.painter().rect(
-        rect,
-        RADIUS_CARD as f32,
-        if hovered { p.card_hover } else { p.card },
-        egui::Stroke::new(1.0, if hovered { p.border_strong } else { p.border }),
-        egui::StrokeKind::Inside,
-    );
-
-    // A tinted plate behind the glyph, the way the concept sets its folders on
-    // a soft panel rather than letting them float on the card.
-    let plate = Rect::from_min_size(pos2(rect.left() + 14.0, rect.top() + 14.0), vec2(34.0, 34.0));
-    ui.painter()
-        .rect_filled(plate, RADIUS_CONTROL as f32, p.selection);
-    icons::draw(ui.painter(), plate.center(), glyph_for(place), p.accent);
-
-    ui.painter().text(
-        pos2(rect.left() + 14.0, rect.top() + 58.0),
-        egui::Align2::LEFT_TOP,
-        &place.name,
-        egui::FontId::proportional(12.5),
-        p.text,
-    );
-
-    let detail = match place.capacity {
-        Some(cap) => format!(
-            "{} free of {}",
-            neutron_ui::format::size(Some(cap.free)),
-            neutron_ui::format::size(Some(cap.total))
-        ),
-        None => "Folder".to_owned(),
+    let plate = Rect::from_min_size(pos2(rect.left() + 14.0, rect.center().y - 19.0), vec2(38.0, 38.0));
+    let folder_like = matches!(place.kind, PlaceKind::KnownFolder);
+    let (plate_fill, glyph_colour) = if folder_like {
+        (theme::with_alpha(p.tints.folder, 30), p.tints.folder)
+    } else {
+        (egui::Color32::from_white_alpha(13), p.text_soft())
     };
-    ui.painter().text(
-        pos2(rect.left() + 14.0, rect.top() + 74.0),
-        egui::Align2::LEFT_TOP,
-        detail,
-        egui::FontId::proportional(10.5),
-        p.text_faint,
-    );
+    ui.painter().rect_filled(plate, egui::CornerRadius::same(13), plate_fill);
+    icons::draw(ui.painter(), plate.center(), glyph_for(place), glyph_colour);
+
+    let text_left = plate.right() + 12.0;
+    let room = (rect.right() - text_left - 14.0).max(1.0);
+    let line = |text: String, font: egui::FontId, colour: egui::Color32| {
+        let mut job = egui::text::LayoutJob::simple_singleline(text, font, colour);
+        job.wrap = egui::text::TextWrapping {
+            max_width: room,
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        ui.painter().layout_job(job)
+    };
+
+    match place.capacity {
+        // A volume shows how full it is, as the storage card does in large.
+        Some(cap) => {
+            let used = cap.total.saturating_sub(cap.free);
+            let fraction = if cap.total > 0 { used as f32 / cap.total as f32 } else { 0.0 };
+            let name = line(place.name.clone(), theme::strong(ui.ctx(), 13.5), p.text);
+            ui.painter().galley(pos2(text_left, rect.center().y - 15.0), name, p.text);
+            ui.painter().text(
+                pos2(rect.right() - 14.0, rect.center().y - 7.0),
+                egui::Align2::RIGHT_CENTER,
+                format!("{:.0}%", fraction * 100.0),
+                egui::FontId::proportional(12.0),
+                p.text_faint,
+            );
+            let track = Rect::from_min_max(
+                pos2(text_left, rect.center().y + 6.0),
+                pos2(rect.right() - 14.0, rect.center().y + 11.0),
+            );
+            ui.painter().rect_filled(track, theme::pill(5.0), p.inset);
+            let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * fraction, track.bottom()));
+            if fill.width() > 1.0 {
+                ui.painter().rect_filled(fill, theme::pill(5.0), theme::with_alpha(p.accent, 220));
+            }
+        }
+        None => {
+            let name = line(place.name.clone(), theme::strong(ui.ctx(), 13.5), p.text);
+            ui.painter().galley(pos2(text_left, rect.center().y - 17.0), name, p.text);
+            let detail = match place.kind {
+                PlaceKind::Server => "Server".to_owned(),
+                PlaceKind::Cloud => "Cloud storage".to_owned(),
+                _ => place
+                    .id
+                    .as_path()
+                    .map(crate::app::tidy_location)
+                    .unwrap_or_else(|| "Folder".to_owned()),
+            };
+            let detail = line(detail, egui::FontId::proportional(12.0), p.text_faint);
+            ui.painter().galley(pos2(text_left, rect.center().y + 2.0), detail, p.text_faint);
+        }
+    }
 
     response.clicked()
 }
@@ -468,7 +472,17 @@ fn glyph_for(place: &Place) -> Glyph {
         PlaceKind::Cloud => Glyph::Cloud,
         PlaceKind::Server => Glyph::Server,
         PlaceKind::Wsl => Glyph::Terminal,
-        _ => Glyph::Folder,
+        _ => match place.name.as_str() {
+            "Home" => Glyph::Home,
+            "Desktop" => Glyph::Desktop,
+            "Downloads" => Glyph::Download,
+            "Documents" => Glyph::Document,
+            "Pictures" => Glyph::Image,
+            "Music" => Glyph::Music,
+            "Movies" | "Videos" => Glyph::Film,
+            "Applications" => Glyph::Grid,
+            _ => Glyph::Folder,
+        },
     }
 }
 

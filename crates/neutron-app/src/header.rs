@@ -35,18 +35,20 @@ use egui::{Rect, Sense, Ui, pos2, vec2};
 use neutron_core::{Axis, NodeId};
 use neutron_ui::file_list::ViewMode;
 use neutron_ui::icons::{self, Glyph};
-use neutron_ui::theme::{self, Palette, RADIUS_CONTROL, RADIUS_SMALL};
+use neutron_ui::theme::{self, Palette, RADIUS_CONTROL};
 
 /// Height of the navigation row.
-const NAV_ROW: f32 = 40.0;
+const NAV_ROW: f32 = 48.0;
 /// Height of the large title block, when it is shown.
-const TITLE_ROW: f32 = 40.0;
+const TITLE_ROW: f32 = 44.0;
 /// Below this pane height the title is dropped in favour of more rows.
 const TITLE_MIN_PANE_HEIGHT: f32 = 300.0;
 /// Below this pane width the filter field is dropped; the breadcrumb and the
 /// navigation arrows matter more on a narrow pane.
 const FILTER_MIN_PANE_WIDTH: f32 = 460.0;
-const FILTER_WIDTH: f32 = 180.0;
+const FILTER_WIDTH: f32 = 220.0;
+/// Narrowest the filter gets in a narrow pane.
+const FILTER_MIN: f32 = 120.0;
 
 /// A control in the header was used.
 #[derive(Debug, Clone, PartialEq)]
@@ -107,8 +109,11 @@ pub fn show(
     let mut action = None;
 
     let full = ui.available_rect_before_wrap();
-    let show_title = full.height() >= TITLE_MIN_PANE_HEIGHT;
-    let show_filter = full.width() >= FILTER_MIN_PANE_WIDTH;
+    // The dashboard is not a folder: nothing to filter, no views to switch
+    // between, no hidden files, and it titles itself.
+    let dashboard = matches!(h.location, NodeId::Home);
+    let show_title = full.height() >= TITLE_MIN_PANE_HEIGHT && !dashboard;
+    let show_filter = full.width() >= FILTER_MIN_PANE_WIDTH && !dashboard;
 
     let nav = Rect::from_min_size(full.min, vec2(full.width(), NAV_ROW));
     ui.advance_cursor_after_rect(nav);
@@ -118,7 +123,10 @@ pub fn show(
     // Shortcuts are spelled out rather than drawn with arrow characters:
     // U+2190…U+2192 are not in the font egui bundles and render as empty boxes,
     // so "Alt+↑" reached the screen as "Alt+ □".
-    let mut x = nav.left() + 10.0;
+    // Back, forward and up share a well: one control for moving about.
+    let group_rect = Rect::from_min_size(pos2(nav.left() + 4.0, nav.center().y - 18.0), vec2(102.0, 36.0));
+    theme::paint_well(ui.painter(), group_rect, egui::CornerRadius::same(14), p);
+    let mut x = group_rect.left() + 3.0;
     for (glyph, enabled, act, tip) in [
         (
             Glyph::ArrowLeft,
@@ -139,21 +147,22 @@ pub fn show(
             "Up (Alt+Up, Backspace)",
         ),
     ] {
-        let r = Rect::from_center_size(pos2(x + 14.0, nav.center().y), vec2(28.0, 28.0));
+        let r = Rect::from_min_size(pos2(x, group_rect.top() + 3.0), vec2(32.0, 30.0));
         if icon_button(ui, p, r, glyph, enabled, false, tip) {
             action = Some(act);
         }
-        x += 30.0;
+        x += 32.0;
     }
+    x = group_rect.right() + 4.0;
 
     // --- right-hand controls, laid out from the right edge inward ---
-    let mut right = nav.right() - 8.0;
+    let mut right = nav.right() - 4.0;
 
     for (vertical, tip) in [
         (true, "Split down (Ctrl+Shift+\\)"),
         (false, "Split right (Ctrl+\\)"),
     ] {
-        let r = Rect::from_center_size(pos2(right - 14.0, nav.center().y), vec2(28.0, 28.0));
+        let r = Rect::from_center_size(pos2(right - 18.0, nav.center().y), vec2(36.0, 36.0));
         if split_button(ui, p, r, vertical, tip) {
             action = Some(HeaderAction::Split(if vertical {
                 Axis::Vertical
@@ -161,57 +170,66 @@ pub fn show(
                 Axis::Horizontal
             }));
         }
-        right -= 30.0;
+        right -= 38.0;
     }
+    right -= 2.0;
 
-    // The views, one button each with the current one lit. Three states no
-    // longer fit one toggle: a button that shows "the next view" makes the
-    // user cycle through one they do not want to reach the one they do.
-    // Laid out from the right, so listed here in reverse.
-    for (mode, glyph, tip) in [
-        (ViewMode::Columns, Glyph::Columns, "Column view (Ctrl+Shift+L cycles views)"),
-        (ViewMode::Grid, Glyph::Grid, "Grid view (Ctrl+Shift+L cycles views)"),
-        (ViewMode::List, Glyph::List, "List view (Ctrl+Shift+L cycles views)"),
-    ] {
-        let r = Rect::from_center_size(pos2(right - 14.0, nav.center().y), vec2(28.0, 28.0));
-        if icon_button(ui, p, r, glyph, true, h.view == mode, tip) && h.view != mode {
-            action = Some(HeaderAction::SetView(mode));
+    if !dashboard {
+        let eye = Rect::from_center_size(pos2(right - 18.0, nav.center().y), vec2(36.0, 36.0));
+        if icon_button(
+            ui,
+            p,
+            eye,
+            Glyph::Eye,
+            true,
+            h.show_hidden,
+            if cfg!(target_os = "macos") {
+                "Show hidden files (Cmd+Shift+.)"
+            } else {
+                "Show hidden files (Ctrl+H)"
+            },
+        ) {
+            action = Some(HeaderAction::ToggleHidden);
         }
-        right -= 30.0;
-    }
-    right -= 6.0;
+        right -= 44.0;
 
-    let eye = Rect::from_center_size(pos2(right - 14.0, nav.center().y), vec2(28.0, 28.0));
-    if icon_button(
-        ui,
-        p,
-        eye,
-        Glyph::Eye,
-        true,
-        h.show_hidden,
-        if cfg!(target_os = "macos") {
-            "Show hidden files (Cmd+Shift+.)"
-        } else {
-            "Show hidden files (Ctrl+H)"
-        },
-    ) {
-        action = Some(HeaderAction::ToggleHidden);
+        // The views, as a segmented control: a pill-shaped well with the chosen
+        // view raised out of it. Three states no longer fit one toggle, and a
+        // button showing "the next view" makes the user cycle through one they do
+        // not want. Laid out from the right, so listed in reverse.
+        let segments = Rect::from_min_size(pos2(right - 117.0, nav.center().y - 18.0), vec2(117.0, 36.0));
+        theme::paint_well(ui.painter(), segments, theme::pill(36.0), p);
+        let mut seg_x = segments.right() - 3.0 - 36.0;
+        for (mode, glyph, tip) in [
+            (ViewMode::Columns, Glyph::Columns, "Column view (Ctrl+Shift+L cycles views)"),
+            (ViewMode::Grid, Glyph::Grid, "Grid view (Ctrl+Shift+L cycles views)"),
+            (ViewMode::List, Glyph::List, "List view (Ctrl+Shift+L cycles views)"),
+        ] {
+            let r = Rect::from_min_size(pos2(seg_x, segments.top() + 3.0), vec2(36.0, 30.0));
+            if segment(ui, p, r, glyph, h.view == mode, tip) && h.view != mode {
+                action = Some(HeaderAction::SetView(mode));
+            }
+            seg_x -= 36.0;
+        }
+        right = segments.left() - 10.0;
     }
-    right -= 36.0;
 
     if show_filter {
+        // Gives up width in a narrow pane before the breadcrumb does: the
+        // trail says where you are, and a filter is still usable at half size.
+        let width = FILTER_WIDTH.min(((right - x) * 0.4).max(FILTER_MIN));
         let field = Rect::from_min_max(
-            pos2(right - FILTER_WIDTH, nav.center().y - 14.0),
-            pos2(right, nav.center().y + 14.0),
+            pos2(right - width, nav.center().y - 18.0),
+            pos2(right, nav.center().y + 18.0),
         );
         if let Some(text) = filter_field(ui, p, group, field, h.filter) {
             action = Some(HeaderAction::SetFilter(text));
         }
-        right -= FILTER_WIDTH + 8.0;
+        right -= width + 10.0;
     }
 
     // --- breadcrumb, in whatever is left between the arrows and the controls ---
-    let trail = Rect::from_min_max(pos2(x + 8.0, nav.top()), pos2(right, nav.bottom()));
+    let trail = Rect::from_min_max(pos2(x + 6.0, nav.top()), pos2(right, nav.bottom()));
     if trail.width() > 40.0 {
         match h.address {
             Some(text) => {
@@ -250,12 +268,8 @@ fn draw_title(ui: &Ui, p: &Palette, row: Rect, h: &Header<'_>) {
     let title = h.location.display_name();
     let painter = ui.painter();
 
-    let galley = painter.layout_no_wrap(
-        title,
-        egui::FontId::proportional(19.0),
-        p.text,
-    );
-    let baseline = pos2(row.left() + 16.0, row.center().y - galley.size().y / 2.0 + 2.0);
+    let galley = painter.layout_no_wrap(title, theme::strong(ui.ctx(), 22.0), p.text);
+    let baseline = pos2(row.left() + 12.0, row.center().y - galley.size().y / 2.0);
     let width = galley.size().x;
     painter.galley(baseline, galley, p.text);
 
@@ -267,10 +281,10 @@ fn draw_title(ui: &Ui, p: &Palette, row: Rect, h: &Header<'_>) {
         format!("{} of {}", h.shown, h.total)
     };
     painter.text(
-        pos2(baseline.x + width + 12.0, row.center().y + 2.0),
+        pos2(baseline.x + width + 12.0, row.center().y + 3.0),
         egui::Align2::LEFT_CENTER,
         count,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(13.0),
         p.text_faint,
     );
 }
@@ -292,21 +306,23 @@ fn icon_button(
         if enabled { Sense::click() } else { Sense::hover() },
     );
 
+    let corners = egui::CornerRadius::same(11);
     if active {
-        ui.painter()
-            .rect_filled(rect, RADIUS_CONTROL as f32, p.selection);
+        ui.painter().rect_filled(rect, corners, p.selection);
     } else if enabled && response.hovered() {
-        ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
+        ui.painter().rect_filled(rect, corners, p.hover);
     }
 
     // Disabled controls are dimmed rather than hidden: a back arrow that
     // vanishes at the start of history makes the row's contents jump.
     let colour = if !enabled {
-        p.text_faint
-    } else if active || response.hovered() {
+        theme::with_alpha(p.text_faint, 140)
+    } else if active {
+        p.accent
+    } else if response.hovered() {
         p.text
     } else {
-        p.text_muted
+        p.text_soft()
     };
     icons::draw(ui.painter(), rect.center(), glyph, colour);
 
@@ -316,6 +332,26 @@ fn icon_button(
     enabled && response.clicked()
 }
 
+/// One segment of the view switcher: raised out of the well when chosen.
+fn segment(ui: &mut Ui, p: &Palette, rect: Rect, glyph: Glyph, chosen: bool, tip: &str) -> bool {
+    let response = ui.interact(rect, ui.id().with(("segment", glyph as u8)), Sense::click());
+    if chosen {
+        theme::paint_raised(ui.painter(), rect, theme::pill(rect.height()), p);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, theme::pill(rect.height()), p.hover);
+    }
+    let colour = if chosen {
+        p.accent
+    } else if response.hovered() {
+        p.text
+    } else {
+        p.text_muted
+    };
+    icons::draw(ui.painter(), rect.center(), glyph, colour);
+    response.clone().on_hover_text(tip);
+    response.clicked()
+}
+
 fn split_button(ui: &mut Ui, p: &Palette, rect: Rect, vertical: bool, tip: &str) -> bool {
     let response = ui.interact(
         rect,
@@ -323,12 +359,12 @@ fn split_button(ui: &mut Ui, p: &Palette, rect: Rect, vertical: bool, tip: &str)
         Sense::click(),
     );
     if response.hovered() {
-        ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(11), p.hover);
     }
     let colour = if response.hovered() {
         p.text
     } else {
-        p.text_muted
+        p.text_soft()
     };
     icons::split(ui.painter(), rect.center(), vertical, colour);
     response.clone().on_hover_text(tip);
@@ -423,32 +459,32 @@ fn filter_field(
     let mut text = current.to_owned();
     let has_focus = ui.memory(|m| m.has_focus(id));
 
-    ui.painter().rect(
-        rect,
-        RADIUS_CONTROL as f32,
-        p.inset,
-        egui::Stroke::new(1.0, if has_focus { p.accent } else { p.border }),
-        egui::StrokeKind::Inside,
-    );
+    // A pill-shaped well; focused, a soft ring of the accent around it.
+    let corners = theme::pill(rect.height());
     if has_focus {
-        let focus_glow = egui::epaint::Shadow {
-            offset: [0, 0],
-            blur: 8,
-            spread: 0,
-            color: p.selection,
-        };
-        ui.painter().add(focus_glow.as_shape(rect, egui::CornerRadius::same(RADIUS_CONTROL)));
+        ui.painter().rect_filled(rect.expand(4.0), theme::pill(rect.height() + 8.0), theme::with_alpha(p.accent, 20));
+    }
+    theme::paint_well(ui.painter(), rect, corners, p);
+    if has_focus {
+        ui.painter().rect_stroke(
+            rect,
+            corners,
+            egui::Stroke::new(1.0, theme::with_alpha(p.accent, 56)),
+            egui::StrokeKind::Inside,
+        );
     }
     icons::draw(
         ui.painter(),
-        pos2(rect.left() + 15.0, rect.center().y),
+        pos2(rect.left() + 18.0, rect.center().y),
         Glyph::Search,
         if has_focus { p.accent } else { p.text_faint },
     );
 
+    // A line's height, centred: the field otherwise sits its text at the top
+    // of whatever height it is given.
     let text_rect = Rect::from_min_max(
-        pos2(rect.left() + 28.0, rect.top()),
-        pos2(rect.right() - 8.0, rect.bottom()),
+        pos2(rect.left() + 34.0, rect.center().y - 10.0),
+        pos2(rect.right() - 14.0, rect.center().y + 10.0),
     );
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(text_rect));
     child.set_clip_rect(text_rect);
@@ -458,10 +494,10 @@ fn filter_field(
         .id(id)
         .background_color(egui::Color32::TRANSPARENT)
         .desired_width(text_rect.width())
-        .font(egui::FontId::proportional(12.0))
+        .font(egui::FontId::proportional(13.0))
         .text_color(p.text)
         // Names the control, so an empty field is not an unexplained blank pill.
-        .hint_text(egui::RichText::new("Filter").color(p.text_faint).size(12.0))
+        .hint_text(egui::RichText::new("Filter this folder").color(p.text_faint).size(13.0))
         .vertical_align(egui::Align::Center)
         .show(&mut child);
 
@@ -499,6 +535,30 @@ fn segments(location: &NodeId) -> Option<Vec<(String, NodeId)>> {
     match location {
         NodeId::Path(path) => {
             use std::path::Component;
+
+            // Inside the home folder the trail starts there, as the column
+            // view's columns do: "/ › Users ›" in front of every path is the
+            // same two crumbs on almost every folder anyone opens.
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                if let Ok(rest) = path.strip_prefix(&home) {
+                    if home.parent().is_some() {
+                        let mut acc = home.clone();
+                        let label = home
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "~".to_owned());
+                        let mut segments = vec![(label, NodeId::Path(acc.clone()))];
+                        for component in rest.components() {
+                            acc.push(component.as_os_str());
+                            segments.push((
+                                component.as_os_str().to_string_lossy().into_owned(),
+                                NodeId::Path(acc.clone()),
+                            ));
+                        }
+                        return Some(segments);
+                    }
+                }
+            }
 
             let mut segments = Vec::new();
             let mut acc = PathBuf::new();
@@ -562,35 +622,45 @@ fn breadcrumb(ui: &mut Ui, p: &Palette, rect: Rect, location: &NodeId) -> Option
         return None;
     };
 
-    let font = egui::FontId::proportional(12.0);
-    let chevron = 16.0;
+    let font = egui::FontId::proportional(13.0);
+    let strong = theme::strong(ui.ctx(), 13.0);
+    let chevron = 18.0;
+    // The "…" and chevron drawn in place of what was dropped.
+    let lead = 12.0 + chevron;
+    let last = segments.len() - 1;
 
-    // Measure from the right, keeping segments while they fit.
+    // Measure from the right, keeping segments while they fit. The last is
+    // measured in the weight it is drawn in.
     let widths: Vec<f32> = segments
         .iter()
-        .map(|(label, _)| {
-            ui.painter()
-                .layout_no_wrap(label.clone(), font.clone(), p.text)
-                .size()
-                .x
+        .enumerate()
+        .map(|(i, (label, _))| {
+            let font = if i == last { strong.clone() } else { font.clone() };
+            ui.painter().layout_no_wrap(label.clone(), font, p.text).size().x
         })
         .collect();
 
     let mut first = 0;
-    let mut used: f32 = widths.iter().sum::<f32>() + chevron * (segments.len() - 1) as f32;
+    let mut used: f32 = widths.iter().sum::<f32>() + chevron * last as f32;
     // The last segment always stays, however long it is — better to clip one
     // name than to render a breadcrumb of nothing but ellipses.
-    while used > rect.width() && first + 1 < segments.len() {
+    while used > rect.width() && first < last {
         used -= widths[first] + chevron;
+        if first == 0 {
+            used += lead;
+        }
         first += 1;
     }
     let elided = first > 0;
+
+    // Nothing paints past the trail's end, whatever a long name measures.
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
 
     let mut action = None;
     let mut x = rect.left();
 
     if elided {
-        ui.painter().text(
+        painter.text(
             pos2(x, rect.center().y),
             egui::Align2::LEFT_CENTER,
             "…",
@@ -599,7 +669,7 @@ fn breadcrumb(ui: &mut Ui, p: &Palette, rect: Rect, location: &NodeId) -> Option
         );
         x += 12.0;
         icons::draw(
-            ui.painter(),
+            &painter,
             pos2(x + chevron / 2.0, rect.center().y),
             Glyph::ChevronRight,
             p.text_faint,
@@ -607,36 +677,38 @@ fn breadcrumb(ui: &mut Ui, p: &Palette, rect: Rect, location: &NodeId) -> Option
         x += chevron;
     }
 
-    let last = segments.len() - 1;
     for (i, (label, target)) in segments.iter().enumerate().skip(first) {
         // Separator before every segment but the first drawn. When the trail is
         // elided the leading chevron has already been drawn after the ellipsis.
         if i > first {
             icons::draw(
-                ui.painter(),
+                &painter,
                 pos2(x + chevron / 2.0, rect.center().y),
                 Glyph::ChevronRight,
-                p.text_faint,
+                theme::with_alpha(p.text_faint, 170),
             );
             x += chevron;
         }
 
         let w = widths[i];
         let hit = Rect::from_min_max(
-            pos2(x - 4.0, rect.center().y - 11.0),
-            pos2(x + w + 4.0, rect.center().y + 11.0),
+            pos2(x - 7.0, rect.center().y - 15.0),
+            pos2(x + w + 7.0, rect.center().y + 15.0),
         );
 
         if i == last {
             // The current location is a label, not a link: clicking it would
             // reload the pane, which is what F5 is for.
-            ui.painter().text(
-                pos2(x, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                label,
-                font.clone(),
-                p.text,
-            );
+            // Ellipsised rather than cut off when even it alone does not fit.
+            let mut job = egui::text::LayoutJob::simple_singleline(label.clone(), strong.clone(), p.text);
+            job.wrap = egui::text::TextWrapping {
+                max_width: (rect.right() - x).max(1.0),
+                max_rows: 1,
+                break_anywhere: true,
+                overflow_character: Some('…'),
+            };
+            let galley = painter.layout_job(job);
+            painter.galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, p.text);
         } else {
             let response = ui.interact(
                 hit,
@@ -644,10 +716,10 @@ fn breadcrumb(ui: &mut Ui, p: &Palette, rect: Rect, location: &NodeId) -> Option
                 Sense::click(),
             );
             if response.hovered() {
-                ui.painter()
-                    .rect_filled(hit, RADIUS_SMALL as f32, p.hover);
+                painter
+                    .rect_filled(hit, egui::CornerRadius::same(10), p.hover);
             }
-            ui.painter().text(
+            painter.text(
                 pos2(x, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 label,
@@ -661,7 +733,6 @@ fn breadcrumb(ui: &mut Ui, p: &Palette, rect: Rect, location: &NodeId) -> Option
         x += w;
     }
 
-    let _ = theme::RADIUS_CARD;
     action
 }
 

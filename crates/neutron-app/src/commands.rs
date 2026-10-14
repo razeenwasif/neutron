@@ -257,7 +257,7 @@ pub fn catalogue(plugins: &[(crate::plugins::Ref, String, String)]) -> Vec<Entry
         .map(|c| Entry {
             invoke: Invoke::Builtin(c.id),
             title: c.title.to_owned(),
-            hint: if cfg!(target_os = "macos") { c.hint.replace("Ctrl+", "Cmd+") } else { c.hint.to_owned() },
+            hint: neutron_ui::format::shortcut(c.hint),
         })
         .collect();
 

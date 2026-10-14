@@ -190,11 +190,6 @@ impl IconService {
     pub fn uv(&self, slot: Slot) -> egui::Rect {
         self.atlas.uv(slot)
     }
-
-    /// Distinct icons resolved so far, for the status bar's diagnostics.
-    pub fn resolved(&self) -> usize {
-        self.atlas.len()
-    }
 }
 
 /// Builds the key for one row, rooted at the directory being listed.

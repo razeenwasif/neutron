@@ -23,7 +23,8 @@ use std::cell::Cell;
 
 use egui::{Align2, Color32, Rect, Sense, Ui, pos2, vec2};
 use neutron_remote::site::{Auth, Protocol, Site, Sites};
-use neutron_ui::theme::{Palette, RADIUS_CARD, RADIUS_CONTROL};
+use egui::CornerRadius;
+use neutron_ui::theme::{self, Palette, RADIUS_CARD, RADIUS_CONTROL};
 
 /// One editable field. An enum rather than six named `String`s so the draw
 /// loop, the focus order and the change action are all one thing each.
@@ -492,6 +493,11 @@ pub fn card_rect(screen: Rect) -> Rect {
     )
 }
 
+/// The text field's widget id, so the dialog can ring the one with the caret.
+pub fn field_id(field: Field) -> egui::Id {
+    egui::Id::new(("neutron-connect-field", field))
+}
+
 /// Where the app draws the text field for `field`.
 pub fn field_rect(screen: Rect, field: Field) -> Rect {
     let card = card_rect(screen);
@@ -521,13 +527,7 @@ pub fn show(ui: &mut Ui, p: &Palette, dialog: &ConnectDialog) -> Option<ConnectA
         Sense::click(),
     );
 
-    painter.rect_filled(card, RADIUS_CARD, p.card);
-    painter.rect_stroke(
-        card,
-        RADIUS_CARD,
-        egui::Stroke::new(1.0, p.border),
-        egui::StrokeKind::Inside,
-    );
+    theme::paint_pane(&painter, card, RADIUS_CARD as f32, p);
 
     painter.text(
         pos2(card.left() + 22.0, card.top() + 26.0),
@@ -537,7 +537,7 @@ pub fn show(ui: &mut Ui, p: &Palette, dialog: &ConnectDialog) -> Option<ConnectA
         } else {
             "Connect to a server"
         },
-        egui::FontId::proportional(17.0),
+        theme::strong(ui.ctx(), 17.0),
         p.text,
     );
 
@@ -545,14 +545,15 @@ pub fn show(ui: &mut Ui, p: &Palette, dialog: &ConnectDialog) -> Option<ConnectA
 
     // Protocol, as three buttons rather than a dropdown: there are exactly
     // three, and which one is chosen changes what the fields below mean.
-    let mut x = card.left() + 22.0;
+    let mut x = card.left() + 22.0 + 4.0;
+    segment_well(&painter, p, pos2(card.left() + 22.0, card.top() + 44.0), 3, 74.0);
     for protocol in [Protocol::Sftp, Protocol::Ftps, Protocol::Ftp] {
         let rect = Rect::from_min_size(pos2(x, card.top() + 48.0), vec2(74.0, 26.0));
         let id = egui::Id::new(("neutron-connect-protocol", protocol.label()));
         if chip(ui, &painter, p, rect, id, protocol.label(), dialog.protocol == protocol) {
             action = Some(ConnectAction::SetProtocol(protocol));
         }
-        x += 80.0;
+        x += 74.0 + SEGMENT_GAP;
     }
 
     // The second row says how this protocol proves who is on each end: how
@@ -567,7 +568,8 @@ pub fn show(ui: &mut Ui, p: &Palette, dialog: &ConnectDialog) -> Option<ConnectA
                 egui::FontId::proportional(13.0),
                 p.text_muted,
             );
-            let mut x = card.left() + 130.0;
+            let mut x = card.left() + 124.0 + 4.0;
+            segment_well(&painter, p, pos2(card.left() + 124.0, row_y - 4.0), 3, 90.0);
             for choice in [AuthChoice::Password, AuthChoice::Key, AuthChoice::Agent] {
                 let rect = Rect::from_min_size(pos2(x, row_y), vec2(90.0, 26.0));
                 let id = egui::Id::new(("neutron-connect-auth", choice.label()));
@@ -575,7 +577,7 @@ pub fn show(ui: &mut Ui, p: &Palette, dialog: &ConnectDialog) -> Option<ConnectA
                 if chip(ui, &painter, p, rect, id, choice.label(), dialog.auth() == choice) {
                     dialog.auth.set(choice);
                 }
-                x += 96.0;
+                x += 90.0 + SEGMENT_GAP;
             }
         }
         Protocol::Ftps => {
@@ -610,7 +612,17 @@ pub fn show(ui: &mut Ui, p: &Palette, dialog: &ConnectDialog) -> Option<ConnectA
             egui::FontId::proportional(13.0),
             p.text_muted,
         );
-        painter.rect_filled(rect.expand2(vec2(6.0, 4.0)), RADIUS_CONTROL, p.inset);
+        let well = rect.expand2(vec2(8.0, 6.0));
+        let corners = CornerRadius::same(RADIUS_CONTROL);
+        theme::paint_well(&painter, well, corners, p);
+        if ui.memory(|m| m.has_focus(field_id(field))) {
+            painter.rect_stroke(
+                well,
+                corners,
+                egui::Stroke::new(1.5, theme::with_alpha(p.accent, 110)),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
 
     let buttons_y = card.bottom() - 34.0;
@@ -623,35 +635,19 @@ pub fn show(ui: &mut Ui, p: &Palette, dialog: &ConnectDialog) -> Option<ConnectA
             egui::Id::new(("neutron-connect-button", text)),
             Sense::click(),
         );
-        painter.rect_filled(
-            rect,
-            RADIUS_CONTROL,
-            if primary {
-                if response.hovered() { p.accent } else { p.selection }
-            } else if response.hovered() {
-                p.hover
-            } else {
-                Color32::TRANSPARENT
-            },
-        );
-        painter.rect_stroke(
-            rect,
-            RADIUS_CONTROL,
-            egui::Stroke::new(1.0, if primary { p.accent } else { p.border }),
-            egui::StrokeKind::Inside,
-        );
+        // Connect is the accent, filled; Cancel a quiet lift beside it.
+        let corners = theme::pill(rect.height());
+        if primary {
+            painter.rect_filled(rect, corners, if response.hovered() { p.accent_hover } else { p.accent });
+        } else {
+            painter.rect_filled(rect, corners, Color32::from_white_alpha(if response.hovered() { 20 } else { 13 }));
+        }
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
             text,
-            egui::FontId::proportional(13.0),
-            if primary && response.hovered() {
-                p.ground
-            } else if primary {
-                p.accent
-            } else {
-                p.text_muted
-            },
+            theme::strong(ui.ctx(), 13.0),
+            if primary { p.inset } else { p.text },
         );
         if response.clicked() {
             action = Some(if primary {
@@ -681,7 +677,16 @@ pub fn show(ui: &mut Ui, p: &Palette, dialog: &ConnectDialog) -> Option<ConnectA
     action
 }
 
-/// One toggle button. Returns whether it was clicked.
+/// Space between the segments of a segmented control.
+const SEGMENT_GAP: f32 = 2.0;
+
+/// The well a row of `count` segments, each `width` wide, sits in.
+fn segment_well(painter: &egui::Painter, p: &Palette, at: egui::Pos2, count: usize, width: f32) {
+    let size = vec2(count as f32 * width + (count - 1) as f32 * SEGMENT_GAP + 8.0, 34.0);
+    theme::paint_well(painter, Rect::from_min_size(at, size), CornerRadius::same(RADIUS_CONTROL), p);
+}
+
+/// One segment of a segmented control. Returns whether it was clicked.
 fn chip(
     ui: &mut Ui,
     painter: &egui::Painter,
@@ -692,29 +697,18 @@ fn chip(
     chosen: bool,
 ) -> bool {
     let response = ui.interact(rect, id, Sense::click());
-    painter.rect_filled(
-        rect,
-        RADIUS_CONTROL,
-        if chosen {
-            p.selection
-        } else if response.hovered() {
-            p.hover
-        } else {
-            Color32::TRANSPARENT
-        },
-    );
-    painter.rect_stroke(
-        rect,
-        RADIUS_CONTROL,
-        egui::Stroke::new(1.0, if chosen { p.accent } else { p.border }),
-        egui::StrokeKind::Inside,
-    );
+    let corners = CornerRadius::same(RADIUS_CONTROL - 4);
+    if chosen {
+        theme::paint_raised(painter, rect, corners, p);
+    } else if response.hovered() {
+        painter.rect_filled(rect, corners, p.hover);
+    }
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         text,
-        egui::FontId::proportional(12.0),
-        if chosen { p.accent } else { p.text_muted },
+        if chosen { theme::strong(ui.ctx(), 12.0) } else { egui::FontId::proportional(12.0) },
+        if chosen { p.text } else { p.text_muted },
     );
     response.clicked()
 }
