@@ -364,3 +364,9 @@ mod tests {
         assert_ne!(Disposal::Recycle, Disposal::Permanent);
     }
 }
+
+/// The Recycle Bin does not say where things went, so nothing deleted here
+/// can be put back by Neutron.
+pub fn trash(paths: &[PathBuf]) -> Result<Vec<Option<PathBuf>>, String> {
+    delete(paths, Disposal::Recycle, 0).map(|()| vec![None; paths.len()])
+}

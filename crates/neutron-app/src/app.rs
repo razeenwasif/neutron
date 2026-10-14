@@ -94,6 +94,10 @@ enum Action {
     CancelArchiveJob,
     /// Stop the copy or move with this id.
     StopTransfer(u64),
+    /// Reverse the last change to files.
+    Undo,
+    /// Make again the change last undone.
+    Redo,
     /// Stop the plugin command that is running.
     CancelPluginCommand,
 
@@ -494,6 +498,11 @@ pub struct NeutronApp {
     planned_rx: crossbeam_channel::Receiver<crate::transfers::Planned>,
     /// Clashes waiting for an answer, first asked first.
     clash_questions: std::collections::VecDeque<crate::transfers::Question>,
+    /// What can be undone and redone.
+    history: crate::undo::History,
+    /// Changes made and reversals finished, reported from workers.
+    undo_tx: crossbeam_channel::Sender<UndoEvent>,
+    undo_rx: crossbeam_channel::Receiver<UndoEvent>,
 
     /// Directory watchers, one per distinct folder on screen.
     ///
@@ -651,6 +660,7 @@ impl NeutronApp {
             }
         }
         let (planned_tx, planned_rx) = crossbeam_channel::unbounded();
+        let (undo_tx, undo_rx) = crossbeam_channel::unbounded();
         let (notice_tx, notice_rx) = crossbeam_channel::unbounded();
         let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
         let (open_as_tx, open_as_rx) = crossbeam_channel::unbounded();
@@ -783,6 +793,9 @@ impl NeutronApp {
             planned_tx,
             planned_rx,
             clash_questions: std::collections::VecDeque::new(),
+            history: crate::undo::History::default(),
+            undo_tx,
+            undo_rx,
             watchers: std::collections::HashMap::new(),
             changed_tx,
             changed_rx,
@@ -1022,6 +1035,32 @@ impl NeutronApp {
                 if !self.refuse_without_a_path("compress anything in") {
                     self.compress_selection();
                 }
+            }
+            Action::Undo | Action::Redo => {
+                let undo = matches!(action, Action::Undo);
+                if self.history.busy {
+                    self.notices.info("Still putting the last change back");
+                    return;
+                }
+                let Some(record) = (if undo { self.history.take_undo() } else { self.history.take_redo() }) else {
+                    self.notices.info(if undo { "Nothing to undo" } else { "Nothing to redo" });
+                    return;
+                };
+                self.history.busy = true;
+                let events = self.undo_tx.clone();
+                let wake = self.ctx.clone();
+                self.sta.submit(move || {
+                    let done = crate::undo::reverse(&record.step);
+                    let step = done.inverse.unwrap_or(crate::undo::Step::Created(Vec::new()));
+                    let record = crate::undo::Record { label: record.label, step };
+                    // What macOS would not let Neutron take out of the Trash,
+                    // shown in the Finder, which can.
+                    if !done.blocked.is_empty() {
+                        let _ = neutron_shell::open::reveal(&done.blocked);
+                    }
+                    let _ = events.send(UndoEvent::Reversed { undo, record, failed: done.failed, blocked: done.blocked });
+                    wake.request_repaint();
+                });
             }
             Action::StopTransfer(id) => {
                 if let Some(job) = self.transfers.iter().find(|j| j.id == id) {
@@ -1974,6 +2013,7 @@ impl NeutronApp {
 
         tracing::info!(from = %from.display(), to = %text, "rename");
         let notices = self.notice_tx.clone();
+        let undo = self.undo_tx.clone();
         self.sta.submit(move || {
             // The collision check runs here, not before the submit. It is a
             // `stat`, and a stat is the blocking call the paint thread must
@@ -1989,6 +2029,10 @@ impl NeutronApp {
                     report(&notices, format!("Could not rename to {text:?}: {e}"));
                 } else {
                     report_info(&notices, format!("Renamed to {text}"));
+                    let _ = undo.send(UndoEvent::Did(crate::undo::Record {
+                        label: "Rename".into(),
+                        step: crate::undo::Step::Relocated(vec![(from.clone(), dir.join(&text))]),
+                    }));
                 }
                 let _ = done.send(tab);
             }
@@ -2015,6 +2059,7 @@ impl NeutronApp {
         let wake = self.ctx.clone();
         let done = self.refresh_tx.clone();
         let created = self.created_tx.clone();
+        let undo = self.undo_tx.clone();
 
         let notices = self.notice_tx.clone();
         self.sta.submit(move || {
@@ -2023,6 +2068,10 @@ impl NeutronApp {
                 // is re-read: a new folder appears with its name selected, and
                 // that cannot be done without knowing which row it is.
                 Ok(name) => {
+                    let _ = undo.send(UndoEvent::Did(crate::undo::Record {
+                        label: "New Folder".into(),
+                        step: crate::undo::Step::Created(vec![dir.join(&name)]),
+                    }));
                     let _ = created.send((tab_id, name));
                 }
                 Err(e) => report(&notices, format!("Could not create a folder here: {e}")),
@@ -2163,6 +2212,40 @@ impl NeutronApp {
     /// Starts checked transfers, queues questions about clashes, and reports
     /// transfers that have ended.
     fn pump_transfers(&mut self) {
+        while let Ok(event) = self.undo_rx.try_recv() {
+            match event {
+                UndoEvent::Did(record) => self.history.record(record),
+                UndoEvent::Reversed { undo, record, failed, blocked } => {
+                    self.history.busy = false;
+                    let label = record.label.clone();
+                    if undo {
+                        self.history.undone(record);
+                    } else {
+                        self.history.redone(record);
+                    }
+                    let verb = if undo { "Undid" } else { "Redid" };
+                    if !blocked.is_empty() {
+                        self.notices.error(format!(
+                            "macOS lets only apps with Full Disk Access take things out of the Trash. {} selected \
+                             in the Finder — choose File › Put Back there, or turn on Full Disk Access for Neutron \
+                             in System Settings.",
+                            if blocked.len() == 1 { "It is" } else { "They are" }
+                        ));
+                    } else if failed.is_empty() {
+                        self.notices.info(format!("{verb} {label}"));
+                    } else {
+                        for line in &failed {
+                            tracing::warn!("undo: {line}");
+                        }
+                        self.notices.error(format!("{verb} {label}, except: {}", failed.join("; ")));
+                    }
+                    if let Some(tab) = self.workspace.active_tab_id() {
+                        let _ = self.refresh_tx.send(tab);
+                    }
+                }
+            }
+        }
+
         while let Ok(planned) = self.planned_rx.try_recv() {
             match planned {
                 crate::transfers::Planned::Clear(request) => {
@@ -2187,6 +2270,20 @@ impl NeutronApp {
             None => true,
         });
         for (request, outcome) in finished {
+            if let Ok(report) = &outcome {
+                let beside = request.paths.iter().all(|p| p.parent() == Some(request.destination.as_path()));
+                let record = match request.how {
+                    neutron_shell::fileops::Transfer::Move => crate::undo::Record {
+                        label: "Move".into(),
+                        step: crate::undo::Step::Relocated(report.moved.clone()),
+                    },
+                    neutron_shell::fileops::Transfer::Copy => crate::undo::Record {
+                        label: if beside { "Duplicate".into() } else { "Copy".into() },
+                        step: crate::undo::Step::Created(report.moved.iter().map(|(_, to)| to.clone()).collect()),
+                    },
+                };
+                self.history.record(record);
+            }
             let (error, text) = crate::transfers::summary(&request, &outcome);
             if error {
                 self.notices.error(text);
@@ -2512,7 +2609,8 @@ impl NeutronApp {
             C::DeleteImmediately => Action::Ask(Box::new(Action::Delete { permanent: true })),
             C::Eject => Action::EjectCurrent,
             C::AddToSidebar => Action::TogglePin,
-            C::Undo | C::Redo => return None,
+            C::Undo => Action::Undo,
+            C::Redo => Action::Redo,
             C::Cut => Action::Clip { cut: true },
             C::Copy => Action::Clip { cut: false },
             C::Paste => Action::Paste,
@@ -2581,8 +2679,9 @@ impl NeutronApp {
         let tabs = self.workspace.focused_group().map_or(0, |g| g.tabs.len());
         for cmd in C::all() {
             let off = match cmd {
-                C::Undo | C::Redo => true,
                 c if typing && c.edits_text() => true,
+                C::Undo => self.history.busy || self.history.undo_label().is_none(),
+                C::Redo => self.history.busy || self.history.redo_label().is_none(),
                 C::Open | C::GetInfo | C::Rename | C::Duplicate | C::MakeAlias | C::QuickLook | C::Compress
                 | C::MoveToTrash | C::DeleteImmediately | C::Cut | C::Copy => selected.is_empty(),
                 C::Extract => !archive,
@@ -2618,6 +2717,11 @@ impl NeutronApp {
             checked.insert(C::ShowPreview.tag());
         }
         neutron_shell::menubar::set_state(disabled, checked);
+        // "Undo Move to Trash", as the Finder names it.
+        let mut titles = std::collections::HashMap::new();
+        titles.insert(C::Undo.tag(), self.history.undo_label().map_or("Undo".to_owned(), |l| format!("Undo {l}")));
+        titles.insert(C::Redo.tag(), self.history.redo_label().map_or("Redo".to_owned(), |l| format!("Redo {l}")));
+        neutron_shell::menubar::set_titles(titles);
     }
 
     fn clear_cut_marks(&mut self) {
@@ -2711,8 +2815,27 @@ impl NeutronApp {
 
         tracing::info!(count = paths.len(), ?disposal, "deleting");
         let notices = self.notice_tx.clone();
+        let undo = self.undo_tx.clone();
         self.sta.submit(move || {
-            if let Err(e) = neutron_shell::fileops::delete(&paths, disposal, owner) {
+            // To the Trash, the way that says where each item went, so Undo
+            // can put them back. A permanent delete has nothing to undo.
+            let outcome = if permanent {
+                neutron_shell::fileops::delete(&paths, disposal, owner)
+            } else {
+                neutron_shell::fileops::trash(&paths).map(|went| {
+                    let items: Vec<(PathBuf, PathBuf)> = paths
+                        .iter()
+                        .cloned()
+                        .zip(went)
+                        .filter_map(|(was, went)| went.map(|w| (was, w)))
+                        .collect();
+                    let _ = undo.send(UndoEvent::Did(crate::undo::Record {
+                        label: "Move to Trash".into(),
+                        step: crate::undo::Step::Trashed(items),
+                    }));
+                })
+            };
+            if let Err(e) = outcome {
                 report(&notices, format!("Delete failed: {e}"));
             } else {
                 report_info(&notices, format!("{} {} items",
@@ -3322,6 +3445,14 @@ impl eframe::App for NeutronApp {
     }
 }
 
+/// What a worker reports to the undo history.
+enum UndoEvent {
+    /// A change was made.
+    Did(crate::undo::Record),
+    /// An undo (or, with `undo` false, a redo) finished.
+    Reversed { undo: bool, record: crate::undo::Record, failed: Vec<String>, blocked: Vec<PathBuf> },
+}
+
 /// What the Quick Look panel was given: the tab, its cursor, and how many
 /// items — enough to tell when the panel has to follow.
 type QuickLookKey = (TabId, Option<usize>, usize);
@@ -3656,6 +3787,9 @@ impl NeutronApp {
                     if pressed(egui::Key::G) {
                         go(Action::ToggleAddress);
                     }
+                    if pressed(egui::Key::Z) {
+                        go(Action::Redo);
+                    }
                     // Shifted, a bracket arrives as a brace on most layouts.
                     if pressed(egui::Key::CloseBracket) || pressed(egui::Key::CloseCurlyBracket) {
                         go(Action::CycleTab(1));
@@ -3694,6 +3828,9 @@ impl NeutronApp {
                     }
                     if pressed(egui::Key::I) {
                         go(Action::GetInfoSelection);
+                    }
+                    if pressed(egui::Key::Z) {
+                        go(Action::Undo);
                     }
                 }
                 // Control-Command-T: the Finder's "Add to Sidebar".
@@ -3765,6 +3902,8 @@ impl NeutronApp {
                     ),
                     (egui::Key::R, Action::Refresh),
                     (egui::Key::W, Action::CloseActiveTab),
+                    (egui::Key::Z, if shift { Action::Redo } else { Action::Undo }),
+                    (egui::Key::Y, Action::Redo),
                     // Backslash splits, mirroring the common terminal binding.
                     (
                         egui::Key::Backslash,
@@ -4690,6 +4829,8 @@ impl NeutronApp {
             C::Extract => Some(Action::ExtractSelection),
             C::Compress => Some(Action::CompressSelection),
             C::Duplicate => Some(Action::Duplicate),
+            C::Undo => Some(Action::Undo),
+            C::Redo => Some(Action::Redo),
             C::DeleteSelection => Some(Action::Delete { permanent: false }),
 
             C::ToggleHidden => Some(Action::ToggleHidden),

@@ -10,6 +10,23 @@ pub fn delete(paths: &[PathBuf], disposal: Disposal, _owner: isize) -> Result<()
     let paths = super::macos::path_strs(paths)?;
     super::macos::call(json!({"action":"delete", "paths":paths, "permanent":disposal == Disposal::Permanent})).map(|_| ())
 }
+
+/// Moves `paths` to the Trash and says where each one went there, in order —
+/// what putting them back needs. `None` for one the system did not report.
+pub fn trash(paths: &[PathBuf]) -> Result<Vec<Option<PathBuf>>, String> {
+    let strs = super::macos::path_strs(paths)?;
+    let result = super::macos::call(json!({"action":"delete", "paths":strs, "permanent":false}))?;
+    let went: Vec<Option<PathBuf>> = result
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|v| v.as_str().filter(|s| !s.is_empty()).map(PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(if went.len() == paths.len() { went } else { vec![None; paths.len()] })
+}
 pub fn transfer(paths: &[PathBuf], destination: &Path, how: Transfer, _owner: isize) -> Result<(), String> {
     let (paths, destination) = (super::macos::path_strs(paths)?, super::macos::path_str(destination)?);
     super::macos::call(json!({"action":if how == Transfer::Move {"move"} else {"copy"}, "paths":paths, "destination":destination})).map(|_| ())

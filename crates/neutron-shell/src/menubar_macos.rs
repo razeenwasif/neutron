@@ -15,7 +15,7 @@
 //! showing one and before matching a shortcut.
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::sync::OnceLock;
 
@@ -103,6 +103,9 @@ define_class!(
             let tag = item.tag() as u32;
             let checked = STATE.with(|s| s.borrow().1.contains(&tag));
             item.setState(if checked { 1 } else { 0 });
+            if let Some(title) = TITLES.with(|t| t.borrow().get(&tag).cloned()) {
+                item.setTitle(&NSString::from_str(&title));
+            }
             Bool::new(!STATE.with(|s| s.borrow().0.contains(&tag)))
         }
     }
@@ -113,6 +116,8 @@ thread_local! {
     static CHOSEN: RefCell<Vec<Chosen>> = const { RefCell::new(Vec::new()) };
     /// Disabled tags, checked tags.
     static STATE: RefCell<(HashSet<u32>, HashSet<u32>)> = RefCell::new((HashSet::new(), HashSet::new()));
+    /// Titles that change with the state: "Undo Move to Trash".
+    static TITLES: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
 }
 
 static WAKER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
@@ -130,6 +135,12 @@ pub fn take_chosen() -> Vec<Chosen> {
 /// Which items are disabled and which are ticked, from now on.
 pub fn set_state(disabled: HashSet<u32>, checked: HashSet<u32>) {
     STATE.with(|s| *s.borrow_mut() = (disabled, checked));
+}
+
+/// Titles for items whose wording follows the state, applied when AppKit next
+/// validates them. Items not named keep the title they were built with.
+pub fn set_titles(titles: HashMap<u32, String>) {
+    TITLES.with(|t| *t.borrow_mut() = titles);
 }
 
 /// Adds `menus` to the menu bar, after the application menu. Main thread,

@@ -156,14 +156,18 @@ func run(_ r: Request) throws -> Any {
         return true
     case "delete":
         let permanent = r.permanent == true
+        // Where each item went in the Trash, in order, so it can be put back.
+        var trashed: [String] = []
         try each(urls.map { ($0, $0) }, verb: permanent ? "delete" : "move", suffix: permanent ? "" : " to the Trash") { url, _ in
             if permanent { try fm.removeItem(at: url); return }
-            do { try fm.trashItem(at: url, resultingItemURL: nil) }
+            var resulting: NSURL?
+            do { try fm.trashItem(at: url, resultingItemURL: &resulting) }
             catch let error as CocoaError where error.code == .featureUnsupported {
                 throw BridgeError(message: "\(url.lastPathComponent) cannot be moved to the Trash on this volume")
             }
+            trashed.append(resulting?.path ?? "")
         }
-        return true
+        return permanent ? true as Any : trashed as Any
     case "rename":
         let name = try require(r.name)
         guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0"), let source = urls.first else {

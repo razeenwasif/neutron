@@ -104,6 +104,7 @@ Finder's, with every command below in them. The keys follow the Finder's:
 | `⌘↑`, `⌘[`, `⌘]` | Enclosing folder, back, forward |
 | `⌘1` `⌘2` `⌘3` | Grid, list, columns |
 | `⌘D` | Duplicate |
+| `⌘Z`, `⇧⌘Z` | Undo and redo copies, moves, renames, new folders and Move to Trash |
 | `⌘I` | Get Info (the Finder's window) |
 | `⌘⌫`, `⌘⌥⌫` | Move to Trash, delete immediately (asks first) |
 | `⌘⇧H` `⌘⇧D` `⌘⇧O` `⌘⌥L` `⌘⇧A` | Home, Desktop, Documents, Downloads, Applications |

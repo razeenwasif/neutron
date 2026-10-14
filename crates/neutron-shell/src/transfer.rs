@@ -94,6 +94,9 @@ pub struct Report {
     pub failed: Vec<String>,
     /// Stopped by the user before the end.
     pub stopped: bool,
+    /// Each item transferred: where it was, and where it is now. What undoing
+    /// the transfer needs.
+    pub moved: Vec<(PathBuf, PathBuf)>,
 }
 
 /// One item of a planned batch.
@@ -180,7 +183,10 @@ pub fn run(
             }
         };
         match outcome {
-            Ok(()) => report.done += 1,
+            Ok(()) => {
+                report.done += 1;
+                report.moved.push((job.source.clone(), job.target.clone()));
+            }
             Err(Failure::Stopped) => {
                 report.stopped = true;
                 break;
@@ -193,6 +199,50 @@ pub fn run(
 }
 
 const EXDEV: i32 = 18;
+
+/// Why [`relocate`] could not move something.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelocateError {
+    /// The system's privacy protection refused it — as it refuses moving
+    /// anything out of the Trash for an app without Full Disk Access.
+    NotPermitted(String),
+    Other(String),
+}
+
+impl std::fmt::Display for RelocateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelocateError::NotPermitted(why) | RelocateError::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Moves one item from `from` to exactly `to` — a name of its own choosing,
+/// unlike [`run`] — never onto something already there. Across volumes it is
+/// copied, then the original removed. For undoing: putting a file back where
+/// it was, or back out of the Trash.
+pub fn relocate(from: &Path, to: &Path) -> Result<(), RelocateError> {
+    if to.symlink_metadata().is_ok() {
+        return Err(RelocateError::Other(format!("something called {} is already there", display_name(to))));
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| RelocateError::Other(e.to_string()))?;
+    }
+    match rename_exclusive(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(EXDEV) => {
+            let job = Job { source: from.to_path_buf(), target: to.to_path_buf(), replace: false };
+            copy_then(&job, Transfer::Move, &Progress::default(), 0).map_err(|failure| match failure {
+                Failure::Stopped => RelocateError::Other("stopped".to_owned()),
+                Failure::Error(why) => RelocateError::Other(why),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(RelocateError::NotPermitted(e.to_string()))
+        }
+        Err(e) => Err(RelocateError::Other(e.to_string())),
+    }
+}
 
 /// Marks one item done, and the bar at exactly where it should be after it —
 /// whatever the call-backs did or did not report along the way.
@@ -637,6 +687,7 @@ mod tests {
 
         let report = run(&[s.from("a.txt")], &s.0.join("to"), Transfer::Copy, Clash::KeepBoth, &progress).unwrap();
         assert_eq!(report.done, 1);
+        assert_eq!(report.moved, vec![(s.from("a.txt"), s.0.join("to").canonicalize().unwrap().join("a copy.txt"))]);
         assert_eq!(std::fs::read_to_string(s.to("a copy.txt")).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(s.to("a.txt")).unwrap(), "old");
     }
@@ -649,7 +700,7 @@ mod tests {
         Scratch::write(&s.from("dir/inner/two.txt"), "123");
         let progress = Progress::default();
         let report = run(&[s.from("dir")], &s.0.join("to"), Transfer::Copy, Clash::KeepBoth, &progress).unwrap();
-        assert_eq!(report, Report { done: 1, ..Report::default() });
+        assert_eq!((report.done, report.failed.len(), report.stopped), (1, 0, false));
         assert_eq!(std::fs::read_to_string(s.to("dir/inner/two.txt")).unwrap(), "123");
         let seen = progress.snapshot();
         assert_eq!((seen.bytes, seen.bytes_done, seen.items_done), (8, 8, 1));
@@ -722,6 +773,18 @@ mod tests {
         assert!(seen_part_way, "no progress was reported during the copy");
         assert!(report.stopped, "{report:?}");
         assert!(!volume.join("big.bin").exists(), "the partial copy was left behind");
+    }
+
+    #[test]
+    fn relocating_moves_to_the_exact_name_and_never_over_anything() {
+        let s = Scratch::new("relocate");
+        Scratch::write(&s.from("a.txt"), "x");
+        Scratch::write(&s.to("taken.txt"), "keep");
+        assert!(relocate(&s.from("a.txt"), &s.to("taken.txt")).is_err());
+        assert_eq!(std::fs::read_to_string(s.to("taken.txt")).unwrap(), "keep");
+        relocate(&s.from("a.txt"), &s.to("deeper/renamed.txt")).unwrap();
+        assert!(!s.from("a.txt").exists());
+        assert_eq!(std::fs::read_to_string(s.to("deeper/renamed.txt")).unwrap(), "x");
     }
 
     #[test]

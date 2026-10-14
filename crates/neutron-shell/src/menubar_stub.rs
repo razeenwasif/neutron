@@ -50,6 +50,7 @@ pub fn take_chosen() -> Vec<Chosen> {
     Vec::new()
 }
 pub fn set_state(_disabled: HashSet<u32>, _checked: HashSet<u32>) {}
+pub fn set_titles(_titles: std::collections::HashMap<u32, String>) {}
 pub fn install(_menus: Vec<Menu>) -> Result<(), String> {
     Ok(())
 }

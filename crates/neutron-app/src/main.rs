@@ -51,6 +51,7 @@ mod plugins;
 mod sidebar;
 mod thumbs;
 mod transfers;
+mod undo;
 mod startup;
 mod workspace;
 

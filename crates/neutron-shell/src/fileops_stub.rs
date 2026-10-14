@@ -38,3 +38,7 @@ pub fn rename(_path: &Path, _new_name: &str, _owner: isize) -> Result<(), String
 pub fn create_folder(_parent: &Path, _owner: isize) -> Result<String, String> {
     Err("creating folders is Windows-only".to_owned())
 }
+
+pub fn trash(_paths: &[PathBuf]) -> Result<Vec<Option<PathBuf>>, String> {
+    Err("file operations are not available here".to_owned())
+}
