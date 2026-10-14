@@ -19,3 +19,9 @@ pub fn shell_execute_with_args(path: &Path, args: &[String], verb: Verb, _owner:
     if output.status.success() { Ok(()) }
     else { Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()) }
 }
+
+/// Shows `paths` selected in a Finder window.
+pub fn reveal(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    let paths = super::macos::path_strs(paths)?;
+    super::macos::call(serde_json::json!({"action":"reveal", "paths":paths})).map(|_| ())
+}

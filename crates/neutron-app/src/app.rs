@@ -137,6 +137,13 @@ enum Action {
     GetInfoSelection,
     /// Finder aliases to these items, beside them.
     MakeAlias(Vec<PathBuf>),
+    /// Take the selected entries of the archive being browsed out into the
+    /// folder the archive is in.
+    ExtractEntries,
+    /// Unpack the whole archive being browsed beside itself.
+    ExtractWholeArchive,
+    /// Create google.json for the user to fill in, or pick it up once they have.
+    SetUpDrive,
     /// The selection's paths as text on the clipboard, one per line, or the
     /// folder's own with nothing selected.
     CopyPath,
@@ -1070,6 +1077,7 @@ impl NeutronApp {
                 }
             }
 
+            Action::Clip { cut: false } if self.in_archive() => self.copy_out_of_archive(),
             Action::Clip { cut } => {
                 if !self.refuse_without_a_path(if cut { "cut from" } else { "copy from" }) {
                     self.clip_selection(cut);
@@ -1203,6 +1211,77 @@ impl NeutronApp {
                 });
             }
             Action::OpenInNewTab(id) => self.open_in_new_tab(id),
+            Action::ExtractEntries => {
+                // Out to the cache, then copied beside the archive by an
+                // ordinary transfer — so a name already taken there is asked
+                // about, and a large entry shows its progress.
+                let Some((archive, entries)) = self.archive_selection() else { return };
+                let Some(folder) = archive.parent().map(Path::to_path_buf) else { return };
+                let Some(tab) = self.workspace.active_tab_id() else { return };
+                let planned = self.planned_tx.clone();
+                let notices = self.notice_tx.clone();
+                let wake = self.ctx.clone();
+                self.sta.submit(move || {
+                    match crate::archives::materialise(&archive, &entries) {
+                        Ok(paths) => {
+                            let request = crate::transfers::Request {
+                                tab,
+                                paths,
+                                destination: folder,
+                                how: neutron_shell::fileops::Transfer::Copy,
+                            };
+                            let _ = planned.send(crate::transfers::plan(request));
+                        }
+                        Err(e) => report(&notices, format!("Could not extract that: {e}")),
+                    }
+                    wake.request_repaint();
+                });
+            }
+            Action::ExtractWholeArchive => {
+                if let Some((archive, _)) = self.workspace.active_tab().and_then(|t| t.location().as_archive()) {
+                    let archive = archive.to_path_buf();
+                    if let Some(format) = neutron_archive::format_of(&archive) {
+                        let ctx = self.ctx.clone();
+                        self.start_archive_job(move || crate::archive_ops::extract(archive, format, ctx));
+                    }
+                }
+            }
+            Action::SetUpDrive => {
+                let notices = self.notice_tx.clone();
+                let done = self.drive_tx.clone();
+                let wake = self.ctx.clone();
+                self.sta.submit(move || {
+                    use neutron_cloud::google::{DriveState, GoogleDrive};
+                    // Filled in since the last look: Drive is ready to sign in.
+                    let state = GoogleDrive::new().state();
+                    if state != DriveState::NotConfigured {
+                        let _ = done.send(state);
+                        wake.request_repaint();
+                        return;
+                    }
+                    let Some(file) = neutron_cloud::config::config_path() else {
+                        report(&notices, "There is no settings folder to keep google.json in".into());
+                        return;
+                    };
+                    if !file.exists() {
+                        let template = "{\n  \"client_id\": \"\",\n  \"client_secret\": \"\"\n}\n";
+                        let made = file.parent().map_or(Ok(()), std::fs::create_dir_all)
+                            .and_then(|()| std::fs::write(&file, template));
+                        if let Err(e) = made {
+                            report(&notices, format!("google.json could not be created: {e}"));
+                            return;
+                        }
+                    }
+                    let _ = neutron_shell::open::reveal(std::slice::from_ref(&file));
+                    report_info(
+                        &notices,
+                        "Put your Google client's client_id and client_secret in google.json, \
+                         then choose Set up Google Drive again"
+                            .into(),
+                    );
+                    wake.request_repaint();
+                });
+            }
             Action::CopyPath => {
                 let paths = match self.selection_paths() {
                     Some((_, _, paths)) => paths,
@@ -1283,6 +1362,16 @@ impl NeutronApp {
                         let _ = done.send(tab);
                     }
                 });
+            }
+            Action::QuickLookSelection if self.in_archive() && !neutron_shell::quicklook::is_open() => {
+                // Taken out first; the panel opens when the files are there.
+                if let Some((archive, entries)) = self.archive_selection() {
+                    let notices = self.notice_tx.clone();
+                    self.sta.submit(move || match crate::archives::materialise(&archive, &entries) {
+                        Ok(paths) => neutron_shell::quicklook::request(paths),
+                        Err(e) => report(&notices, format!("Quick Look could not open that: {e}")),
+                    });
+                }
             }
             Action::QuickLookSelection => {
                 if neutron_shell::quicklook::is_open() {
@@ -1604,10 +1693,35 @@ impl NeutronApp {
             return;
         }
 
+        // Inside an archive: a folder is gone into, a file is taken out into
+        // the cache and opened from there, as a file on a server is.
+        if let Some((archive, inner)) = t.location().as_archive() {
+            let (archive, entry) = (archive.to_path_buf(), crate::archives::join(inner, &name));
+            if kind.is_container() {
+                self.navigate(tab, NodeId::archive(archive, entry));
+            } else {
+                let notices = self.notice_tx.clone();
+                self.sta.submit(move || {
+                    let opened = crate::archives::materialise(&archive, std::slice::from_ref(&entry))
+                        .and_then(|paths| neutron_shell::open::shell_execute(&paths[0], neutron_shell::open::Verb::Open, 0));
+                    if let Err(e) = opened {
+                        report(&notices, format!("{name} could not be opened: {e}"));
+                    }
+                });
+            }
+            return;
+        }
+
         let Some(base) = t.location().as_path() else {
             return;
         };
         let full = base.join(&name);
+        // An archive opens as a folder: browsed in place, as in Explorer,
+        // rather than unpacked beside itself. Extract is in its menu for that.
+        if !kind.is_container() && neutron_archive::format_of(&full).is_some() {
+            self.navigate(tab, NodeId::archive(full, ""));
+            return;
+        }
         #[cfg(target_os = "macos")]
         if full.extension().is_some_and(|ext| ext == "app") && kind.is_container() {
             self.open_local(full);
@@ -2303,6 +2417,73 @@ impl NeutronApp {
         rows
     }
 
+    /// The menu for a row inside an archive, or for the archive folder itself.
+    fn archive_menu(&mut self, on_row: bool, at: egui::Pos2) {
+        use neutron_core::MenuItem;
+        self.menu_actions.clear();
+        let mut items = Vec::new();
+        let mut next = MENU_ID_OURS;
+        let mut add = |label: &str, action: Action, actions: &mut Vec<(u32, Action)>, default: bool| {
+            next += 1;
+            actions.push((next, action));
+            MenuItem { id: next, label: label.to_owned(), enabled: true, default, ..Default::default() }
+        };
+        if on_row {
+            if let Some(cursor) = self.workspace.active_tab().and_then(|t| t.selection.cursor()) {
+                items.push(add("Open", Action::Activate(cursor), &mut self.menu_actions, true));
+            }
+            items.push(add("Quick Look", Action::QuickLookSelection, &mut self.menu_actions, false));
+            items.push(MenuItem::separator());
+            items.push(add("Copy", Action::Clip { cut: false }, &mut self.menu_actions, false));
+            items.push(add("Extract to the Archive's Folder", Action::ExtractEntries, &mut self.menu_actions, false));
+        } else {
+            items.push(add("Extract All", Action::ExtractWholeArchive, &mut self.menu_actions, false));
+        }
+        self.menu = Some(neutron_ui::MenuState::new(items, at));
+        self.menu_reply = None;
+    }
+
+    /// Whether the focused tab is inside an archive.
+    fn in_archive(&self) -> bool {
+        self.workspace.active_tab().is_some_and(|t| t.location().as_archive().is_some())
+    }
+
+    /// The archive the focused tab is inside, and the selected entries' paths
+    /// within it — or the cursor's, with nothing selected.
+    fn archive_selection(&self) -> Option<(PathBuf, Vec<String>)> {
+        let tab = self.workspace.active_tab()?;
+        let (archive, inner) = tab.location().as_archive()?;
+        let mut rows = visible_selection(tab);
+        if rows.is_empty() {
+            rows.extend(tab.selection.cursor().filter(|&i| i < tab.list.len()));
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        let entries = rows.iter().map(|&i| crate::archives::join(inner, tab.list.name(i))).collect();
+        Some((archive.to_path_buf(), entries))
+    }
+
+    /// Copy inside an archive: the entries are taken out into the cache and
+    /// those files go on the clipboard, so a paste anywhere copies them out.
+    fn copy_out_of_archive(&mut self) {
+        let Some((archive, entries)) = self.archive_selection() else {
+            return;
+        };
+        let notices = self.notice_tx.clone();
+        let name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.sta.submit(move || {
+            let copied = crate::archives::materialise(&archive, &entries).and_then(|paths| {
+                neutron_shell::clipboard::write(&paths, neutron_shell::fileops::Transfer::Copy).map(|()| paths.len())
+            });
+            match copied {
+                Ok(1) => report_info(&notices, format!("Copied 1 item out of {name} — paste to put it somewhere")),
+                Ok(n) => report_info(&notices, format!("Copied {n} items out of {name} — paste to put them somewhere")),
+                Err(e) => report(&notices, format!("Could not copy out of {name}: {e}")),
+            }
+        });
+    }
+
     /// Whether a question or a menu has the window: keys and menu commands
     /// wait until it is answered.
     fn modal(&self) -> bool {
@@ -2602,6 +2783,13 @@ impl NeutronApp {
                     t.selection.apply(&t.list, idx, SelectMode::Replace);
                 }
             }
+        }
+
+        // Inside an archive the shell has nothing to say — its menu is for
+        // files on disk — so the menu is Neutron's own.
+        if self.in_archive() {
+            self.archive_menu(idx.is_some(), pos);
+            return;
         }
 
         // Nothing selected means the click was on empty space, and the menu is
@@ -4904,7 +5092,7 @@ impl NeutronApp {
     fn open_plugins_folder(&mut self) {
         let Some(dir) = neutron_plugin::discover::plugins_dir() else {
             self.notices
-                .error("There is no %APPDATA% to keep plugins in");
+                .error(format!("There is no {} to keep plugins in", crate::persist::settings_folder_name()));
             return;
         };
         let Some(tab) = self.workspace.active_tab_id() else {
@@ -5587,6 +5775,10 @@ impl NeutronApp {
                     crate::preview::Source::Drive { id: id.to_owned() }
                 }
                 NodeId::Shell { .. } => crate::preview::Source::Shell,
+                NodeId::Archive { archive, inner } => crate::preview::Source::Archive {
+                    archive: archive.clone(),
+                    inner: crate::archives::join(inner, name),
+                },
             };
             Some((source, tab.list.size(idx), tab.list.kind(idx).is_container()))
         });
@@ -5701,6 +5893,7 @@ impl NeutronApp {
         let state = crate::rail::RailState {
             local_folder: tab.is_some_and(|t| t.location().is_filesystem()),
             server_folder: tab.is_some_and(|t| t.location().as_remote().is_some()),
+            archive_folder: tab.is_some_and(|t| t.location().as_archive().is_some()),
             selection_count: tab.map_or(0, |t| t.selection.iter().filter(|&i| t.list.rank(i).is_some()).count()),
             has_cursor: tab.is_some_and(|t| t.selection.cursor().is_some_and(|i| i < t.list.len())),
             selected_archive: tab.is_some_and(|t| t.selection.iter().any(|i| {
@@ -5969,13 +6162,21 @@ impl NeutronApp {
                             actions.push(Action::ConnectDrive);
                         }
                     }
-                    DriveState::NotConfigured => sidebar::placeholder_row(
-                        ui,
-                        p,
-                        "Google Drive",
-                        neutron_ui::icons::Glyph::Cloud,
-                        "Set NEUTRON_GOOGLE_CLIENT_ID to enable Drive",
-                    ),
+                    // A row that does something about it: an app opened from
+                    // the Dock never sees an environment variable, so the
+                    // file is the way, and this makes it and shows it.
+                    DriveState::NotConfigured => {
+                        if sidebar::action_row_with_hint(
+                            ui,
+                            p,
+                            "Set up Google Drive",
+                            neutron_ui::icons::Glyph::Cloud,
+                            "Drive needs a Google OAuth client of your own. This creates google.json \
+                             in Neutron's settings folder for its client_id and client_secret.",
+                        ) {
+                            actions.push(Action::SetUpDrive);
+                        }
+                    }
                     // Retryable, not a dead row. A failed sign-in is usually
                     // something the user can act on — a declined consent, a
                     // dropped connection — and making them restart the
@@ -7280,6 +7481,22 @@ mod screens {
         settle(&mut harness);
         shoot(&mut harness, &out, "connect.png");
         harness.state_mut().connect.close();
+
+        // Inside an archive, when one is given.
+        if let Some(archive) = std::env::var_os("NEUTRON_SHOTS_ARCHIVE").map(PathBuf::from) {
+            act(&mut harness, Action::SetView(file_list::ViewMode::List));
+            act(&mut harness, Action::Navigate(NodeId::archive(archive.clone(), "project")));
+            settle(&mut harness);
+            act(&mut harness, Action::Select { idx: 0, mode: SelectMode::Replace });
+            settle(&mut harness);
+            shoot(&mut harness, &out, "archive.png");
+            act(&mut harness, Action::ContextMenu { idx: Some(0), pos: egui::pos2(700.0, 260.0) });
+            settle(&mut harness);
+            shoot(&mut harness, &out, "archive-menu.png");
+            harness.state_mut().menu = None;
+            act(&mut harness, Action::Back);
+            settle(&mut harness);
+        }
 
         act(&mut harness, Action::Navigate(NodeId::Home));
         settle(&mut harness);

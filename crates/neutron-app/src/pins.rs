@@ -112,7 +112,7 @@ pub fn parse(text: &str) -> Result<Pins, String> {
 /// some, and this code cannot tell which it is looking at.
 pub fn save(pins: &Pins) -> Result<PathBuf, String> {
     let Some(file) = path() else {
-        return Err("there is no %APPDATA% to save pins in".to_owned());
+        return Err(format!("there is no {} to save pins in", crate::persist::settings_folder_name()));
     };
     let json = serde_json::to_string_pretty(pins).map_err(|e| e.to_string())?;
     crate::persist::write(&file, &json, pins.revision)?;

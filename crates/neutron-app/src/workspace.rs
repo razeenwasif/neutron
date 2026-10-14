@@ -524,6 +524,8 @@ pub enum PersistedLocation {
     /// A folder on a saved server. Restorable because it is named by the site's
     /// id and a path, both of which outlive the connection.
     Remote { site: String, path: String },
+    /// A folder inside an archive on disk.
+    Archive { archive: String, inner: String },
 }
 
 impl PersistedLocation {
@@ -538,6 +540,10 @@ impl PersistedLocation {
             NodeId::Remote { site, path } => Some(PersistedLocation::Remote {
                 site: site.to_string(),
                 path: path.to_string(),
+            }),
+            NodeId::Archive { archive, inner } => Some(PersistedLocation::Archive {
+                archive: archive.to_string_lossy().into_owned(),
+                inner: inner.to_string(),
             }),
             // A cloud node's id is only meaningful while its provider is
             // connected, so restoring one would produce a tab that cannot load.
@@ -554,6 +560,9 @@ impl PersistedLocation {
             }
             PersistedLocation::Remote { site, path } => {
                 NodeId::remote(site.as_str(), path.as_str())
+            }
+            PersistedLocation::Archive { archive, inner } => {
+                NodeId::archive(PathBuf::from(archive), inner.as_str())
             }
         }
     }

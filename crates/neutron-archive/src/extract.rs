@@ -47,6 +47,7 @@ pub fn extract(
         destination,
         provenance: mark::read(archive),
         marked: HashSet::new(),
+        select: None,
     };
     // The destination is marked only if this made it. Extracting into a
     // folder that was already there must not quarantine the folder itself.
@@ -54,16 +55,69 @@ pub fn extract(
         out.stamp(destination, true);
     }
 
+    run(archive, format, &mut out, on_progress)
+}
+
+/// Extracts only the entries at `selected` — paths inside the archive, files
+/// or folders — into `destination`, each under its own name: `docs/a.txt`
+/// comes out as `a.txt`, and `docs` as a folder `docs` with what it holds.
+///
+/// For taking a few things out of an archive being browsed, through exactly
+/// the same checks a whole extraction makes.
+pub fn extract_selected(
+    archive: &Path,
+    destination: &Path,
+    format: Format,
+    selected: &[String],
+    on_progress: impl FnMut(Progress) -> Continue,
+) -> Result<Summary, ArchiveError> {
+    fs::create_dir_all(destination)?;
+    let selected: Vec<String> = selected.iter().map(|s| crate::browse::normalise(s).0).collect();
+    let select = move |name: &str| select(&selected, name);
+    let mut out = Output {
+        destination,
+        provenance: mark::read(archive),
+        marked: HashSet::new(),
+        select: Some(&select),
+    };
+    run(archive, format, &mut out, on_progress)
+}
+
+/// What entry `name` is extracted as when only `selected` are wanted, or
+/// `None` to leave it.
+fn select(selected: &[String], name: &str) -> Option<String> {
+    let (path, dir) = crate::browse::normalise(name);
+    for wanted in selected {
+        let base = wanted.rsplit('/').next().unwrap_or(wanted);
+        if path == *wanted {
+            return Some(if dir { format!("{base}/") } else { base.to_owned() });
+        }
+        if let Some(rest) = path.strip_prefix(wanted.as_str()).and_then(|r| r.strip_prefix('/')) {
+            return Some(if dir { format!("{base}/{rest}/") } else { format!("{base}/{rest}") });
+        }
+    }
+    None
+}
+
+fn run(
+    archive: &Path,
+    format: Format,
+    out: &mut Output<'_>,
+    on_progress: impl FnMut(Progress) -> Continue,
+) -> Result<Summary, ArchiveError> {
     match format {
-        Format::Zip => zip(archive, &mut out, on_progress),
-        Format::Tar => tarball(tar::Archive::new(fs::File::open(archive)?), &mut out, on_progress),
+        Format::Zip => zip(archive, out, on_progress),
+        Format::Tar => tarball(tar::Archive::new(fs::File::open(archive)?), out, on_progress),
         Format::TarGz => tarball(
             tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(archive)?)),
-            &mut out,
+            out,
             on_progress,
         ),
     }
 }
+
+/// Maps an entry's name to the name it is written under, or `None` to skip it.
+type Select = dyn Fn(&str) -> Option<String>;
 
 /// Where entries are written, and what is passed on to each.
 struct Output<'a> {
@@ -73,6 +127,18 @@ struct Output<'a> {
     /// Directories already marked, so a folder of ten thousand files is
     /// marked once rather than ten thousand times.
     marked: HashSet<PathBuf>,
+    /// Only some entries, renamed: see [`extract_selected`].
+    select: Option<&'a Select>,
+}
+
+impl Output<'_> {
+    /// The name `name` is written under, or `None` when it is not wanted.
+    fn wanted(&self, name: &str) -> Option<String> {
+        match self.select {
+            Some(select) => select(name),
+            None => Some(name.to_owned()),
+        }
+    }
 }
 
 impl Output<'_> {
@@ -186,7 +252,9 @@ fn zip(
     let mut total = 0u64;
     for i in 0..zip.len() {
         if let Ok(entry) = zip.by_index_raw(i) {
-            total += entry.size();
+            if out.wanted(entry.name()).is_some() {
+                total += entry.size();
+            }
         }
     }
 
@@ -207,7 +275,7 @@ fn zip(
         // `mangled_name` is the zip crate's own sanitiser. It is not trusted in
         // place of ours: it silently rewrites hostile names into something
         // plausible, where the whole point here is to notice and report them.
-        let name = entry.name().to_owned();
+        let Some(name) = out.wanted(entry.name()) else { continue };
         let target = match safe_join(out.destination, &name) {
             Ok(path) => path,
             Err(reason) => {
@@ -288,6 +356,9 @@ fn tarball<R: Read>(
             summary.refused.push("an entry with an unreadable name".to_owned());
             continue;
         };
+        let directory = entry.header().entry_type() == tar::EntryType::Directory;
+        let named = if directory && !name.ends_with('/') { format!("{name}/") } else { name };
+        let Some(name) = out.wanted(&named) else { continue };
 
         let target = match safe_join(out.destination, &name) {
             Ok(path) => path,

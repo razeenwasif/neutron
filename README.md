@@ -118,8 +118,9 @@ Copies and moves run in the background with progress and a Stop that works
 partway through a file; when names are already taken you are asked whether to
 keep both, skip, or replace (the replaced items go to the Trash). Disks appear
 and disappear in the sidebar as they are mounted and ejected, with an eject
-button beside the ones that can be. A `.zip` opens in Archive Utility, as in the
-Finder; **Extract** in its menu unpacks it beside itself.
+button beside the ones that can be. A `.zip`, `.tar` or `.tar.gz` opens as a
+read-only folder you can browse, preview, Quick Look and copy out of;
+**Extract** in its menu unpacks the whole thing beside itself.
 
 Windows, natively:
 
@@ -327,10 +328,16 @@ call on the paint thread. A parsing name — `::{20D04FE0-…}` for This PC,
 `C:\archive.zip\inner` for a folder in a zip — round-trips through
 `SHParseDisplayName`, persists, and travels with its display name.
 
-**Zip files.** Nothing in a `.zip`'s own attributes says it is browsable; only
-the shell knows a namespace handler is registered for that extension. So opening
-a file asks the shell, on a worker, rather than matching against a list of
-extensions that would go stale.
+**Archives.** A `.zip`, `.tar` or `.tar.gz` opens as a folder, on every
+platform, read by Neutron itself rather than through the shell: a zip's
+directory is read without decompressing anything, a tar is read through once,
+and either is kept while the archive is unchanged, so moving between its folders
+costs nothing. It is read-only. Opening a file, previewing it, Quick Look and
+Copy take the entries out into the cache (`~/Library/Caches/Neutron/archives` on
+the Mac) and work from there; **Extract to the Archive's Folder** copies them out
+beside the archive, with the usual question when a name is taken. Entry names
+are an archive's own strings, so they are normalised for display and go through
+the same checks as a full extraction before anything is written.
 
 ---
 
@@ -359,8 +366,19 @@ documents that an installed app's secret "is obviously not treated as a secret",
 since it ships in every copy of the binary — but hard-coding them would tie every
 build to one project's quota and audit trail.
 
-Without them the sidebar row stays greyed with that instruction; the rest of
-Neutron is unaffected.
+An app opened from the Dock or the Finder never sees environment variables, so
+the values can also go in a file, which is read when the environment has none:
+`~/Library/Application Support/Neutron/google.json` on the Mac,
+`%APPDATA%\Neutron\google.json` on Windows.
+
+```json
+{ "client_id": "<id>.apps.googleusercontent.com", "client_secret": "<secret>" }
+```
+
+Until one or the other is there, the sidebar offers **Set up Google Drive**,
+which creates that file with empty fields and shows it in the Finder; choosing
+it again once the fields are filled in brings up **Connect Google Drive**. The
+rest of Neutron is unaffected.
 
 **Security.** The flow is PKCE with a loopback redirect. A desktop app cannot
 keep a secret — anything compiled in is readable by whoever has the binary, which
@@ -370,7 +388,8 @@ code is useless without it. The redirect binds `127.0.0.1:0` rather than a
 custom URI scheme, which any other program on the machine could register and
 intercept. The `state` parameter is checked before the code is even read.
 
-The refresh token lives in Windows Credential Manager, not on disk. That is not
+The refresh token lives in the keychain on the Mac and in Windows Credential
+Manager, not on disk. That is not
 a strong boundary — anything running as the user can read it back, which is what
 Neutron does — but it is encrypted under the login, scoped to the account, and
 markedly better than a config file that ends up in backups. Only
@@ -457,8 +476,10 @@ not, so it does not get a promise about something that is not coming.
 
 FTP, FTPS and SFTP servers appear in the sidebar under **Servers** and open like
 folders. **Connect to a server** in the palette adds one; everything but the
-password is written to `%APPDATA%\Neutron\sites.json`, and the password goes
-into Windows Credential Manager under `Neutron/Site/<id>`.
+password is written to `sites.json` in Neutron's settings folder
+(`~/Library/Application Support/Neutron` on the Mac, `%APPDATA%\Neutron` on
+Windows), and the password goes into the keychain on the Mac or Windows
+Credential Manager under `Neutron/Site/<id>`.
 
 Both clients are pure Rust — `suppaftp` and `russh` — because the alternative
 for SSH is libssh2 through a C build, and this project cross-compiles from WSL
@@ -495,7 +516,9 @@ of. `docs/servers.md` has the manifest reference and the rest.
 
 ## Plugins
 
-A plugin is a folder under `%APPDATA%\Neutron\plugins` holding a `plugin.json`
+A plugin is a folder under `plugins` in Neutron's settings folder
+(`~/Library/Application Support/Neutron/plugins` on the Mac,
+`%APPDATA%\Neutron\plugins` on Windows) holding a `plugin.json`
 and a program. Its commands appear in the command palette and, if the manifest
 asks, in the right-click menu. Choosing one runs the program with the current
 folder and selection as one line of JSON on standard input, and acts on the
@@ -584,7 +607,7 @@ do not.
 | `Ctrl+Shift+F` | Search every volume (arrows move, `Enter` opens, `Esc` closes) |
 | `Ctrl+P` | Fuzzy-find a file in this folder and below |
 | `Ctrl+Shift+P` | Command palette |
-| *double-click a `.zip`* | Browse inside it, as Explorer does (Windows; on the Mac it opens in Archive Utility) |
+| *double-click a `.zip`* | Browse inside it (also `.tar` and `.tar.gz`); read-only |
 | `Delete` | Send the selection to the Recycle Bin |
 | `Shift+Delete` | Delete permanently (the shell still confirms) |
 | *right-click* | The shell's own menu, drawn in Neutron's glass |

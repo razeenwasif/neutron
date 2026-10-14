@@ -32,6 +32,7 @@ pub fn text_for(location: &NodeId) -> Option<String> {
         NodeId::Path(p) => Some(p.to_string_lossy().into_owned()),
         NodeId::Shell { parsing, .. } => Some(parsing.to_string()),
         NodeId::Remote { site, path } => Some(format!("{site}:{path}")),
+        NodeId::Archive { .. } => Some(location.to_string()),
         NodeId::Home | NodeId::Cloud { .. } => None,
     }
 }
@@ -72,7 +73,25 @@ pub fn resolve(input: &str, current: &NodeId, home: Option<&Path>) -> Option<Nod
     } else {
         current.as_path()?.join(expanded)
     };
-    Some(NodeId::Path(normalize(&path)))
+    let path = normalize(&path);
+    Some(into_archive(&path).unwrap_or(NodeId::Path(path)))
+}
+
+/// A path that runs through an archive — `…/papers.zip` or
+/// `…/papers.zip/2024` — as the folder inside it. Read from the names alone,
+/// like the rest of this, so a folder that is called `x.zip` is taken for an
+/// archive; such folders are rare enough to accept that.
+fn into_archive(path: &Path) -> Option<NodeId> {
+    let mut archive = PathBuf::new();
+    let mut components = path.components();
+    for component in components.by_ref() {
+        archive.push(component.as_os_str());
+        if neutron_archive::format_of(&archive).is_some() && component.as_os_str() != archive.as_os_str() {
+            let inner: Vec<String> = components.map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            return Some(NodeId::archive(archive, inner.join("/")));
+        }
+    }
+    None
 }
 
 /// Folds `.` and `..` away and rebuilds the path with the platform's own
@@ -403,5 +422,16 @@ mod unix_tests {
         assert_eq!(resolve("/Applications", &current, None), Some(NodeId::path("/Applications")));
         assert_eq!(resolve("notes", &current, None), Some(NodeId::path("/Users/test/Documents/notes")));
         assert_eq!(resolve("~/Downloads", &current, Some(Path::new("/Users/test"))), Some(NodeId::path("/Users/test/Downloads")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_path_through_an_archive_opens_inside_it() {
+        let here = NodeId::path("/x");
+        assert_eq!(resolve("/x/a.zip/docs/2024", &here, None), Some(NodeId::archive("/x/a.zip", "docs/2024")));
+        assert_eq!(resolve("/x/a.ZIP", &here, None), Some(NodeId::archive("/x/a.ZIP", "")));
+        assert_eq!(resolve("b.tar.gz/src", &here, None), Some(NodeId::archive("/x/b.tar.gz", "src")));
+        assert_eq!(resolve("/x/notes.txt", &here, None), Some(NodeId::path("/x/notes.txt")));
+        assert_eq!(text_for(&NodeId::archive("/x/a.zip", "docs")).as_deref(), Some("/x/a.zip/docs"));
     }
 }

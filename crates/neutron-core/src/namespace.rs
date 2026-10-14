@@ -81,6 +81,14 @@ pub enum NodeId {
         /// An absolute POSIX path on that server.
         path: Arc<str>,
     },
+
+    /// A folder inside an archive on disk: the archive, and a `/`-separated
+    /// path within it, empty at its top. Read-only — browsed, opened from and
+    /// copied out of, never written to.
+    Archive {
+        archive: PathBuf,
+        inner: Arc<str>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -118,6 +126,20 @@ impl NodeId {
     }
 
     /// The site and path, when this is a remote node.
+    pub fn archive(archive: impl Into<PathBuf>, inner: impl Into<Arc<str>>) -> Self {
+        NodeId::Archive {
+            archive: archive.into(),
+            inner: inner.into(),
+        }
+    }
+
+    pub fn as_archive(&self) -> Option<(&Path, &str)> {
+        match self {
+            NodeId::Archive { archive, inner } => Some((archive, inner)),
+            _ => None,
+        }
+    }
+
     pub fn as_remote(&self) -> Option<(&str, &str)> {
         match self {
             NodeId::Remote { site, path } => Some((site, path)),
@@ -171,6 +193,11 @@ impl NodeId {
                 Some(name) if !name.is_empty() => name.to_owned(),
                 _ => site.to_string(),
             },
+            // The folder's own name, or the archive's at its top.
+            NodeId::Archive { archive, inner } => match inner.rsplit('/').next() {
+                Some(name) if !name.is_empty() => name.to_owned(),
+                _ => archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            },
         }
     }
 
@@ -191,6 +218,13 @@ impl NodeId {
                     Some(cut) => Some(NodeId::remote(site.clone(), &trimmed[..cut])),
                 }
             }
+            // Up from an archive's top is the folder the archive sits in, as
+            // it is from any other folder.
+            NodeId::Archive { archive, inner } => match inner.rsplit_once('/') {
+                Some((up, _)) => Some(NodeId::archive(archive.clone(), up)),
+                None if inner.is_empty() => archive.parent().map(|p| NodeId::Path(p.to_path_buf())),
+                None => Some(NodeId::archive(archive.clone(), "")),
+            },
             // A shell parent needs COM to walk, which cannot happen while
             // painting.
             //
@@ -212,6 +246,8 @@ impl fmt::Display for NodeId {
             NodeId::Shell { parsing, .. } => write!(f, "{parsing}"),
             NodeId::Cloud { provider, id, .. } => write!(f, "<{provider:?}:{id}>"),
             NodeId::Remote { site, path } => write!(f, "{site}:{path}"),
+            NodeId::Archive { archive, inner } if inner.is_empty() => write!(f, "{}", archive.display()),
+            NodeId::Archive { archive, inner } => write!(f, "{}/{inner}", archive.display()),
         }
     }
 }
@@ -295,5 +331,17 @@ mod tests {
     #[test]
     fn remote_nodes_on_different_sites_are_different_locations() {
         assert_ne!(NodeId::remote("a", "/pub"), NodeId::remote("b", "/pub"));
+    }
+
+    #[test]
+    fn up_inside_an_archive_climbs_to_its_top_and_then_out_of_it() {
+        let deep = NodeId::archive("/x/a.zip", "docs/inner");
+        assert_eq!(deep.display_name(), "inner");
+        let docs = deep.parent().unwrap();
+        assert_eq!(docs, NodeId::archive("/x/a.zip", "docs"));
+        let top = docs.parent().unwrap();
+        assert_eq!(top, NodeId::archive("/x/a.zip", ""));
+        assert_eq!(top.display_name(), "a.zip");
+        assert_eq!(top.parent(), Some(NodeId::path("/x")));
     }
 }

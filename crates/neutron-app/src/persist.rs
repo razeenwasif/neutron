@@ -62,6 +62,16 @@ pub fn set_aside(file: &Path) -> Option<PathBuf> {
     Some(kept)
 }
 
+/// How the folder Neutron keeps its settings in is named to the user, in a
+/// message about it being missing.
+pub fn settings_folder_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Application Support folder"
+    } else {
+        "%APPDATA%"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

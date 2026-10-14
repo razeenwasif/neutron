@@ -279,14 +279,21 @@ fn hint_for(command: &CommandDef) -> &'static str {
     }
 }
 
+/// The built-in commands this platform offers, in the palette's order.
+pub fn offered() -> impl Iterator<Item = &'static CommandDef> {
+    // The Windows indexer's housekeeping. Spotlight keeps its own index on
+    // the Mac, so there is nothing for these to refresh or stop.
+    ALL.iter()
+        .filter(|c| !(cfg!(target_os = "macos") && matches!(c.id, CommandId::RefreshIndex | CommandId::StopIndexer)))
+}
+
 /// The palette's full list: everything built in, then everything installed.
 ///
 /// Built-ins first because they are what a user expects to find, and their
 /// order is deliberate. Plugin entries keep the order [`crate::plugins`]
 /// produced, which is by plugin id and then by manifest.
 pub fn catalogue(plugins: &[(crate::plugins::Ref, String, String)]) -> Vec<Entry> {
-    let mut entries: Vec<Entry> = ALL
-        .iter()
+    let mut entries: Vec<Entry> = offered()
         .map(|c| Entry {
             invoke: Invoke::Builtin(c.id),
             title: c.title.to_owned(),
@@ -345,7 +352,7 @@ mod tests {
         )];
         let entries = catalogue(&plugins);
 
-        assert_eq!(entries.len(), ALL.len() + 1);
+        assert_eq!(entries.len(), offered().count() + 1);
         assert_eq!(entries[0].invoke, Invoke::Builtin(ALL[0].id));
         let last = entries.last().unwrap();
         assert_eq!(last.title, "Copy SHA-256");
@@ -370,8 +377,9 @@ mod tests {
             ),
         ];
         let entries = catalogue(&plugins);
-        assert_eq!(entries.len(), ALL.len() + 2);
-        assert_ne!(entries[ALL.len()].invoke, entries[ALL.len() + 1].invoke);
+        let builtins = offered().count();
+        assert_eq!(entries.len(), builtins + 2);
+        assert_ne!(entries[builtins].invoke, entries[builtins + 1].invoke);
     }
 
     #[test]

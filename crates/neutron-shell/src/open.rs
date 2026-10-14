@@ -238,3 +238,14 @@ mod tests {
         assert_eq!(back, "C:\\日本\\🦀.txt");
     }
 }
+
+/// Shows `paths` selected in an Explorer window — the first of them, which is
+/// as many as `/select` takes.
+pub fn reveal(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    let Some(first) = paths.first() else { return Ok(()) };
+    std::process::Command::new("explorer")
+        .arg(format!("/select,{}", first.display()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}

@@ -37,4 +37,6 @@ image.workspace = true
 winresource = "0.1"
 
 [dev-dependencies]
+# Builds the small archives the browsing tests read.
+zip = { version = "6", default-features = false, features = ["deflate"] }
 egui_kittest = { version = "0.36", features = ["wgpu", "eframe", "snapshot"] }

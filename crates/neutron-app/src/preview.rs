@@ -91,6 +91,8 @@ pub enum Source {
     /// A shell namespace item — the inside of a zip, a Control Panel entry.
     /// The bytes exist only through COM, if they exist at all.
     Shell,
+    /// An entry inside an archive being browsed, by its path in the archive.
+    Archive { archive: PathBuf, inner: String },
 }
 
 /// What the pane has to show.
@@ -298,6 +300,12 @@ fn worker(
             // A drive letter under This PC, a Control Panel applet, an entry
             // inside a zip. The first two are not files; the third is, but its
             // bytes exist only through the shell's own extraction.
+            Source::Archive { .. } if request.is_dir => Preview::Opaque,
+            // Taken out into the cache, then read like any file.
+            Source::Archive { archive, inner } => match crate::archives::materialise(archive, std::slice::from_ref(inner)) {
+                Ok(paths) => read(&paths[0], false),
+                Err(why) => Preview::Unreadable(why),
+            },
             Source::Shell if request.is_dir => Preview::Opaque,
             Source::Shell => Preview::Unreachable(
                 "No preview here — these contents are only reachable through the shell"

@@ -617,7 +617,7 @@ mod tests {
         // With nothing typed the list is read, not filtered, and the catalogue
         // is grouped by what each command acts on.
         let hits = match_commands(&builtins(), "");
-        assert_eq!(hits.len(), crate::commands::ALL.len());
+        assert_eq!(hits.len(), crate::commands::offered().count());
         assert_eq!(hits[0].1.primary, crate::commands::ALL[0].title);
     }
 

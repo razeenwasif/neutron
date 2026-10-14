@@ -52,6 +52,9 @@ pub struct RailState {
     /// A folder on a saved server: uploads, new folders, renames and deletes
     /// work there; copying off it and archives do not yet.
     pub server_folder: bool,
+    /// A folder inside an archive: read-only, but what is in it can be
+    /// copied out.
+    pub archive_folder: bool,
     pub selection_count: usize,
     pub has_cursor: bool,
     pub selected_archive: bool,
@@ -73,6 +76,13 @@ impl RailAction {
         }
     }
     fn unavailable(self, state: &RailState) -> Option<&'static str> {
+        if state.archive_folder {
+            return match self {
+                Self::Copy if state.selection_count == 0 => Some("Select files or folders first"),
+                Self::Copy => None,
+                _ => Some("An archive is read-only — copy things out of it to change them"),
+            };
+        }
         if state.server_folder {
             match self {
                 Self::Copy | Self::Cut => return Some("Copying files off a server is not supported yet"),
@@ -373,5 +383,14 @@ mod tests {
     fn the_strip_is_wide_enough_for_its_labels() {
         // Narrower than this and the rail crops its own labels.
         const { assert!(WIDTH >= 60.0) };
+    }
+
+    #[test]
+    fn inside_an_archive_only_copying_out_is_offered() {
+        let state = RailState { archive_folder: true, selection_count: 1, has_cursor: true, ..Default::default() };
+        assert!(RailAction::Copy.unavailable(&state).is_none());
+        for action in [RailAction::Cut, RailAction::Paste, RailAction::Rename, RailAction::Delete, RailAction::NewFolder] {
+            assert!(action.unavailable(&state).is_some(), "{action:?} would change an archive");
+        }
     }
 }

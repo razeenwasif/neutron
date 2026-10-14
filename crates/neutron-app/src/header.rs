@@ -602,6 +602,24 @@ fn segments(location: &NodeId) -> Option<Vec<(String, NodeId)>> {
             Some(segments)
         }
 
+        // The trail to the archive, the archive itself, then the folders in
+        // it — the archive's crumb leading to its top rather than to the file.
+        NodeId::Archive { archive, inner } => {
+            let mut trail = segments(&NodeId::Path(archive.clone()))?;
+            if let Some(last) = trail.last_mut() {
+                last.1 = NodeId::archive(archive.clone(), "");
+            }
+            let mut acc = String::new();
+            for part in inner.split('/').filter(|p| !p.is_empty()) {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(part);
+                trail.push((part.to_owned(), NodeId::archive(archive.clone(), acc.as_str())));
+            }
+            Some(trail)
+        }
+
         _ => None,
     }
 }

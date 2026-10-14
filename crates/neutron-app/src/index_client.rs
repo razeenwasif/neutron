@@ -783,11 +783,15 @@ mod tests {
         // one request per frame at 60fps for a query already answered.
         let ctx = egui::Context::default();
         let mut client = IndexClient::spawn(ctx);
+        // Counted on a channel nothing else reads. The worker drains the real
+        // one as it goes, so its length could drop between the two looks and
+        // pass — or fail — for reasons that have nothing to do with this.
+        let (sent, received) = crossbeam_channel::unbounded();
+        client.commands = sent;
 
         client.search("report");
-        let first = client.commands.len();
         client.search("report");
-        assert_eq!(client.commands.len(), first, "the query was sent twice");
+        assert_eq!(received.len(), 1, "the query was sent twice");
     }
 }
 

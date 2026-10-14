@@ -182,6 +182,7 @@ fn worker(
     // Connections to saved servers, opened on demand and kept for the thread's
     // life. See `crate::remote` for why they live here and not in the app.
     let mut sessions = crate::remote::Sessions::load();
+    let mut archives = crate::archives::Archives::default();
 
     while let Ok(job) = requests.recv() {
         let req = match job {
@@ -219,6 +220,9 @@ fn worker(
             // string and the shell would make something of it.
             NodeId::Remote { site, path } => sessions
                 .list(site, path)
+                .map_err(neutron_core::NamespaceError::Other),
+            NodeId::Archive { archive, inner } => archives
+                .list(archive, inner)
                 .map_err(neutron_core::NamespaceError::Other),
             id if shell.handles(id) => shell.enumerate(id),
             id => fs.enumerate(id),

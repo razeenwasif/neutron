@@ -68,6 +68,14 @@ pub fn pathless(id: &NodeId, sites: &Sites) -> Option<Pathless> {
             name: display.to_string(),
             later: false,
         }),
+        // Read-only by design: browsed and copied out of, never changed.
+        NodeId::Archive { archive, .. } => Some(Pathless {
+            name: archive
+                .file_name()
+                .map(|n| format!("{}, which is read-only", n.to_string_lossy()))
+                .unwrap_or_else(|| "an archive".to_owned()),
+            later: false,
+        }),
     }
 }
 

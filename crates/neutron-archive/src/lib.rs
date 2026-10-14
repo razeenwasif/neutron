@@ -20,6 +20,7 @@
 //! Entry names are attacker-controlled strings. See [`path::safe_join`], which
 //! is where that is dealt with, and which is the most important code here.
 
+pub mod browse;
 pub mod clock;
 pub mod create;
 pub mod extract;

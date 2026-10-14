@@ -22,3 +22,7 @@ pub fn shell_execute_with_args(
 ) -> Result<(), String> {
     Err("shell execute is Windows-only".to_owned())
 }
+
+pub fn reveal(_paths: &[std::path::PathBuf]) -> Result<(), String> {
+    Err("revealing files is not supported here".to_owned())
+}
