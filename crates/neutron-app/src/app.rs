@@ -543,6 +543,9 @@ pub struct NeutronApp {
     look_window: Option<egui::ViewportId>,
     /// The window a context menu being built was asked for in.
     menu_window: Option<egui::ViewportId>,
+    /// The window that last had focus, which shows notices and jobs. Kept
+    /// while Neutron is in the background, so they do not vanish with it.
+    last_focused: egui::ViewportId,
     /// Changes made and reversals finished, reported from workers.
     undo_tx: crossbeam_channel::Sender<UndoEvent>,
     undo_rx: crossbeam_channel::Receiver<UndoEvent>,
@@ -847,6 +850,7 @@ impl NeutronApp {
             mail: Mail::default(),
             look_window: None,
             menu_window: None,
+            last_focused: egui::ViewportId::ROOT,
             undo_tx,
             undo_rx,
             watchers: std::collections::HashMap::new(),
@@ -3819,6 +3823,9 @@ impl NeutronApp {
         let focused = ctx
             .input(|i| i.viewport().focused)
             .unwrap_or(self.viewport == egui::ViewportId::ROOT && self.windows.is_empty());
+        if focused {
+            self.last_focused = self.viewport;
+        }
         let looks_here = self.look_window.map_or(focused, |w| w == self.viewport);
         if looks_here {
             for delta in std::mem::take(&mut self.mail.moves) {
@@ -3932,6 +3939,9 @@ impl NeutronApp {
         }
         if self.menu_window == Some(window.viewport) {
             self.menu_window = None;
+        }
+        if self.last_focused == window.viewport {
+            self.last_focused = egui::ViewportId::ROOT;
         }
     }
 
@@ -5521,7 +5531,8 @@ impl NeutronApp {
     /// in that folder's own pane — see `pane_footer` — so with nothing going on
     /// the window ends at the bottom of its panes.
     fn status_bar(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
-        if !self.has_status() {
+        // In the window being worked in, not repeated in every one.
+        if !self.has_status() || self.viewport != self.last_focused {
             return;
         }
 
