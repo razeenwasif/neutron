@@ -417,6 +417,35 @@ pub fn action_row(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph) -> bool {
     action_row_with_hint(ui, p, label, glyph, "")
 }
 
+/// A Finder tag: its colour as a dot, its name, and the same selection as a
+/// place's row when its files are being shown.
+pub fn tag_row(ui: &mut Ui, p: &Palette, name: &str, color: u8, selected: bool) -> RowHit {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return RowHit::of(&response, rect);
+    }
+    let corners = CornerRadius::same(12);
+    if selected {
+        ui.painter().rect_filled(rect, corners, p.selection);
+        ui.painter().rect_stroke(
+            rect,
+            corners,
+            Stroke::new(1.0, theme::with_alpha(p.accent, 51)),
+            egui::StrokeKind::Inside,
+        );
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, corners, p.hover);
+    }
+    ui.painter().circle_filled(pos2(rect.left() + 19.0, rect.center().y), 5.5, neutron_ui::tags::color(color));
+    let (font, colour) = if selected {
+        (theme::strong(ui.ctx(), 13.5), p.text)
+    } else {
+        (egui::FontId::proportional(13.5), p.text_soft())
+    };
+    ui.painter().text(pos2(rect.left() + 39.0, rect.center().y), egui::Align2::LEFT_CENTER, name, font, colour);
+    RowHit::of(&response, rect)
+}
+
 pub fn action_row_with_hint(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph, hint: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
 

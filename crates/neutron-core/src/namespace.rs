@@ -89,6 +89,10 @@ pub enum NodeId {
         archive: PathBuf,
         inner: Arc<str>,
     },
+
+    /// Every file carrying a Finder tag, wherever it is, as Spotlight finds
+    /// them. Its rows lead to their own paths, so it has none of its own.
+    Tag { name: Arc<str> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -193,6 +197,7 @@ impl NodeId {
                 Some(name) if !name.is_empty() => name.to_owned(),
                 _ => site.to_string(),
             },
+            NodeId::Tag { name } => name.to_string(),
             // The folder's own name, or the archive's at its top.
             NodeId::Archive { archive, inner } => match inner.rsplit('/').next() {
                 Some(name) if !name.is_empty() => name.to_owned(),
@@ -246,6 +251,7 @@ impl fmt::Display for NodeId {
             NodeId::Shell { parsing, .. } => write!(f, "{parsing}"),
             NodeId::Cloud { provider, id, .. } => write!(f, "<{provider:?}:{id}>"),
             NodeId::Remote { site, path } => write!(f, "{site}:{path}"),
+            NodeId::Tag { name } => write!(f, "<tag:{name}>"),
             NodeId::Archive { archive, inner } if inner.is_empty() => write!(f, "{}", archive.display()),
             NodeId::Archive { archive, inner } => write!(f, "{}/{inner}", archive.display()),
         }

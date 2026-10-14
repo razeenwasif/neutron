@@ -27,6 +27,11 @@ pub mod attr {
     /// Cloud placeholder: contents are not local and opening triggers a fetch.
     pub const RECALL_ON_OPEN: u32 = 0x0004_0000;
     pub const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+
+    /// The Mac's tag colours, in the top byte, which no Win32 bit the Mac
+    /// listing sets reaches: bit `n - 1` of the byte for Finder colour `n`.
+    pub const TAG_SHIFT: u32 = 24;
+    pub const TAG_MASK: u32 = 0x7F << TAG_SHIFT;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -253,6 +258,16 @@ impl EntryList {
 
     pub fn attrs(&self, i: usize) -> u32 {
         self.attrs[i]
+    }
+
+    /// Entry `i`'s tag colours, as bits: bit `n - 1` for Finder colour `n`.
+    /// Always none away from the Mac, where the top byte is Win32's own.
+    pub fn tag_colors(&self, i: usize) -> u8 {
+        if cfg!(target_os = "macos") {
+            ((self.attrs[i] & attr::TAG_MASK) >> attr::TAG_SHIFT) as u8
+        } else {
+            0
+        }
     }
 
     pub fn kind(&self, i: usize) -> EntryKind {

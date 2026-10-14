@@ -94,6 +94,10 @@ enum Action {
     CancelArchiveJob,
     /// Stop the copy or move with this id.
     StopTransfer(u64),
+    /// Give the chosen items a Finder tag, or take it away.
+    ToggleTag { name: &'static str, on: bool },
+    /// Go to the folder `.0` is in, with it selected.
+    ShowInFolder(PathBuf),
     /// Reverse the last change to files.
     Undo,
     /// Make again the change last undone.
@@ -272,6 +276,15 @@ fn report_info(to: &crossbeam_channel::Sender<(crate::notice::Level, String)>, t
 ///
 /// Only rows the filter shows: an entry the listing hides is never acted on,
 /// whatever state the selection was left in. And in row order, because the
+/// Where row `i` of `tab` is on disk: its own path when the listing says, as
+/// a list of tagged files does, or its name in `dir`.
+fn row_path(tab: &crate::workspace::Tab, dir: &Path, i: usize) -> PathBuf {
+    match tab.list.target(i) {
+        Some((target, true)) => PathBuf::from(target),
+        _ => dir.join(tab.list.name(i)),
+    }
+}
+
 /// selection is a set and its own order changes from run to run.
 fn visible_selection(tab: &crate::workspace::Tab) -> Vec<usize> {
     let mut selected: Vec<(usize, usize)> = tab
@@ -1056,6 +1069,29 @@ impl NeutronApp {
                     self.compress_selection();
                 }
             }
+            Action::ToggleTag { name, on } => {
+                let Some(paths) = self.chosen_paths() else { return };
+                let notices = self.notice_tx.clone();
+                let done = self.refresh_tx.clone();
+                let tab = self.workspace.active_tab_id();
+                self.sta.submit(move || {
+                    if let Err(e) = neutron_shell::tags::toggle(&paths, name, on) {
+                        report(&notices, format!("The tag could not be changed: {e}"));
+                    }
+                    if let Some(tab) = tab {
+                        let _ = done.send(tab);
+                    }
+                });
+            }
+            Action::ShowInFolder(path) => {
+                let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else { return };
+                let Some(tab) = self.workspace.active_tab_id() else { return };
+                let name = name.to_string_lossy().into_owned();
+                self.navigate(tab, NodeId::path(folder));
+                if let Some(t) = self.workspace.tabs.get_mut(&tab) {
+                    t.reselect = Some(crate::workspace::Reselect { names: vec![name.clone()], cursor: Some(name) });
+                }
+            }
             Action::Undo | Action::Redo => {
                 let undo = matches!(action, Action::Undo);
                 if self.history.busy {
@@ -1137,6 +1173,16 @@ impl NeutronApp {
             }
 
             Action::Clip { cut: false } if self.in_archive() => self.copy_out_of_archive(),
+            Action::Clip { cut: false } if self.in_tag_view() => {
+                if let Some(paths) = self.chosen_paths() {
+                    let notices = self.notice_tx.clone();
+                    self.sta.submit(move || {
+                        if let Err(e) = neutron_shell::clipboard::write(&paths, neutron_shell::fileops::Transfer::Copy) {
+                            report(&notices, format!("Could not copy: {e}"));
+                        }
+                    });
+                }
+            }
             Action::Clip { cut } => {
                 if !self.refuse_without_a_path(if cut { "cut from" } else { "copy from" }) {
                     self.clip_selection(cut);
@@ -1369,7 +1415,7 @@ impl NeutronApp {
                 });
             }
             Action::GetInfoSelection => {
-                if let Some((_, _, paths)) = self.selection_paths() {
+                if let Some(paths) = self.chosen_paths() {
                     self.apply(ctx, Action::GetInfo(paths));
                 }
             }
@@ -1445,6 +1491,7 @@ impl NeutronApp {
                     }
                 }
             }
+            Action::Delete { permanent } if self.in_tag_view() => self.delete_selection(permanent),
             Action::Delete { permanent } => {
                 if !self.refuse_without_a_path("delete from") {
                     self.delete_selection(permanent);
@@ -2407,7 +2454,12 @@ impl NeutronApp {
     /// the item under the cursor, with where in it the cursor is.
     fn quick_look_subject(&self) -> Option<(Vec<PathBuf>, usize, QuickLookKey)> {
         let tab = self.workspace.active_tab()?;
-        let dir = tab.location().as_path()?;
+        let dir = tab.location().as_path().map(Path::to_path_buf).unwrap_or_default();
+        // Somewhere with neither a folder nor rows that lead to files has
+        // nothing for Quick Look.
+        if tab.location().as_path().is_none() && !self.in_tag_view() {
+            return None;
+        }
         let cursor = tab.selection.cursor().filter(|&i| i < tab.list.len());
         let selected = visible_selection(tab);
         let (items, index) = if selected.len() > 1 {
@@ -2416,7 +2468,7 @@ impl NeutronApp {
         } else {
             (vec![cursor?], 0)
         };
-        let paths: Vec<PathBuf> = items.iter().map(|&i| dir.join(tab.list.name(i))).collect();
+        let paths: Vec<PathBuf> = items.iter().map(|&i| row_path(tab, &dir, i)).collect();
         let key = (tab.id, cursor, paths.len());
         Some((paths, index, key))
     }
@@ -2540,6 +2592,16 @@ impl NeutronApp {
             if cfg!(target_os = "macos") {
                 rows.push(MenuItem { accel: neutron_ui::format::shortcut("Cmd+I"), ..row("Get Info", Action::GetInfo(paths.clone()), &mut actions) });
                 rows.push(row("Make Alias", Action::MakeAlias(paths), &mut actions));
+                // Ticked where every selected item has the tag.
+                let bits: Vec<u8> = selected.iter().map(|&i| tab.list.tag_colors(i)).collect();
+                let children = neutron_shell::tags::COLORS
+                    .iter()
+                    .map(|&(name, color)| {
+                        let all = bits.iter().all(|b| b & (1 << (color - 1)) != 0);
+                        MenuItem { checked: all, ..row(name, Action::ToggleTag { name, on: !all }, &mut actions) }
+                    })
+                    .collect();
+                rows.push(MenuItem { label: "Tags".into(), enabled: true, children, ..Default::default() });
             }
         }
         // Remembered for the answer; see `context_menu_overlay`.
@@ -2571,6 +2633,86 @@ impl NeutronApp {
         }
         self.menu = Some(neutron_ui::MenuState::new(items, at));
         self.menu_reply = None;
+    }
+
+    /// Whether the focused tab is showing the files with a tag.
+    fn in_tag_view(&self) -> bool {
+        self.workspace.active_tab().is_some_and(|t| matches!(t.location(), NodeId::Tag { .. }))
+    }
+
+    /// The real paths of what is selected: joined to the folder, or — in a
+    /// list of tagged files, which come from everywhere — each row's own.
+    fn chosen_paths(&self) -> Option<Vec<PathBuf>> {
+        if let Some((_, _, paths)) = self.selection_paths() {
+            return Some(paths);
+        }
+        let tab = self.workspace.active_tab()?;
+        if !matches!(tab.location(), NodeId::Tag { .. }) {
+            return None;
+        }
+        let paths: Vec<PathBuf> = visible_selection(tab)
+            .into_iter()
+            .filter_map(|i| match tab.list.target(i) {
+                Some((target, true)) => Some(PathBuf::from(target)),
+                _ => None,
+            })
+            .collect();
+        (!paths.is_empty()).then_some(paths)
+    }
+
+    /// The menu for a list of tagged files: what works on files wherever they
+    /// are, and the way to the folder one is in.
+    fn tag_menu(&mut self, on_row: bool, at: egui::Pos2) {
+        use neutron_core::MenuItem;
+        fn add(next: &mut u32, label: &str, action: Action, actions: &mut Vec<(u32, Action)>, default: bool) -> MenuItem {
+            *next += 1;
+            actions.push((*next, action));
+            MenuItem { id: *next, label: label.to_owned(), enabled: true, default, ..Default::default() }
+        }
+        self.menu_actions.clear();
+        let paths = self.chosen_paths().unwrap_or_default();
+        if !on_row || paths.is_empty() {
+            return;
+        }
+        let mut next = MENU_ID_OURS;
+        let mut items = Vec::new();
+        if let Some(cursor) = self.workspace.active_tab().and_then(|t| t.selection.cursor()) {
+            items.push(add(&mut next, "Open", Action::Activate(cursor), &mut self.menu_actions, true));
+        }
+        items.push(add(&mut next, "Quick Look", Action::QuickLookSelection, &mut self.menu_actions, false));
+        if let [only] = paths.as_slice() {
+            items.push(add(&mut next, "Show in Enclosing Folder", Action::ShowInFolder(only.clone()), &mut self.menu_actions, false));
+        }
+        items.push(MenuItem::separator());
+        items.push(add(&mut next, "Copy", Action::Clip { cut: false }, &mut self.menu_actions, false));
+        items.push(add(&mut next, "Get Info", Action::GetInfo(paths.clone()), &mut self.menu_actions, false));
+        let tags = self.tags_submenu(&mut next);
+        items.push(tags);
+        items.push(MenuItem::separator());
+        items.push(add(&mut next, "Move to Trash", Action::Delete { permanent: false }, &mut self.menu_actions, false));
+        self.menu = Some(neutron_ui::MenuState::new(items, at));
+        self.menu_reply = None;
+    }
+
+    /// The Tags submenu for the selection: each colour, ticked when every
+    /// selected item has it.
+    fn tags_submenu(&mut self, next: &mut u32) -> neutron_core::MenuItem {
+        use neutron_core::MenuItem;
+        let bits: Vec<u8> = self
+            .workspace
+            .active_tab()
+            .map(|t| visible_selection(t).into_iter().map(|i| t.list.tag_colors(i)).collect())
+            .unwrap_or_default();
+        let children = neutron_shell::tags::COLORS
+            .iter()
+            .map(|&(name, color)| {
+                let all = !bits.is_empty() && bits.iter().all(|b| b & (1 << (color - 1)) != 0);
+                *next += 1;
+                self.menu_actions.push((*next, Action::ToggleTag { name, on: !all }));
+                MenuItem { id: *next, label: name.to_owned(), enabled: true, checked: all, ..Default::default() }
+            })
+            .collect();
+        MenuItem { label: "Tags".into(), enabled: true, children, ..Default::default() }
     }
 
     /// Whether the focused tab is inside an archive.
@@ -2833,7 +2975,10 @@ impl NeutronApp {
     /// the rest succeeds. Re-reading the directory is the only account of what
     /// actually happened that is guaranteed to be true.
     fn delete_selection(&mut self, permanent: bool) {
-        let Some((tab_id, _, paths)) = self.selection_paths() else {
+        let Some(tab_id) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let Some(paths) = self.chosen_paths() else {
             return;
         };
 
@@ -2945,6 +3090,10 @@ impl NeutronApp {
         // files on disk — so the menu is Neutron's own.
         if self.in_archive() {
             self.archive_menu(idx.is_some(), pos);
+            return;
+        }
+        if self.in_tag_view() {
+            self.tag_menu(idx.is_some(), pos);
             return;
         }
 
@@ -6218,6 +6367,11 @@ impl NeutronApp {
                     archive: archive.clone(),
                     inner: crate::archives::join(inner, name),
                 },
+                // Each row leads to its own file.
+                NodeId::Tag { .. } => match tab.list.target(idx) {
+                    Some((target, true)) => crate::preview::Source::Local(PathBuf::from(target)),
+                    _ => return None,
+                },
             };
             Some((source, tab.list.size(idx), tab.list.kind(idx).is_container()))
         });
@@ -6669,6 +6823,18 @@ impl NeutronApp {
                                 sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
                                 sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
                                 sidebar::RowHit::None | sidebar::RowHit::Eject => {}
+                        }
+                    }
+                }
+
+                // The Finder's colour tags, each showing every file that
+                // carries it.
+                if cfg!(target_os = "macos") {
+                    sidebar::section(ui, p, "Tags");
+                    for &(name, color) in neutron_shell::tags::COLORS.iter() {
+                        let selected = matches!(current, Some(NodeId::Tag { name: n }) if &**n == name);
+                        if matches!(sidebar::tag_row(ui, p, name, color, selected), sidebar::RowHit::Open) {
+                            actions.push(Action::Navigate(NodeId::Tag { name: name.into() }));
                         }
                     }
                 }
@@ -7935,6 +8101,22 @@ mod screens {
             settle(&mut harness);
             shoot(&mut harness, &out, "archive-menu.png");
             harness.state_mut().menu = None;
+            act(&mut harness, Action::Back);
+            settle(&mut harness);
+        }
+
+        // Tags, in a folder given for them.
+        if let Some(folder) = std::env::var_os("NEUTRON_SHOTS_TAGS").map(PathBuf::from) {
+            act(&mut harness, Action::SetView(file_list::ViewMode::List));
+            act(&mut harness, Action::Navigate(NodeId::path(folder)));
+            settle(&mut harness);
+            act(&mut harness, Action::Select { idx: 1, mode: SelectMode::Replace });
+            settle(&mut harness);
+            shoot(&mut harness, &out, "tags.png");
+            act(&mut harness, Action::SetView(file_list::ViewMode::Grid));
+            settle(&mut harness);
+            shoot(&mut harness, &out, "tags-grid.png");
+            act(&mut harness, Action::SetView(file_list::ViewMode::List));
             act(&mut harness, Action::Back);
             settle(&mut harness);
         }

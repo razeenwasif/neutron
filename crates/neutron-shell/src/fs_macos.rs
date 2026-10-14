@@ -31,6 +31,9 @@ impl Namespace for FsNamespace {
             // Dot-files, and items carrying UF_HIDDEN the way Finder hides ~/Library.
             if name.starts_with('.') || meta.st_flags() & UF_HIDDEN != 0 { attrs |= attr::HIDDEN; }
             if meta.permissions().readonly() { attrs |= attr::READONLY; }
+            // Its tag colours, for the dots beside its name: one attribute
+            // read, which for an untagged file is a quick "not there".
+            attrs |= (crate::tags::colors(&entry.path()) as u32) << attr::TAG_SHIFT;
             let kind = if directory { EntryKind::Directory }
                 else if link { EntryKind::Symlink } else { EntryKind::File };
             list.push(&Entry { name, kind, size: meta.len(), attrs,

@@ -80,6 +80,10 @@ pub mod icons;
 
 pub mod thumbnails;
 
+#[cfg_attr(target_os = "macos", path = "tags_macos.rs")]
+#[cfg_attr(not(target_os = "macos"), path = "tags_stub.rs")]
+pub mod tags;
+
 #[cfg_attr(target_os = "macos", path = "menubar_macos.rs")]
 #[cfg_attr(not(target_os = "macos"), path = "menubar_stub.rs")]
 pub mod menubar;

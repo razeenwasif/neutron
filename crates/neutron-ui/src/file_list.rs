@@ -1090,6 +1090,8 @@ fn draw_row(
             &body,
             name_colour,
             p.text_faint,
+            list.tag_colors(idx),
+            p.card,
         );
     }
 
@@ -1476,7 +1478,14 @@ fn draw_tile(
         overflow_character: Some('…'),
     };
     let galley = ui.painter().layout_job(job);
+    let name_bottom = name_top + galley.size().y;
     ui.painter().galley(pos2(rect.center().x, name_top), galley, colour);
+    // Tags, as dots centred under the name.
+    let tags = list.tag_colors(idx);
+    let dots = crate::tags::width(tags);
+    if dots > 0.0 {
+        crate::tags::paint(ui.painter(), pos2(rect.center().x - dots / 2.0, name_bottom + 6.0), tags, p.card);
+    }
 
     // The selection badge, from the second reference design: a filled accent
     // disc with a tick, in the tile's top-right.
@@ -1594,18 +1603,24 @@ pub(crate) fn draw_name_text(
     // Always the faint tone. Passed rather than looked up so the two colours
     // arrive from one place and cannot drift apart.
     ext_colour: Color32,
+    // Tag colours, drawn as dots right after the name; room is kept for them,
+    // so a long name is shortened rather than run under them.
+    tags: u8,
+    // The surface behind the row, which rings each dot.
+    ground: Color32,
 ) {
-    let Some((stem, ext)) = split_extension(name, kind) else {
-        draw_cell_text(ui, cell, name, font, stem_colour, Align2::LEFT_CENTER);
-        return;
-    };
-
     let inner = cell.shrink2(vec2(CELL_PAD / 2.0, 0.0));
+    let dots = crate::tags::width(tags);
     let mut job = egui::text::LayoutJob::default();
-    job.append(stem, 0.0, egui::TextFormat::simple(font.clone(), stem_colour));
-    job.append(ext, 0.0, egui::TextFormat::simple(font.clone(), ext_colour));
+    match split_extension(name, kind) {
+        Some((stem, ext)) => {
+            job.append(stem, 0.0, egui::TextFormat::simple(font.clone(), stem_colour));
+            job.append(ext, 0.0, egui::TextFormat::simple(font.clone(), ext_colour));
+        }
+        None => job.append(name, 0.0, egui::TextFormat::simple(font.clone(), stem_colour)),
+    }
     job.wrap = egui::text::TextWrapping {
-        max_width: inner.width(),
+        max_width: (inner.width() - if dots > 0.0 { dots + 8.0 } else { 0.0 }).max(1.0),
         max_rows: 1,
         break_anywhere: true,
         overflow_character: Some('…'),
@@ -1613,7 +1628,11 @@ pub(crate) fn draw_name_text(
 
     let galley = ui.painter().layout_job(job);
     let pos = pos2(inner.left(), inner.center().y - galley.size().y / 2.0);
+    let end = pos.x + galley.size().x;
     ui.painter().galley(pos, galley, stem_colour);
+    if dots > 0.0 {
+        crate::tags::paint(ui.painter(), pos2(end + 7.0, inner.center().y), tags, ground);
+    }
 }
 
 pub fn kind_label(kind: EntryKind, name: &str) -> String {

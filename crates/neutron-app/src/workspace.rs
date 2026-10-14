@@ -536,6 +536,8 @@ pub enum PersistedLocation {
     Remote { site: String, path: String },
     /// A folder inside an archive on disk.
     Archive { archive: String, inner: String },
+    /// Every file with a Finder tag.
+    Tag { tag: String },
 }
 
 impl PersistedLocation {
@@ -551,6 +553,7 @@ impl PersistedLocation {
                 site: site.to_string(),
                 path: path.to_string(),
             }),
+            NodeId::Tag { name } => Some(PersistedLocation::Tag { tag: name.to_string() }),
             NodeId::Archive { archive, inner } => Some(PersistedLocation::Archive {
                 archive: archive.to_string_lossy().into_owned(),
                 inner: inner.to_string(),
@@ -571,6 +574,7 @@ impl PersistedLocation {
             PersistedLocation::Remote { site, path } => {
                 NodeId::remote(site.as_str(), path.as_str())
             }
+            PersistedLocation::Tag { tag } => NodeId::Tag { name: tag.as_str().into() },
             PersistedLocation::Archive { archive, inner } => {
                 NodeId::archive(PathBuf::from(archive), inner.as_str())
             }

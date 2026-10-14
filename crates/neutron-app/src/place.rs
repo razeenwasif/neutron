@@ -68,6 +68,12 @@ pub fn pathless(id: &NodeId, sites: &Sites) -> Option<Pathless> {
             name: display.to_string(),
             later: false,
         }),
+        // Its files are all over the disk; what needs one folder cannot be
+        // done here.
+        NodeId::Tag { name } => Some(Pathless {
+            name: format!("the files tagged {name}"),
+            later: false,
+        }),
         // Read-only by design: browsed and copied out of, never changed.
         NodeId::Archive { archive, .. } => Some(Pathless {
             name: archive

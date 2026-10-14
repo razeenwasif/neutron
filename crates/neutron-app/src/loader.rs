@@ -224,6 +224,7 @@ fn worker(
             NodeId::Archive { archive, inner } => archives
                 .list(archive, inner)
                 .map_err(neutron_core::NamespaceError::Other),
+            NodeId::Tag { name } => tagged(name).map_err(neutron_core::NamespaceError::Other),
             id if shell.handles(id) => shell.enumerate(id),
             id => fs.enumerate(id),
         };
@@ -281,4 +282,36 @@ fn is_stale(generations: &Generations, tab: TabId, generation: u64) -> bool {
         .get(&tab)
         // A missing entry means the tab was closed, so the work is unwanted.
         .is_none_or(|&latest| generation < latest)
+}
+
+/// Every file Spotlight finds with the tag `name`, each row leading to its
+/// own path.
+fn tagged(name: &str) -> Result<EntryList, String> {
+    use neutron_core::entry::{Entry, EntryKind, SyncState, attr};
+    let paths = neutron_shell::tags::search(name)?;
+    let mut list = EntryList::with_capacity(paths.len());
+    for path in paths {
+        let Ok(meta) = path.symlink_metadata() else { continue };
+        let Some(file_name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        let Some(text) = path.to_str() else { continue };
+        let millis = |t: std::io::Result<std::time::SystemTime>| {
+            t.ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_millis() as i64)
+        };
+        let directory = meta.is_dir() && !crate::columns::is_package(&path);
+        let mut attrs = if directory { attr::DIRECTORY } else { 0 };
+        attrs |= (neutron_shell::tags::colors(&path) as u32) << attr::TAG_SHIFT;
+        list.push(&Entry {
+            name: file_name,
+            kind: if directory { EntryKind::Directory } else { EntryKind::File },
+            size: meta.len(),
+            modified: millis(meta.modified()),
+            created: millis(meta.created()),
+            attrs,
+            sync: SyncState::None,
+        });
+        list.push_target(text, true);
+    }
+    Ok(list)
 }

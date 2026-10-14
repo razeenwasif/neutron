@@ -720,6 +720,8 @@ fn draw_entry(
                 p.text_soft()
             },
             p.text_faint,
+            list.tag_colors(idx),
+            p.inset,
         );
     }
 

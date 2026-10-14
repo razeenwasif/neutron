@@ -120,7 +120,9 @@ Copies and moves run in the background with progress and a Stop that works
 partway through a file; when names are already taken you are asked whether to
 keep both, skip, or replace (the replaced items go to the Trash). Disks appear
 and disappear in the sidebar as they are mounted and ejected, with an eject
-button beside the ones that can be. A `.zip`, `.tar` or `.tar.gz` opens as a
+button beside the ones that can be. Finder tags show as coloured dots after a
+file's name; **Tags** in its menu sets the colour tags, and the sidebar's Tags
+section lists every file with one, found by Spotlight. A `.zip`, `.tar` or `.tar.gz` opens as a
 read-only folder you can browse, preview, Quick Look and copy out of;
 **Extract** in its menu unpacks the whole thing beside itself.
 
