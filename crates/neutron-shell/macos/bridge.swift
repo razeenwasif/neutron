@@ -111,9 +111,17 @@ func run(_ r: Request) throws -> Any {
         // Mounts flagged "don't browse" (Recovery, VM, Preboot) stay out of the sidebar.
         var info = statfs()
         let browsable = statfs(path, &info) != 0 || info.f_flags & UInt32(MNT_DONTBROWSE) == 0
+        // Ejectable as the Finder decides it: removable media, disk images
+        // and network volumes, never the startup disk or an internal one.
+        let keys: Set<URLResourceKey> = [.volumeIsEjectableKey, .volumeIsRemovableKey, .volumeIsLocalKey,
+                                         .volumeIsInternalKey, .volumeIsRootFileSystemKey]
+        let v = try? URL(fileURLWithPath: path).resourceValues(forKeys: keys)
+        let root = v?.volumeIsRootFileSystem ?? (path == "/")
+        let ejectable = !root && ((v?.volumeIsEjectable ?? false) || (v?.volumeIsRemovable ?? false)
+            || !(v?.volumeIsLocal ?? true) || !(v?.volumeIsInternal ?? true))
         return ["total": (attributes[.systemSize] as? NSNumber)?.uint64Value ?? 0,
                 "free": (attributes[.systemFreeSize] as? NSNumber)?.uint64Value ?? 0,
-                "browsable": browsable]
+                "browsable": browsable, "ejectable": ejectable]
     case "copy", "move":
         let move = r.action == "move"
         let destination = URL(fileURLWithPath: try require(r.destination)).resolvingSymlinksInPath()

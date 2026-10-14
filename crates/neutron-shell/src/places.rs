@@ -515,3 +515,12 @@ fn capacity(root_wide: &[u16]) -> Option<Capacity> {
         free: free_to_caller,
     })
 }
+
+/// Ejecting is offered only on the Mac for now.
+pub fn ejectable(_path: &std::path::Path) -> bool {
+    false
+}
+
+pub fn eject(_path: &std::path::Path) -> Result<(), String> {
+    Err("Ejecting is not supported here yet".into())
+}

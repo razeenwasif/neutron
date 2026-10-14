@@ -201,9 +201,9 @@ pub fn show(
         theme::paint_well(ui.painter(), segments, theme::pill(36.0), p);
         let mut seg_x = segments.right() - 3.0 - 36.0;
         for (mode, glyph, tip) in [
-            (ViewMode::Columns, Glyph::Columns, "Column view (Ctrl+Shift+L cycles views)"),
-            (ViewMode::Grid, Glyph::Grid, "Grid view (Ctrl+Shift+L cycles views)"),
-            (ViewMode::List, Glyph::List, "List view (Ctrl+Shift+L cycles views)"),
+            (ViewMode::Columns, Glyph::Columns, if cfg!(target_os = "macos") { "Column view (⌘3)" } else { "Column view (Ctrl+Shift+L cycles views)" }),
+            (ViewMode::Grid, Glyph::Grid, if cfg!(target_os = "macos") { "Grid view (⌘1)" } else { "Grid view (Ctrl+Shift+L cycles views)" }),
+            (ViewMode::List, Glyph::List, if cfg!(target_os = "macos") { "List view (⌘2)" } else { "List view (Ctrl+Shift+L cycles views)" }),
         ] {
             let r = Rect::from_min_size(pos2(seg_x, segments.top() + 3.0), vec2(36.0, 30.0));
             if segment(ui, p, r, glyph, h.view == mode, tip) && h.view != mode {
@@ -367,7 +367,7 @@ fn split_button(ui: &mut Ui, p: &Palette, rect: Rect, vertical: bool, tip: &str)
         p.text_soft()
     };
     icons::split(ui.painter(), rect.center(), vertical, colour);
-    response.clone().on_hover_text(tip);
+    response.clone().on_hover_text(neutron_ui::format::shortcut(tip));
     response.clicked()
 }
 

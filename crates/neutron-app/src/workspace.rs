@@ -403,6 +403,16 @@ impl Workspace {
             }
         }
     }
+
+    /// Steps the focused pane's active tab by `delta`, wrapping at the ends.
+    pub fn cycle_tab(&mut self, delta: isize) {
+        if let Some(g) = self.groups.get_mut(&self.focused) {
+            let n = g.tabs.len() as isize;
+            if n > 1 {
+                g.active = (g.active as isize + delta).rem_euclid(n) as usize;
+            }
+        }
+    }
 }
 
 // --- persistence -----------------------------------------------------------

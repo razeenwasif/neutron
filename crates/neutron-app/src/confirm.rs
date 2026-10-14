@@ -110,6 +110,89 @@ pub fn show(ui: &mut Ui, p: &Palette, confirm: &Confirm) -> Answer {
 }
 
 /// A button. Two states only: the quiet one and the one that does the thing.
+/// The answer to a question about names already taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClashAnswer {
+    Waiting,
+    /// Do nothing.
+    Cancelled,
+    Chose(neutron_shell::transfer::Clash),
+}
+
+/// Asks what to do about names a copy or move would land on.
+///
+/// Four answers rather than Finder's per-item sheet with "apply to all": a
+/// paste of forty files that clash on thirty is one decision, not thirty, and
+/// the one case that wants different answers for different files is better
+/// served by pasting in two goes.
+pub fn ask_clash(ui: &mut Ui, p: &Palette, title: &str, body: &str) -> ClashAnswer {
+    use neutron_shell::transfer::Clash;
+    let screen = ui.ctx().content_rect();
+    ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(90));
+    let _ = ui.allocate_rect(screen, Sense::click());
+
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        return ClashAnswer::Cancelled;
+    }
+    let mut answer = ClashAnswer::Waiting;
+    egui::Area::new(egui::Id::new("neutron-clash"))
+        .anchor(Align2::CENTER_CENTER, vec2(0.0, -40.0))
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+            theme::popover(p)
+                .corner_radius(egui::CornerRadius::same(RADIUS_CARD))
+                .inner_margin(egui::Margin::symmetric(20, 18))
+                .show(ui, |ui| {
+                    ui.set_width(420.0);
+                    ui.label(egui::RichText::new(title).font(theme::strong(ui.ctx(), 15.0)).color(p.text));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(body).size(12.5).color(p.text_muted));
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if pill(ui, p, "Stop", Style::Quiet) {
+                            answer = ClashAnswer::Cancelled;
+                        }
+                        let room = ui.available_width() - 272.0;
+                        ui.add_space(room.max(0.0));
+                        if pill(ui, p, "Skip", Style::Quiet) {
+                            answer = ClashAnswer::Chose(Clash::Skip);
+                        }
+                        if pill(ui, p, "Keep Both", Style::Quiet) {
+                            answer = ClashAnswer::Chose(Clash::KeepBoth);
+                        }
+                        if pill(ui, p, "Replace", Style::Primary) {
+                            answer = ClashAnswer::Chose(Clash::Replace);
+                        }
+                    });
+                });
+        });
+    answer
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Style {
+    Quiet,
+    Primary,
+}
+
+/// A rounded button in the velvet style: the accent for the main answer, a
+/// faint lift for the others.
+fn pill(ui: &mut Ui, p: &Palette, label: &str, style: Style) -> bool {
+    let font = theme::strong(ui.ctx(), 12.5);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font.clone(), p.text);
+    let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x + 28.0, 32.0), Sense::click());
+    let corners = theme::pill(rect.height());
+    let (fill, ink) = match (style, response.hovered()) {
+        (Style::Primary, false) => (p.accent, p.inset),
+        (Style::Primary, true) => (p.accent_hover, p.inset),
+        (Style::Quiet, false) => (Color32::from_white_alpha(13), p.text),
+        (Style::Quiet, true) => (Color32::from_white_alpha(22), p.text),
+    };
+    ui.painter().rect_filled(rect, corners, fill);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, ink);
+    response.clicked()
+}
+
 fn flat(ui: &mut Ui, p: &Palette, label: &str, danger: bool) -> bool {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),

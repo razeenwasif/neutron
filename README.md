@@ -83,11 +83,42 @@ The macOS bundle generates its ICNS from the 1024-pixel PNG. The window and
 sidebar use a separate 256-pixel render made directly from the vector for
 Retina displays.
 
-The macOS context menu offers Neutron's file actions. Windows shell extensions,
-NTFS indexing, native file icons, and dragging files out to other apps are not
-available on macOS yet. Use copy/paste to transfer files to Finder. Windows
-keeps its native backends. The local bundle is ad-hoc signed; public distribution
-requires Developer ID signing and notarization.
+On macOS Neutron uses the system's own services: native file icons and Quick
+Look previews, dragging files out to other apps, the keychain for server
+passwords, and `copyfile(3)` for copies (cloned on APFS, metadata and tags
+kept). Windows shell extensions and NTFS indexing have no Mac equivalent and are
+not offered there. Settings, pins and saved servers live under
+`~/Library/Application Support/Neutron`. The local bundle is ad-hoc signed;
+public distribution requires Developer ID signing and notarization.
+
+### On the Mac
+
+The keys follow the Finder's:
+
+| Key | Does |
+|---|---|
+| `Space`, `⌘Y` | Quick Look the selection; arrows move through the folder with it open |
+| `↩` | Rename |
+| `⌘O`, `⌘↓` | Open |
+| `⌘↑`, `⌘[`, `⌘]` | Enclosing folder, back, forward |
+| `⌘1` `⌘2` `⌘3` | Grid, list, columns |
+| `⌘D` | Duplicate |
+| `⌘I` | Get Info (the Finder's window) |
+| `⌘⌫`, `⌘⌥⌫` | Move to Trash, delete immediately (asks first) |
+| `⌘⇧H` `⌘⇧D` `⌘⇧O` `⌘⌥L` `⌘⇧A` | Home, Desktop, Documents, Downloads, Applications |
+| `⌘⇧G` | Go to a folder by path |
+| `⌘⇧]`, `⌘⇧[`, `⌃⇥` | Next and previous tab |
+| `⌘E` | Eject the disk this folder is on |
+| `⌘K` | Connect to a server |
+| `⌃⌘T` | Add the folder to the sidebar |
+| `⌘⇧.` | Show hidden files |
+
+Copies and moves run in the background with progress and a Stop that works
+partway through a file; when names are already taken you are asked whether to
+keep both, skip, or replace (the replaced items go to the Trash). Disks appear
+and disappear in the sidebar as they are mounted and ejected, with an eject
+button beside the ones that can be. A `.zip` opens in Archive Utility, as in the
+Finder; **Extract** in its menu unpacks it beside itself.
 
 Windows, natively:
 
@@ -552,7 +583,7 @@ do not.
 | `Ctrl+Shift+F` | Search every volume (arrows move, `Enter` opens, `Esc` closes) |
 | `Ctrl+P` | Fuzzy-find a file in this folder and below |
 | `Ctrl+Shift+P` | Command palette |
-| *double-click a `.zip`* | Browse inside it, as Explorer does |
+| *double-click a `.zip`* | Browse inside it, as Explorer does (Windows; on the Mac it opens in Archive Utility) |
 | `Delete` | Send the selection to the Recycle Bin |
 | `Shift+Delete` | Delete permanently (the shell still confirms) |
 | *right-click* | The shell's own menu, drawn in Neutron's glass |

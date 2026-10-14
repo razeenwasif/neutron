@@ -88,6 +88,10 @@ pub enum Glyph {
     Close,
     /// Three crossed orbits — Neutron's mark when its icon is not to hand.
     Atom,
+    /// A triangle over a bar: take the disk out.
+    Eject,
+    /// Arcs spreading from a point.
+    AirDrop,
 }
 
 /// Draws `glyph` centred on `centre`.
@@ -139,6 +143,8 @@ fn draw_with(painter: &Painter, centre: Pos2, glyph: Glyph, stroke: Stroke) {
         Glyph::Plus => outlines::plus(painter, centre, stroke),
         Glyph::Close => outlines::close(painter, centre, stroke),
         Glyph::Atom => outlines::atom(painter, centre, stroke),
+        Glyph::Eject => outlines::eject(painter, centre, stroke),
+        Glyph::AirDrop => outlines::airdrop(painter, centre, stroke),
     }
 }
 
@@ -190,6 +196,8 @@ fn is_outline(glyph: Glyph) -> bool {
             | Glyph::Plus
             | Glyph::Close
             | Glyph::Atom
+            | Glyph::Eject
+            | Glyph::AirDrop
     )
 }
 
@@ -1000,6 +1008,25 @@ mod outlines {
     pub fn close(p: &Painter, c: Pos2, s: Stroke) {
         line(p, c, &[(7.5, 7.5), (16.5, 16.5)], s);
         line(p, c, &[(16.5, 7.5), (7.5, 16.5)], s);
+    }
+
+    pub fn eject(p: &Painter, c: Pos2, s: Stroke) {
+        closed(p, c, &[(12.0, 5.5), (18.5, 13.0), (5.5, 13.0)], s);
+        line(p, c, &[(5.5, 17.5), (18.5, 17.5)], s);
+    }
+
+    pub fn airdrop(p: &Painter, c: Pos2, s: Stroke) {
+        // Three arcs opening upwards from a point near the bottom.
+        for r in [3.5f32, 7.0, 10.5] {
+            let points: Vec<Pos2> = (0..=24)
+                .map(|i| {
+                    let t = (210.0 + 120.0 * i as f32 / 24.0).to_radians();
+                    u(c, 12.0 + r * t.cos(), 17.0 + r * t.sin())
+                })
+                .collect();
+            p.add(Shape::line(points, s));
+        }
+        p.circle_filled(u(c, 12.0, 17.0), 1.2 * k(), s.color);
     }
 
     pub fn atom(p: &Painter, c: Pos2, s: Stroke) {

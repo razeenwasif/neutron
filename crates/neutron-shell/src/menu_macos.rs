@@ -147,14 +147,10 @@ fn run(command: &mut Command) -> Result<(), String> {
     else { Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()) }
 }
 
-/// The Quick Look panel, as `qlmanage -p` shows it. Detached: the panel stays
-/// up until the user closes it, and this worker has a menu to finish.
+/// The Quick Look panel, in Neutron's own window. This runs on the menu's
+/// worker and the panel is AppKit's, so it is handed to the main thread.
 fn quick_look(paths: &[PathBuf]) -> Result<(), String> {
-    let mut child = Command::new("/usr/bin/qlmanage").arg("-p").args(paths)
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().map_err(|e| format!("could not start Quick Look: {e}"))?;
-    // Reaped elsewhere so it does not linger as a zombie once closed.
-    std::thread::spawn(move || { let _ = child.wait(); });
+    crate::quicklook::request(paths.to_vec());
     Ok(())
 }
 

@@ -13,6 +13,32 @@ fn volume(path: &Path) -> Option<(Option<Capacity>, bool)> {
     let capacity = Some(Capacity { total: v["total"].as_u64()?, free: v["free"].as_u64()? });
     Some((capacity, v["browsable"] != false))
 }
+/// Whether the volume at `path` can be ejected: removable media, a disk image,
+/// a network volume. Asks the system, so it belongs on a worker.
+pub fn ejectable(path: &Path) -> bool {
+    let Ok(path) = crate::macos::path_str(path) else { return false };
+    crate::macos::call(serde_json::json!({"action":"capacity", "destination":path}))
+        .ok()
+        .is_some_and(|v| v["ejectable"] == true)
+}
+
+/// Ejects the volume at `path`, or unmounts it if it is on the network.
+/// Blocks until macOS answers — a busy disk can take seconds — so run it on a
+/// worker.
+pub fn eject(path: &Path) -> Result<(), String> {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::{NSString, NSURL};
+    let text = crate::macos::path_str(path)?;
+    objc2::rc::autoreleasepool(|_| {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(text));
+        // Documented as safe off the main thread, like the rest of
+        // NSWorkspace's file operations.
+        NSWorkspace::sharedWorkspace()
+            .unmountAndEjectDeviceAtURL_error(&url)
+            .map_err(|e| e.localizedDescription().to_string())
+    })
+}
+
 pub fn known_folders() -> Vec<Place> {
     let Some(home) = home() else { return vec![]; };
     let mut out = vec![place("Home", &home, PlaceKind::KnownFolder)];

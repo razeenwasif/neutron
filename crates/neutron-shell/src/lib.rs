@@ -80,6 +80,12 @@ pub mod icons;
 
 pub mod thumbnails;
 
+#[cfg_attr(target_os = "macos", path = "quicklook_macos.rs")]
+#[cfg_attr(not(target_os = "macos"), path = "quicklook_stub.rs")]
+pub mod quicklook;
+
+pub mod transfer;
+
 pub mod sta;
 
 /// Documents macOS asks Neutron to open (Finder's Open With, the Dock icon).

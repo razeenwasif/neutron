@@ -5,7 +5,10 @@
 /// Takes any text, so a tooltip that mentions a shortcut goes through whole.
 pub fn shortcut(text: &str) -> String {
     if cfg!(target_os = "macos") {
-        text.replace("Ctrl+", "⌘")
+        // The real Control key first: "Control+" is how a Mac-only hint names
+        // it, since "Ctrl+" in a shared hint means Command here.
+        text.replace("Control+", "⌃")
+            .replace("Ctrl+", "⌘")
             .replace("Cmd+", "⌘")
             .replace("Shift+", "⇧")
             .replace("Alt+", "⌥")
@@ -193,5 +196,6 @@ mod tests {
         assert_eq!(shortcut("Ctrl+Shift+D"), "⌘⇧D");
         assert_eq!(shortcut("Go back (Alt+Left)"), "Go back (⌥Left)");
         assert_eq!(shortcut("F2"), "F2");
+        assert_eq!(shortcut("Control+Cmd+T"), "⌃⌘T");
     }
 }

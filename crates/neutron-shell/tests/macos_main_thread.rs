@@ -5,7 +5,8 @@
 fn main() {
     open_documents_event_reaches_the_channel();
     drag_without_a_window_is_an_error_not_a_crash();
-    println!("macos_main_thread: 2 passed");
+    quick_look_without_a_window_is_an_error_not_a_crash();
+    println!("macos_main_thread: 3 passed");
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -52,4 +53,17 @@ fn drag_without_a_window_is_an_error_not_a_crash() {
     let result = neutron_shell::dragout::drag(&[std::path::PathBuf::from("/tmp")], 0);
     let err = result.expect_err("there is no window to drag from");
     assert!(err.contains("window"), "{err}");
+}
+
+/// The panel's class is reachable (Quartz is linked), it starts closed, and
+/// asking for it with no window to attach to says so rather than raising.
+#[cfg(target_os = "macos")]
+fn quick_look_without_a_window_is_an_error_not_a_crash() {
+    use neutron_shell::quicklook;
+    assert!(objc2::runtime::AnyClass::get(c"QLPreviewPanel").is_some(), "Quartz is not linked");
+    assert!(!quicklook::is_open());
+    let err = quicklook::toggle(&[std::path::PathBuf::from("/tmp")], 0).expect_err("there is no window");
+    assert!(err.contains("window"), "{err}");
+    assert!(quicklook::take_moves().is_empty());
+    quicklook::follow(&[std::path::PathBuf::from("/tmp")], 0);
 }

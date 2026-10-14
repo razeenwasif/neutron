@@ -113,6 +113,8 @@ pub enum RowHit {
     None,
     Open,
     Menu(egui::Pos2),
+    /// The eject button on a volume's row.
+    Eject,
 }
 
 impl RowHit {
@@ -133,6 +135,12 @@ impl RowHit {
 
 /// One destination.
 pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) -> RowHit {
+    drive_row(ui, p, place, current, false)
+}
+
+/// One destination, with an eject button at its end when `ejectable`, as the
+/// Finder puts one beside a disk that can be taken out.
+pub fn drive_row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>, ejectable: bool) -> RowHit {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
     if !ui.is_rect_visible(rect) {
         return RowHit::of(&response, rect);
@@ -149,17 +157,23 @@ pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) ->
             Stroke::new(1.0, theme::with_alpha(p.accent, 51)),
             egui::StrokeKind::Inside,
         );
-        ui.painter()
-            .circle_filled(pos2(rect.right() - 14.0, rect.center().y), 3.0, p.accent);
+        // The eject button takes the dot's place on a disk that has one.
+        if !ejectable {
+            ui.painter()
+                .circle_filled(pos2(rect.right() - 14.0, rect.center().y), 3.0, p.accent);
+        }
     } else if response.hovered() {
         ui.painter().rect_filled(rect, corners, p.hover);
     }
 
-    icons::draw(
+    // The Trash borrows the action rail's glyph, which is drawn larger.
+    let glyph = glyph_for(place);
+    icons::draw_scaled(
         ui.painter(),
         pos2(rect.left() + 19.0, rect.center().y),
-        glyph_for(place),
+        glyph,
         if selected { p.accent } else { p.icon },
+        if glyph == Glyph::Trash { 0.8 } else { 1.0 },
     );
 
     let (font, colour) = if selected {
@@ -187,6 +201,25 @@ pub fn row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) ->
         response
             .clone()
             .on_hover_text(format!("{free} free of {total}"));
+    }
+
+    if ejectable {
+        let button = Rect::from_center_size(pos2(rect.right() - 17.0, rect.center().y), vec2(24.0, 24.0));
+        let eject = ui
+            .interact(button, ui.id().with(("eject", &place.id)), Sense::click())
+            .on_hover_text(format!("Eject {}", place.name));
+        if eject.hovered() {
+            ui.painter().circle_filled(button.center(), 12.0, p.hover);
+        }
+        icons::draw(
+            ui.painter(),
+            button.center(),
+            Glyph::Eject,
+            if eject.hovered() { p.text } else { p.text_faint },
+        );
+        if eject.clicked() {
+            return RowHit::Eject;
+        }
     }
 
     RowHit::of(&response, rect)
@@ -221,6 +254,8 @@ fn glyph_for(place: &Place) -> Glyph {
             "Music" => Glyph::Music,
             "Movies" | "Videos" => Glyph::Film,
             "Applications" => Glyph::Grid,
+            "Trash" => Glyph::Trash,
+            "AirDrop" => Glyph::AirDrop,
             _ => Glyph::Folder,
         },
     }

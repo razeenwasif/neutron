@@ -31,6 +31,7 @@ pub enum CommandId {
     NewFolder,
     Extract,
     Compress,
+    Duplicate,
     Copy,
     Cut,
     Paste,
@@ -110,6 +111,7 @@ pub const ALL: &[CommandDef] = &[
     CommandDef { id: CommandId::NewFolder, title: "New folder", hint: "Ctrl+Shift+N" },
     CommandDef { id: CommandId::Extract, title: "Extract this archive", hint: "" },
     CommandDef { id: CommandId::Compress, title: "Compress to a zip", hint: "" },
+    CommandDef { id: CommandId::Duplicate, title: "Duplicate", hint: "" },
     CommandDef {
         id: CommandId::DeleteSelection,
         title: if cfg!(target_os = "macos") { "Move to Trash" } else { "Delete to Recycle Bin" },
@@ -246,6 +248,37 @@ pub struct Entry {
     pub hint: String,
 }
 
+/// The shortcut to show for `command`: the Mac's own where its layout differs
+/// from the one in the table, which is written in Windows terms.
+fn hint_for(command: &CommandDef) -> &'static str {
+    if !cfg!(target_os = "macos") {
+        return command.hint;
+    }
+    use CommandId as C;
+    match command.id {
+        C::GoUp => "Cmd+↑",
+        C::GoBack => "Cmd+[",
+        C::GoForward => "Cmd+]",
+        C::Rename => "↩",
+        C::Duplicate => "Cmd+D",
+        C::DeleteSelection => "Cmd+⌫",
+        C::GridView => "Cmd+1",
+        C::ListView => "Cmd+2",
+        C::ColumnView => "Cmd+3",
+        C::ToggleHidden => "Cmd+Shift+.",
+        // Cmd+D is Duplicate on a Mac.
+        C::ToggleTheme => "",
+        C::TogglePin => "Control+Cmd+T",
+        C::GoHome => "Cmd+Shift+H",
+        C::GoDesktop => "Cmd+Shift+D",
+        C::GoDownloads => "Cmd+Alt+L",
+        C::GoDocuments => "Cmd+Shift+O",
+        C::ConnectServer => "Cmd+K",
+        C::OpenTerminal => "Control+`",
+        _ => command.hint,
+    }
+}
+
 /// The palette's full list: everything built in, then everything installed.
 ///
 /// Built-ins first because they are what a user expects to find, and their
@@ -257,7 +290,7 @@ pub fn catalogue(plugins: &[(crate::plugins::Ref, String, String)]) -> Vec<Entry
         .map(|c| Entry {
             invoke: Invoke::Builtin(c.id),
             title: c.title.to_owned(),
-            hint: neutron_ui::format::shortcut(c.hint),
+            hint: neutron_ui::format::shortcut(hint_for(c)),
         })
         .collect();
 

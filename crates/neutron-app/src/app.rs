@@ -92,6 +92,8 @@ enum Action {
     CompressSelection,
     /// Stop the archive job that is running.
     CancelArchiveJob,
+    /// Stop the copy or move with this id.
+    StopTransfer(u64),
     /// Stop the plugin command that is running.
     CancelPluginCommand,
 
@@ -115,6 +117,26 @@ enum Action {
     EditSite(String),
     /// Show a file in the system's Quick Look panel.
     QuickLook(PathBuf),
+    /// Open Quick Look on the selection, or close it.
+    QuickLookSelection,
+    /// Eject the volume mounted here.
+    Eject(PathBuf),
+    /// Eject the volume the current folder is on.
+    EjectCurrent,
+    /// The Finder's AirDrop window.
+    OpenAirDrop,
+    /// Empty the Trash, after asking.
+    EmptyTrash,
+    /// System Settings, at Privacy & Security › Full Disk Access.
+    OpenFullDiskAccess,
+    OpenInNewTab(NodeId),
+    OpenTerminalAt(PathBuf),
+    /// The Finder's Get Info windows for these items.
+    GetInfo(Vec<PathBuf>),
+    /// Get Info for the selection.
+    GetInfoSelection,
+    /// Finder aliases to these items, beside them.
+    MakeAlias(Vec<PathBuf>),
     /// Clear the status line.
     DismissNotice,
     /// Open a terminal at the focused tab's folder.
@@ -183,6 +205,12 @@ enum Action {
     CloseTab { group: GroupId, index: usize },
     CloseActiveTab,
     FocusTabIndex(usize),
+    /// The next tab in the focused pane, or the previous one, wrapping.
+    CycleTab(isize),
+    /// Go to one of the known folders, by name.
+    GoKnown(&'static str),
+    /// Copy the selection beside itself, under Finder's "copy" names.
+    Duplicate,
     BeginTabDrag(TabDrag),
     DropTab(GroupId),
     EndTabDrag,
@@ -202,6 +230,10 @@ enum Action {
 /// to `IContextMenu::InvokeCommand`, where it would invoke an unrelated verb.
 const MENU_ID_PIN: u32 = 0x0800_0001;
 const MENU_ID_NEW_TAB: u32 = 0x0800_0002;
+const MENU_ID_EJECT: u32 = 0x0800_0010;
+/// Neutron's rows in a file's menu are numbered up from here.
+const MENU_ID_OURS: u32 = 0x0800_0100;
+const MENU_ID_EMPTY_TRASH: u32 = 0x0800_0011;
 const MENU_ID_EDIT_SITE: u32 = 0x0800_0003;
 const _: () = assert!(MENU_ID_EDIT_SITE > 0x7FFF);
 const _: () = assert!(MENU_ID_EDIT_SITE < crate::plugins::MENU_ID_BASE);
@@ -304,6 +336,10 @@ enum PlacesUpdate {
     Wsl(Vec<Place>),
     Shell(Vec<Place>),
     Drive(Place),
+    /// A drive just sent can be ejected.
+    Ejectable(PathBuf),
+    /// A disk came or went: the drives are about to be sent again.
+    DrivesReset,
     /// The volume scan finished — including any devices that timed out.
     Done,
 }
@@ -362,6 +398,17 @@ pub struct NeutronApp {
     scanning_drives: bool,
 
     type_ahead: String,
+    /// What the Quick Look panel was last given: the tab, its cursor, and how
+    /// many items. When this no longer matches, the panel is told to follow.
+    quick_look_shown: Option<QuickLookKey>,
+    /// Volumes that can be ejected, by mount point.
+    ejectable: std::collections::HashSet<PathBuf>,
+    /// What Neutron's own items in an open menu do, by id: rows it adds to
+    /// the shell's menu and to the sidebar's. The shell never sees these ids.
+    menu_actions: Vec<(u32, Action)>,
+    /// What `menu_rows` built, for the overlay to take; it runs through
+    /// `&self`, so it cannot set `menu_actions` itself.
+    pending_menu_actions: std::cell::RefCell<Vec<(u32, Action)>>,
     type_ahead_at: Option<Instant>,
     /// Tab currently being dragged, if any.
     tab_drag: Option<TabDrag>,
@@ -428,6 +475,15 @@ pub struct NeutronApp {
 
     /// The archive job that is running, if any, and what it last reported.
     archive_job: Option<crate::archive_ops::ArchiveJob>,
+    /// Copies and moves under way. Several at once: unlike archive work, a
+    /// copy to a USB stick should not hold up a move within the same disk.
+    transfers: Vec<crate::transfers::Job>,
+    next_transfer: u64,
+    /// Checked transfers, back from the worker that looked for clashes.
+    planned_tx: crossbeam_channel::Sender<crate::transfers::Planned>,
+    planned_rx: crossbeam_channel::Receiver<crate::transfers::Planned>,
+    /// Clashes waiting for an answer, first asked first.
+    clash_questions: std::collections::VecDeque<crate::transfers::Question>,
 
     /// Directory watchers, one per distinct folder on screen.
     ///
@@ -573,6 +629,13 @@ impl NeutronApp {
         let sta = neutron_shell::sta::StaPool::spawn();
         let icons = IconService::new(sta.clone(), cc.egui_ctx.clone());
         let thumbs = crate::thumbs::Thumbnails::new(cc.egui_ctx.clone());
+        {
+            // Quick Look's panel and the context menu's worker both need to
+            // wake the event loop, and winit sees neither.
+            let ctx = cc.egui_ctx.clone();
+            neutron_shell::quicklook::set_waker(move || ctx.request_repaint());
+        }
+        let (planned_tx, planned_rx) = crossbeam_channel::unbounded();
         let (notice_tx, notice_rx) = crossbeam_channel::unbounded();
         let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
         let (open_as_tx, open_as_rx) = crossbeam_channel::unbounded();
@@ -666,6 +729,10 @@ impl NeutronApp {
             places_rx,
             scanning_drives: true,
             type_ahead: String::new(),
+            quick_look_shown: None,
+            ejectable: std::collections::HashSet::new(),
+            menu_actions: Vec::new(),
+            pending_menu_actions: std::cell::RefCell::new(Vec::new()),
             type_ahead_at: None,
             tab_drag: None,
             last_title: String::new(),
@@ -696,6 +763,11 @@ impl NeutronApp {
             plugins,
             palette,
             archive_job: None,
+            transfers: Vec::new(),
+            next_transfer: 0,
+            planned_tx,
+            planned_rx,
+            clash_questions: std::collections::VecDeque::new(),
             watchers: std::collections::HashMap::new(),
             changed_tx,
             changed_rx,
@@ -936,6 +1008,11 @@ impl NeutronApp {
                     self.compress_selection();
                 }
             }
+            Action::StopTransfer(id) => {
+                if let Some(job) = self.transfers.iter().find(|j| j.id == id) {
+                    job.stop();
+                }
+            }
             Action::CancelArchiveJob => {
                 if let Some(job) = self.archive_job.as_ref() {
                     job.cancel();
@@ -1079,16 +1156,117 @@ impl NeutronApp {
             Action::DeleteOnServer => self.remote_delete(),
             Action::EditSite(id) => self.edit_site(&id),
             Action::QuickLook(path) => {
-                // `qlmanage` is the system's own Quick Look, run on a worker:
-                // starting a process is not something the paint thread waits on.
-                self.sta.submit(move || {
-                    let _ = std::process::Command::new("/usr/bin/qlmanage")
-                        .arg("-p")
-                        .arg(&path)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
+                if let Err(e) = neutron_shell::quicklook::toggle(std::slice::from_ref(&path), 0) {
+                    self.notices.error(e);
+                }
+            }
+            Action::Eject(volume) => {
+                let name = volume.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let notices = self.notice_tx.clone();
+                let wake = self.ctx.clone();
+                self.notices.info(format!("Ejecting {name}…"));
+                std::thread::spawn(move || {
+                    match neutron_shell::places::eject(&volume) {
+                        Ok(()) => report_info(&notices, format!("Ejected {name}")),
+                        Err(why) => report(&notices, format!("{name} could not be ejected: {why}")),
+                    }
+                    wake.request_repaint();
                 });
+            }
+            Action::EjectCurrent => {
+                let here = self.workspace.active_tab().and_then(|t| t.location().as_path().map(Path::to_path_buf));
+                let volume = here.and_then(|here| {
+                    self.ejectable.iter().filter(|v| here.starts_with(v)).max_by_key(|v| v.as_os_str().len()).cloned()
+                });
+                match volume {
+                    Some(volume) => self.apply(ctx, Action::Eject(volume)),
+                    None => self.notices.info("This folder is not on a disk that can be ejected"),
+                }
+            }
+            Action::OpenAirDrop => {
+                let notices = self.notice_tx.clone();
+                self.sta.submit(move || {
+                    let opened = std::process::Command::new("/usr/bin/open")
+                        .arg("/System/Library/CoreServices/Finder.app/Contents/Applications/AirDrop.app")
+                        .status();
+                    if !opened.is_ok_and(|s| s.success()) {
+                        report(&notices, "AirDrop could not be opened".into());
+                    }
+                });
+            }
+            Action::OpenInNewTab(id) => self.open_in_new_tab(id),
+            Action::OpenTerminalAt(dir) => {
+                let notices = self.notice_tx.clone();
+                self.sta.submit(move || {
+                    if let Err(e) = neutron_shell::terminal::open_at(&dir) {
+                        report(&notices, format!("Could not open a terminal: {e}"));
+                    }
+                });
+            }
+            Action::GetInfoSelection => {
+                if let Some((_, _, paths)) = self.selection_paths() {
+                    self.apply(ctx, Action::GetInfo(paths));
+                }
+            }
+            Action::GetInfo(paths) => {
+                // The Finder's own window: permissions, tags, comments and
+                // "Open with" for all files of the kind are all there, and a
+                // copy of it here would be a worse one.
+                self.finder_script(
+                    paths,
+                    &["open information window of f"],
+                    "Get Info could not be opened",
+                    true,
+                );
+            }
+            Action::MakeAlias(paths) => {
+                self.finder_script(
+                    paths,
+                    &["make new alias file at (container of f) to f"],
+                    "The alias could not be made",
+                    false,
+                );
+            }
+            Action::OpenFullDiskAccess => {
+                self.sta.submit(|| {
+                    let _ = std::process::Command::new("/usr/bin/open")
+                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                        .status();
+                });
+            }
+            Action::EmptyTrash => {
+                let notices = self.notice_tx.clone();
+                let done = self.refresh_tx.clone();
+                let tab = self.workspace.active_tab_id();
+                self.sta.submit(move || {
+                    // The Finder owns the Trash, including its other volumes'
+                    // parts; asking it is the only complete way to empty it.
+                    let output = std::process::Command::new("/usr/bin/osascript")
+                        .args(["-e", "tell application \"Finder\" to empty trash"])
+                        .output();
+                    match output {
+                        Ok(o) if o.status.success() => report_info(&notices, "Emptied the Trash".into()),
+                        Ok(o) => report(&notices, format!(
+                            "The Trash could not be emptied: {}",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        )),
+                        Err(e) => report(&notices, format!("The Trash could not be emptied: {e}")),
+                    }
+                    if let Some(tab) = tab {
+                        let _ = done.send(tab);
+                    }
+                });
+            }
+            Action::QuickLookSelection => {
+                if neutron_shell::quicklook::is_open() {
+                    let _ = neutron_shell::quicklook::toggle(&[], 0);
+                    self.quick_look_shown = None;
+                } else if let Some((paths, index, key)) = self.quick_look_subject() {
+                    match neutron_shell::quicklook::toggle(&paths, index) {
+                        Ok(()) => self.quick_look_shown = Some(key),
+                        Err(e) => self.notices.error(e),
+                    }
+                }
             }
             Action::Delete { permanent } => {
                 if !self.refuse_without_a_path("delete from") {
@@ -1265,6 +1443,27 @@ impl NeutronApp {
                 }
             }
             Action::FocusTabIndex(i) => self.workspace.focus_tab_index(i),
+            Action::CycleTab(delta) => self.workspace.cycle_tab(delta),
+            Action::GoKnown(name) => {
+                match self.known_folders.iter().find(|p| p.name == name).map(|p| p.id.clone()) {
+                    Some(id) => self.apply(ctx, Action::Navigate(id)),
+                    None => self.notices.info(format!("There is no {name} folder here")),
+                }
+            }
+            Action::Duplicate => {
+                if !self.refuse_without_a_path("duplicate anything in") {
+                    if let Some((tab, dir, paths)) = self.selection_paths() {
+                        let request = crate::transfers::Request {
+                            tab,
+                            paths,
+                            destination: dir,
+                            how: neutron_shell::fileops::Transfer::Copy,
+                        };
+                        // Beside itself, so never a clash: each is named as a copy.
+                        self.start_transfer(request, neutron_shell::transfer::Clash::KeepBoth);
+                    }
+                }
+            }
 
             Action::BeginTabDrag(d) => self.tab_drag = Some(d),
             Action::EndTabDrag => self.tab_drag = None,
@@ -1792,7 +1991,7 @@ impl NeutronApp {
     fn clipboard_keys(&self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         // A menu or a text field is using the keyboard; its own copy and paste
         // win.
-        if self.menu.is_some() || self.confirm.is_some() || ctx.egui_wants_keyboard_input() {
+        if self.menu.is_some() || self.confirm.is_some() || !self.clash_questions.is_empty() || ctx.egui_wants_keyboard_input() {
             // Still drained, so a press held while a field had focus does not
             // fire the moment focus leaves.
             while self.paste_rx.try_recv().is_ok() {}
@@ -1820,6 +2019,263 @@ impl NeutronApp {
         }
     }
 
+    /// Starts checked transfers, queues questions about clashes, and reports
+    /// transfers that have ended.
+    fn pump_transfers(&mut self) {
+        while let Ok(planned) = self.planned_rx.try_recv() {
+            match planned {
+                crate::transfers::Planned::Clear(request) => {
+                    // Nothing is in the way, so how clashes are settled does
+                    // not matter; Keep Both is the one that can never lose a
+                    // file to a name that appears in the meantime.
+                    self.start_transfer(request, neutron_shell::transfer::Clash::KeepBoth);
+                }
+                crate::transfers::Planned::Clashes(request, names) => {
+                    self.clash_questions.push_back(crate::transfers::Question { request, names });
+                }
+                crate::transfers::Planned::Refused(why) => self.notices.error(why),
+            }
+        }
+
+        let mut finished = Vec::new();
+        self.transfers.retain(|job| match job.poll() {
+            Some(outcome) => {
+                finished.push((job.request.clone(), outcome));
+                false
+            }
+            None => true,
+        });
+        for (request, outcome) in finished {
+            let (error, text) = crate::transfers::summary(&request, &outcome);
+            if error {
+                self.notices.error(text);
+            } else {
+                self.notices.info(text);
+            }
+            // The folder watcher sees the change too; this makes it certain.
+            let _ = self.refresh_tx.send(request.tab);
+        }
+
+        if !self.transfers.is_empty() {
+            // The bar moves without input; nothing else would redraw it.
+            self.ctx.request_repaint_after(Duration::from_millis(120));
+        }
+    }
+
+    fn start_transfer(&mut self, request: crate::transfers::Request, clash: neutron_shell::transfer::Clash) {
+        self.next_transfer += 1;
+        self.notices.dismiss_info();
+        let job = crate::transfers::Job::start(self.next_transfer, request, clash, self.ctx.clone());
+        self.transfers.push(job);
+    }
+
+    /// The question about clashing names, when there is one.
+    fn clash_overlay(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // One question at a time, and never over the delete confirmation.
+        if self.confirm.is_some() {
+            return;
+        }
+        let Some(question) = self.clash_questions.front() else {
+            return;
+        };
+        match crate::confirm::ask_clash(ui, p, &question.title(), &question.body()) {
+            crate::confirm::ClashAnswer::Waiting => {}
+            crate::confirm::ClashAnswer::Cancelled => {
+                self.clash_questions.pop_front();
+            }
+            crate::confirm::ClashAnswer::Chose(clash) => {
+                if let Some(question) = self.clash_questions.pop_front() {
+                    self.start_transfer(question.request, clash);
+                }
+            }
+        }
+    }
+
+    /// Each copy or move under way: what it is doing, a bar, and Stop.
+    fn transfer_status(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
+        for job in &self.transfers {
+            if ui
+                .add(egui::Button::new(egui::RichText::new("Stop").size(11.0)).small())
+                .on_hover_text("Stop. The item being copied is removed; what is already done stays done.")
+                .clicked()
+            {
+                actions.push(Action::StopTransfer(job.id));
+            }
+            ui.label(egui::RichText::new(job.status()).color(p.text_soft()));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(90.0, 6.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, theme::pill(6.0), p.inset);
+            let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * job.fraction(), rect.height()));
+            if fill.width() >= 1.0 {
+                ui.painter().rect_filled(fill, theme::pill(6.0), p.accent);
+            }
+        }
+    }
+
+    /// Sends any tab showing a disk that is no longer mounted to the
+    /// dashboard. Run when a rescan of the drives finishes: a disk ejected,
+    /// from here or anywhere else, leaves its tabs pointing at nothing.
+    fn leave_missing_volumes(&mut self) {
+        let mounted: Vec<PathBuf> = self.drives.iter().filter_map(|d| d.id.as_path().map(Path::to_path_buf)).collect();
+        let stranded: Vec<TabId> = self
+            .workspace
+            .tabs
+            .iter()
+            .filter_map(|(id, tab)| {
+                let path = tab.location().as_path()?;
+                let on_volume = path.starts_with("/Volumes/") && path.components().count() >= 3;
+                let gone = on_volume && !mounted.iter().any(|m| m != Path::new("/") && path.starts_with(m));
+                gone.then_some(*id)
+            })
+            .collect();
+        for tab in stranded {
+            self.navigate(tab, NodeId::Home);
+        }
+    }
+
+    /// What Quick Look should show: the selection when there are several, or
+    /// the item under the cursor, with where in it the cursor is.
+    fn quick_look_subject(&self) -> Option<(Vec<PathBuf>, usize, QuickLookKey)> {
+        let tab = self.workspace.active_tab()?;
+        let dir = tab.location().as_path()?;
+        let cursor = tab.selection.cursor().filter(|&i| i < tab.list.len());
+        let selected = visible_selection(tab);
+        let (items, index) = if selected.len() > 1 {
+            let at = cursor.and_then(|c| selected.iter().position(|&i| i == c)).unwrap_or(0);
+            (selected, at)
+        } else {
+            (vec![cursor?], 0)
+        };
+        let paths: Vec<PathBuf> = items.iter().map(|&i| dir.join(tab.list.name(i))).collect();
+        let key = (tab.id, cursor, paths.len());
+        Some((paths, index, key))
+    }
+
+    /// Keeps an open Quick Look panel on the cursor as it moves.
+    fn quick_look_follow(&mut self) {
+        if self.quick_look_shown.is_none() || !neutron_shell::quicklook::is_open() {
+            self.quick_look_shown = None;
+            return;
+        }
+        if let Some((paths, index, key)) = self.quick_look_subject() {
+            if self.quick_look_shown != Some(key) {
+                neutron_shell::quicklook::follow(&paths, index);
+                self.quick_look_shown = Some(key);
+            }
+        }
+    }
+
+    /// Runs `lines` in the Finder for each of `paths`, bound to `f`.
+    ///
+    /// Paths are passed as arguments, never pasted into the script, so a name
+    /// with a quote in it cannot change what the script does. The first use
+    /// asks the user to let Neutron control the Finder, which is the system's
+    /// own consent and the only way to these.
+    fn finder_script(&self, paths: Vec<PathBuf>, lines: &[&str], failed: &'static str, bring_forward: bool) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut script = vec![
+            "on run argv".to_owned(),
+            "tell application \"Finder\"".to_owned(),
+            "repeat with p in argv".to_owned(),
+            "set f to (POSIX file (p as text)) as alias".to_owned(),
+        ];
+        script.extend(lines.iter().map(|l| (*l).to_owned()));
+        script.push("end repeat".to_owned());
+        if bring_forward {
+            script.push("activate".to_owned());
+        }
+        script.extend(["end tell".to_owned(), "end run".to_owned()]);
+        let notices = self.notice_tx.clone();
+        let done = self.refresh_tx.clone();
+        let tab = self.workspace.active_tab_id();
+        self.sta.submit(move || {
+            let mut command = std::process::Command::new("/usr/bin/osascript");
+            for line in &script {
+                command.arg("-e").arg(line);
+            }
+            command.arg("--").args(&paths);
+            match command.output() {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => report(&notices, format!("{failed}: {}", String::from_utf8_lossy(&o.stderr).trim())),
+                Err(e) => report(&notices, format!("{failed}: {e}")),
+            }
+            if let Some(tab) = tab {
+                let _ = done.send(tab);
+            }
+        });
+    }
+
+    /// Neutron's rows for a file's menu, or for the folder's own when nothing
+    /// is selected, as labels and what each does.
+    fn menu_rows(&self) -> Vec<neutron_core::MenuItem> {
+        use neutron_core::MenuItem;
+        let mut rows: Vec<MenuItem> = Vec::new();
+        let mut actions: Vec<(u32, Action)> = Vec::new();
+        let mut next = MENU_ID_OURS;
+        let mut row = |label: &str, action: Action, actions: &mut Vec<(u32, Action)>| -> MenuItem {
+            next += 1;
+            actions.push((next, action));
+            MenuItem { id: next, label: label.to_owned(), enabled: true, ..Default::default() }
+        };
+
+        let Some(tab) = self.workspace.active_tab() else { return rows };
+        let Some(dir) = tab.location().as_path() else { return rows };
+        let selected = visible_selection(tab);
+
+        if selected.is_empty() {
+            let views = [
+                ("List", file_list::ViewMode::List),
+                ("Grid", file_list::ViewMode::Grid),
+                ("Columns", file_list::ViewMode::Columns),
+            ];
+            let children = views
+                .into_iter()
+                .map(|(label, mode)| MenuItem { checked: tab.view.view == mode, ..row(label, Action::SetView(mode), &mut actions) })
+                .collect();
+            rows.push(MenuItem { label: "View as".into(), enabled: true, children, ..Default::default() });
+            let sorts = [
+                ("Name", neutron_core::SortColumn::Name),
+                ("Kind", neutron_core::SortColumn::Kind),
+                ("Date Modified", neutron_core::SortColumn::Modified),
+                ("Date Created", neutron_core::SortColumn::Created),
+                ("Size", neutron_core::SortColumn::Size),
+            ];
+            let children = sorts
+                .into_iter()
+                .map(|(label, column)| MenuItem {
+                    checked: tab.view.sort.column == column,
+                    ..row(label, Action::SortBy(column), &mut actions)
+                })
+                .collect();
+            rows.push(MenuItem { label: "Sort By".into(), enabled: true, children, ..Default::default() });
+            let hidden = if tab.view.show_hidden { "Hide Hidden Files" } else { "Show Hidden Files" };
+            rows.push(row(hidden, Action::ToggleHidden, &mut actions));
+        } else {
+            let paths: Vec<PathBuf> = selected.iter().map(|&i| dir.join(tab.list.name(i))).collect();
+            if let [only] = selected.as_slice() {
+                let path = dir.join(tab.list.name(*only));
+                rows.push(row("Rename", Action::BeginRename, &mut actions));
+                if crate::columns::is_package(&path) {
+                    rows.push(row("Show Package Contents", Action::Navigate(NodeId::path(&path)), &mut actions));
+                } else if tab.list.kind(*only).is_container() {
+                    rows.push(row("Open in New Tab", Action::OpenInNewTab(NodeId::path(&path)), &mut actions));
+                    rows.push(row("Open in Terminal", Action::OpenTerminalAt(path.clone()), &mut actions));
+                }
+            }
+            if paths.iter().any(|p| neutron_archive::format_of(p).is_some()) {
+                rows.push(row("Extract", Action::ExtractSelection, &mut actions));
+            }
+            if cfg!(target_os = "macos") {
+                rows.push(MenuItem { accel: neutron_ui::format::shortcut("Cmd+I"), ..row("Get Info", Action::GetInfo(paths.clone()), &mut actions) });
+                rows.push(row("Make Alias", Action::MakeAlias(paths), &mut actions));
+            }
+        }
+        // Remembered for the answer; see `context_menu_overlay`.
+        self.pending_menu_actions.replace(actions);
+        rows
+    }
+
     fn clear_cut_marks(&mut self) {
         self.cut_dir = None;
         self.cut_names.clear();
@@ -1828,9 +2284,9 @@ impl NeutronApp {
     /// Pastes the clipboard into the focused tab's folder.
     ///
     /// Reading the clipboard is itself a blocking call — another process may
-    /// hold it — so the whole operation, decision included, happens on the
-    /// worker. The UI thread never learns what was on the clipboard, only that
-    /// the listing should be re-read.
+    /// hold it — so reading it and checking the destination happen on the
+    /// worker. What comes back is a checked transfer, or a question about
+    /// clashing names; see `pump_transfers`.
     fn paste(&mut self) {
         let Some(tab_id) = self.workspace.active_tab_id() else {
             return;
@@ -1850,11 +2306,9 @@ impl NeutronApp {
         // leaving rows faded would be a lie about a clipboard we no longer own.
         self.clear_cut_marks();
 
-        let owner = self.hwnd.unwrap_or(0);
         let wake = self.ctx.clone();
-        let done = self.refresh_tx.clone();
-
         let notices = self.notice_tx.clone();
+        let planned = self.planned_tx.clone();
         self.sta.submit(move || {
             let Some((paths, how)) = neutron_shell::clipboard::read() else {
                 report_info(&notices, "No files on the clipboard — copy or cut files first".into());
@@ -1882,15 +2336,10 @@ impl NeutronApp {
                 return;
             }
 
-            tracing::info!(count = paths.len(), ?how, dest = %dir.display(), "paste");
-            if let Err(e) = neutron_shell::fileops::transfer(&paths, &dir, how, owner) {
-                report(&notices, format!("Paste failed: {e}"));
-            } else {
-                report_info(&notices, format!("{} {} items into {}",
-                    if how == neutron_shell::fileops::Transfer::Move { "Moved" } else { "Copied" },
-                    paths.len(), dir.file_name().unwrap_or_default().to_string_lossy()));
-            }
-            let _ = done.send(tab_id);
+            // Checked here, carried out by a job of its own: see
+            // `transfers`. The listing is refreshed when the job ends.
+            let request = crate::transfers::Request { tab: tab_id, paths, destination: dir, how };
+            let _ = planned.send(crate::transfers::plan(request));
             wake.request_repaint();
         });
     }
@@ -1952,25 +2401,20 @@ impl NeutronApp {
         };
 
         use neutron_shell::fileops::Transfer;
-        // Ctrl forces a copy, matching Explorer. Without it the source and
-        // destination volumes decide.
-        let how = if copy {
-            Transfer::Copy
-        } else {
-            neutron_shell::fileops::default_transfer(&paths[0], &dir)
-        };
-
-        let owner = self.hwnd.unwrap_or(0);
         let wake = self.ctx.clone();
-        let done = self.refresh_tx.clone();
-
-        tracing::info!(count = paths.len(), ?how, dest = %dir.display(), "drop");
-        let notices = self.notice_tx.clone();
+        let planned = self.planned_tx.clone();
         self.sta.submit(move || {
-            if let Err(e) = neutron_shell::fileops::transfer(&paths, &dir, how, owner) {
-                report(&notices, format!("Could not copy those files here: {e}"));
-            }
-            let _ = done.send(tab_id);
+            // Option forces a copy, as in the Finder. Without it the volumes
+            // decide: a move within one disk, a copy onto another. Worked out
+            // here because it stats both ends.
+            let how = if copy {
+                Transfer::Copy
+            } else {
+                neutron_shell::fileops::default_transfer(&paths[0], &dir)
+            };
+            tracing::info!(count = paths.len(), ?how, dest = %dir.display(), "drop");
+            let request = crate::transfers::Request { tab: tab_id, paths, destination: dir, how };
+            let _ = planned.send(crate::transfers::plan(request));
             wake.request_repaint();
         });
     }
@@ -2074,6 +2518,29 @@ impl NeutronApp {
             // also where the ids handed out have to be remembered.
             let mut items = pending.items;
 
+            // The shell's Paste and Duplicate, taken over: Neutron's go
+            // through the transfer job, with its progress, Stop, and question
+            // about names already taken.
+            self.menu_actions.clear();
+            for item in items.iter_mut() {
+                let ours = match item.label.as_str() {
+                    "Paste" => Some((MENU_ID_OURS + 0xF0, Action::Paste)),
+                    "Duplicate" => Some((MENU_ID_OURS + 0xF1, Action::Duplicate)),
+                    _ => None,
+                };
+                if let Some((id, action)) = ours {
+                    item.id = id;
+                    self.menu_actions.push((id, action));
+                }
+            }
+            let rows = self.menu_rows();
+            if !rows.is_empty() {
+                items.push(neutron_core::MenuItem::separator());
+                items.extend(rows);
+                let built = std::mem::take(&mut *self.pending_menu_actions.borrow_mut());
+                self.menu_actions.extend(built);
+            }
+
             // Neutron's own rows come before the plugins', and after the
             // shell's: they are part of the application rather than an
             // extension of it.
@@ -2124,8 +2591,13 @@ impl NeutronApp {
             .flatten();
 
         let plugin = answer.and_then(|id| self.plugins.menu_choice(id));
-        let for_shell = match (&pin, &new_tab, &plugin, &edit_site) {
-            (None, None, None, None) => answer,
+        let ours = answer.and_then(|id| {
+            let found = self.menu_actions.iter().position(|(i, _)| *i == id);
+            found.map(|at| self.menu_actions.swap_remove(at).1)
+        });
+        self.menu_actions.clear();
+        let for_shell = match (&pin, &new_tab, &plugin, &edit_site, &ours) {
+            (None, None, None, None, None) => answer,
             _ => None,
         };
 
@@ -2148,6 +2620,11 @@ impl NeutronApp {
         if let Some(reference) = plugin {
             let ctx = ctx.clone();
             self.run_plugin(&ctx, &reference);
+        }
+
+        if let Some(action) = ours {
+            let ctx = ctx.clone();
+            self.apply(&ctx, action);
         }
     }
 
@@ -2400,6 +2877,7 @@ impl eframe::App for NeutronApp {
         // Before drawing: installs icons that arrived since the last frame, so
         // rows painted below pick them up immediately rather than a frame late.
         self.pump_archive_job();
+        self.pump_transfers();
         self.pump_plugin(&ctx);
         self.pump_download();
         self.pump_remote_job();
@@ -2426,6 +2904,12 @@ impl eframe::App for NeutronApp {
         self.context_menu_overlay(&ctx, &p);
 
         self.keyboard(&ctx, &mut actions);
+        // Quick Look: a request from the menu's worker, and arrows pressed
+        // while the panel had the keyboard.
+        neutron_shell::quicklook::pump();
+        for delta in neutron_shell::quicklook::take_moves() {
+            actions.push(Action::MoveCursor { delta, extend: false });
+        }
 
         // Before every other panel: it claims the top strip, and the rest
         // lay out inside what is left.
@@ -2452,6 +2936,7 @@ impl eframe::App for NeutronApp {
         // Last of all: a question is answered before anything underneath it is
         // touched, and its scrim has to cover the overlays too.
         self.confirm_overlay(ui, &p);
+        self.clash_overlay(ui, &p);
 
 
         // Queued *after* drawing so a `DropTab` pushed by a tab strip this
@@ -2469,10 +2954,15 @@ impl eframe::App for NeutronApp {
         for action in actions {
             self.apply(&ctx, action);
         }
+        self.quick_look_follow();
 
         self.startup.mark_frame(frame_started.elapsed());
     }
 }
+
+/// What the Quick Look panel was given: the tab, its cursor, and how many
+/// items — enough to tell when the panel has to follow.
+type QuickLookKey = (TabId, Option<usize>, usize);
 
 /// Whether the preview pane was showing when the last session was saved.
 ///
@@ -2543,7 +3033,18 @@ impl NeutronApp {
                 PlacesUpdate::Wsl(distros) => self.wsl = distros,
                 PlacesUpdate::Shell(roots) => self.shell_roots = roots,
                 PlacesUpdate::Drive(place) => self.drives.push(place),
-                PlacesUpdate::Done => self.scanning_drives = false,
+                PlacesUpdate::Ejectable(path) => {
+                    self.ejectable.insert(path);
+                }
+                PlacesUpdate::DrivesReset => {
+                    self.drives.clear();
+                    self.ejectable.clear();
+                    self.scanning_drives = true;
+                }
+                PlacesUpdate::Done => {
+                    self.scanning_drives = false;
+                    self.leave_missing_volumes();
+                }
             }
         }
     }
@@ -2654,7 +3155,7 @@ impl NeutronApp {
 
         // Nor while a question is open. A key that moved the selection would
         // change what the dialog's button acts on, after the dialog counted it.
-        if self.confirm.is_some() {
+        if self.confirm.is_some() || !self.clash_questions.is_empty() {
             return;
         }
 
@@ -2676,7 +3177,13 @@ impl NeutronApp {
                 if let egui::Event::Text(text) = event {
                     if !ctrl && !alt {
                         if let Some(c) = text.chars().next() {
-                            if !c.is_control() {
+                            // Space is Quick Look on the Mac — except partway
+                            // through typing a name that has a space in it.
+                            let typing = !self.type_ahead.is_empty()
+                                && self.type_ahead_at.is_some_and(|t| t.elapsed() <= TYPE_AHEAD_TIMEOUT);
+                            if c == ' ' && cfg!(target_os = "macos") && !typing {
+                                actions.push(Action::QuickLookSelection);
+                            } else if !c.is_control() {
                                 actions.push(Action::TypeAhead(c));
                             }
                         }
@@ -2764,9 +3271,90 @@ impl NeutronApp {
                 bindings.push((egui::Key::H, Action::ToggleHidden));
             }
 
-            if ctrl {
+            // The Finder's layout, where it differs from the one above: the
+            // views on Cmd+1–3, Duplicate on Cmd+D, the Go menu's folders, tabs
+            // on Cmd+Shift+[ and ], Return to rename. Worked out first so the
+            // shared table can stand aside for the keys it claims.
+            let mac = cfg!(target_os = "macos") && i.modifiers.command;
+            if mac {
+                let control = i.modifiers.ctrl;
+                let pressed = |k: egui::Key| i.key_pressed(k);
+                let mut go = |action: Action| actions.push(action);
+                if shift && !alt {
+                    for (key, name) in [
+                        (egui::Key::H, "Home"),
+                        (egui::Key::D, "Desktop"),
+                        (egui::Key::O, "Documents"),
+                        (egui::Key::A, "Applications"),
+                    ] {
+                        if pressed(key) {
+                            go(Action::GoKnown(name));
+                        }
+                    }
+                    if pressed(egui::Key::G) {
+                        go(Action::ToggleAddress);
+                    }
+                    // Shifted, a bracket arrives as a brace on most layouts.
+                    if pressed(egui::Key::CloseBracket) || pressed(egui::Key::CloseCurlyBracket) {
+                        go(Action::CycleTab(1));
+                    }
+                    if pressed(egui::Key::OpenBracket) || pressed(egui::Key::OpenCurlyBracket) {
+                        go(Action::CycleTab(-1));
+                    }
+                }
+                if alt && !shift && pressed(egui::Key::L) {
+                    go(Action::GoKnown("Downloads"));
+                }
+                if alt && pressed(egui::Key::Backspace) {
+                    go(Action::Ask(Box::new(Action::Delete { permanent: true })));
+                }
+                if !shift && !alt && !control {
+                    for (key, view) in [
+                        (egui::Key::Num1, file_list::ViewMode::Grid),
+                        (egui::Key::Num2, file_list::ViewMode::List),
+                        (egui::Key::Num3, file_list::ViewMode::Columns),
+                    ] {
+                        if pressed(key) {
+                            go(Action::SetView(view));
+                        }
+                    }
+                    if pressed(egui::Key::D) {
+                        go(Action::Duplicate);
+                    }
+                    if pressed(egui::Key::K) {
+                        go(Action::OpenConnect);
+                    }
+                    if pressed(egui::Key::Y) {
+                        go(Action::QuickLookSelection);
+                    }
+                    if pressed(egui::Key::E) {
+                        go(Action::EjectCurrent);
+                    }
+                    if pressed(egui::Key::I) {
+                        go(Action::GetInfoSelection);
+                    }
+                }
+                // Control-Command-T: the Finder's "Add to Sidebar".
+                if control && pressed(egui::Key::T) {
+                    go(Action::TogglePin);
+                }
+            }
+            // Control-Tab through the tabs, as in every tabbed Mac app.
+            if cfg!(target_os = "macos") && i.modifiers.ctrl && !i.modifiers.command && i.key_pressed(egui::Key::Tab) {
+                actions.push(Action::CycleTab(if shift { -1 } else { 1 }));
+            }
+
+            if mac && !(shift || alt || i.modifiers.ctrl) {
                 bindings.extend([
                     (egui::Key::A, Action::SelectAll),
+                    (egui::Key::R, Action::Refresh),
+                    (egui::Key::W, Action::CloseActiveTab),
+                ]);
+            }
+
+            // Everywhere but the Mac, whose layout is the block above.
+            if ctrl && !cfg!(target_os = "macos") {
+                bindings.extend([
                     (
                         // Ctrl+L is the address bar, as it is in every browser
                         // and in Explorer. Shift escalates to the view toggle,
@@ -2832,11 +3420,8 @@ impl NeutronApp {
                 }
 
                 // Ctrl+` for the terminal, as in the editor this is most often
-                // sitting beside. The real Control key on the Mac, where Cmd+`
-                // is the system's own "next window" and never arrives here.
-                if !cfg!(target_os = "macos") || (i.modifiers.ctrl && !i.modifiers.command) {
-                    bindings.push((egui::Key::Backtick, Action::OpenTerminal));
-                }
+                // sitting beside.
+                bindings.push((egui::Key::Backtick, Action::OpenTerminal));
 
                 if let Some(group) = self.workspace.focused_group().map(|g| g.id) {
                     bindings.push((egui::Key::T, Action::NewTab(group)));
@@ -2861,18 +3446,51 @@ impl NeutronApp {
                 }
             }
 
+            // What the Mac keeps of the table above, with Command.
+            if mac && !alt && !i.modifiers.ctrl {
+                bindings.extend([
+                    (egui::Key::L, if shift { Action::ToggleView } else { Action::ToggleAddress }),
+                    (egui::Key::F, if shift { Action::ToggleFinder(Mode::Everything) } else { Action::FocusFilter }),
+                    (egui::Key::P, Action::ToggleFinder(if shift { Mode::Commands } else { Mode::Files })),
+                    (egui::Key::Backslash, Action::Split(if shift { Axis::Vertical } else { Axis::Horizontal })),
+                    (egui::Key::N, if shift { Action::NewFolder } else { Action::NewWindow }),
+                ]);
+                if !shift {
+                    if let Some(group) = self.workspace.focused_group().map(|g| g.id) {
+                        bindings.push((egui::Key::T, Action::NewTab(group)));
+                    }
+                }
+            }
+            // The real Control key for the terminal on the Mac, where Cmd+` is
+            // the system's own "next window" and never arrives here.
+            if cfg!(target_os = "macos") && i.modifiers.ctrl && !i.modifiers.command {
+                bindings.push((egui::Key::Backtick, Action::OpenTerminal));
+            }
+
             // The Finder's navigation keys: Cmd+Up to the enclosing folder,
             // Cmd+Down into the one under the cursor, Cmd+[ and Cmd+] through
             // history. They replace plain Up and Down while Command is held,
             // where the table above would otherwise also move the cursor.
             let finder_keys = cfg!(target_os = "macos") && i.modifiers.command && !alt;
-            let mut open_cursor = i.key_pressed(egui::Key::Enter);
+            // On the Mac, Return renames and Command-O or Command-Down opens,
+            // as in the Finder.
+            let mut open_cursor = if cfg!(target_os = "macos") {
+                if i.key_pressed(egui::Key::Enter) && !i.modifiers.command && !alt {
+                    actions.push(Action::BeginRename);
+                }
+                false
+            } else {
+                i.key_pressed(egui::Key::Enter)
+            };
             if finder_keys {
                 bindings.retain(|(key, _)| !matches!(key, egui::Key::ArrowUp | egui::Key::ArrowDown));
                 bindings.push((egui::Key::ArrowUp, Action::Up));
-                bindings.push((egui::Key::OpenBracket, Action::Back));
-                bindings.push((egui::Key::CloseBracket, Action::Forward));
+                if !shift {
+                    bindings.push((egui::Key::OpenBracket, Action::Back));
+                    bindings.push((egui::Key::CloseBracket, Action::Forward));
+                }
                 open_cursor |= i.key_pressed(egui::Key::ArrowDown);
+                open_cursor |= !shift && i.key_pressed(egui::Key::O);
             }
 
             if open_cursor {
@@ -3153,6 +3771,12 @@ impl NeutronApp {
                 })
             }
 
+            Action::EmptyTrash => Some(crate::confirm::Confirm {
+                title: "Empty the Trash?".into(),
+                body: "Everything in the Trash will be deleted permanently. This cannot be undone.".into(),
+                proceed: "Empty Trash".into(),
+            }),
+
             Action::ForgetServer => {
                 let (site, _) = self.workspace.active_tab()?.location().as_remote()?;
                 let name = self
@@ -3232,15 +3856,37 @@ impl NeutronApp {
             items.push(neutron_core::MenuItem::separator());
             items.push(neutron_core::MenuItem {
                 id: MENU_ID_PIN,
-                label: if pinned {
-                    "Unpin from Quick access".to_owned()
-                } else {
-                    "Pin to Quick access".to_owned()
-                },
-                accel: neutron_ui::format::shortcut("Ctrl+Shift+D"),
+                label: pin_label(pinned, None),
+                accel: neutron_ui::format::shortcut(if cfg!(target_os = "macos") { "Control+Cmd+T" } else { "Ctrl+Shift+D" }),
                 enabled: true,
                 ..Default::default()
             });
+        }
+
+        // Neutron's own verbs for particular rows.
+        self.menu_actions.clear();
+        if let Some(path) = id.as_path() {
+            if self.ejectable.contains(path) {
+                items.push(neutron_core::MenuItem::separator());
+                items.push(neutron_core::MenuItem {
+                    id: MENU_ID_EJECT,
+                    label: format!("Eject {}", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
+                    accel: neutron_ui::format::shortcut("Cmd+E"),
+                    enabled: true,
+                    ..Default::default()
+                });
+                self.menu_actions.push((MENU_ID_EJECT, Action::Eject(path.to_path_buf())));
+            }
+            if Some(path) == trash_folder().as_deref() {
+                items.push(neutron_core::MenuItem::separator());
+                items.push(neutron_core::MenuItem {
+                    id: MENU_ID_EMPTY_TRASH,
+                    label: "Empty Trash…".to_owned(),
+                    enabled: true,
+                    ..Default::default()
+                });
+                self.menu_actions.push((MENU_ID_EMPTY_TRASH, Action::Ask(Box::new(Action::EmptyTrash))));
+            }
         }
 
         // A saved server can be edited from its own row: its password, how it
@@ -3292,12 +3938,8 @@ impl NeutronApp {
         Some((
             neutron_core::MenuItem {
                 id: MENU_ID_PIN,
-                label: if pinned {
-                    format!("Unpin {name} from Quick access")
-                } else {
-                    format!("Pin {name} to Quick access")
-                },
-                accel: neutron_ui::format::shortcut("Ctrl+Shift+D"),
+                label: pin_label(pinned, Some(&name)),
+                accel: neutron_ui::format::shortcut(if cfg!(target_os = "macos") { "Control+Cmd+T" } else { "Ctrl+Shift+D" }),
                 enabled: true,
                 ..Default::default()
             },
@@ -3321,7 +3963,8 @@ impl NeutronApp {
             // Refused rather than dropping the oldest: that would lose a pin
             // the user made on purpose, and say nothing about it.
             self.notices.info(format!(
-                "Quick access holds {} folders — unpin one first",
+                "{} holds {} folders — remove one first",
+                if cfg!(target_os = "macos") { "The sidebar" } else { "Quick access" },
                 crate::pins::MAX
             ));
             return;
@@ -3331,7 +3974,9 @@ impl NeutronApp {
         // only makes it outlast the session.
         self.pins = pins.clone();
         self.notices.info(match outcome {
+            crate::pins::Toggled::Pinned if cfg!(target_os = "macos") => format!("Added {name} to the sidebar"),
             crate::pins::Toggled::Pinned => format!("Pinned {name} to Quick access"),
+            _ if cfg!(target_os = "macos") => format!("Removed {name} from the sidebar"),
             _ => format!("Unpinned {name}"),
         });
 
@@ -3682,6 +4327,7 @@ impl NeutronApp {
             C::NewFolder => Some(Action::NewFolder),
             C::Extract => Some(Action::ExtractSelection),
             C::Compress => Some(Action::CompressSelection),
+            C::Duplicate => Some(Action::Duplicate),
             C::DeleteSelection => Some(Action::Delete { permanent: false }),
 
             C::ToggleHidden => Some(Action::ToggleHidden),
@@ -3831,6 +4477,7 @@ impl NeutronApp {
     fn has_status(&self) -> bool {
         self.notices.current().is_some()
             || self.archive_job.is_some()
+            || !self.transfers.is_empty()
             || self.plugins.running_label().is_some()
             || self.download.is_some()
             || self.remote_job.is_some()
@@ -3880,6 +4527,7 @@ impl NeutronApp {
                             self.download_status(ui, p, actions);
                             self.plugin_status(ui, p, actions);
                             self.archive_status(ui, p, actions);
+                            self.transfer_status(ui, p, actions);
                         });
                     });
             });
@@ -5021,13 +5669,39 @@ impl NeutronApp {
                 match sidebar::row(ui, p, &dashboard, current) {
                         sidebar::RowHit::Open => actions.push(Action::Navigate(NodeId::Home)),
                         sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(dashboard.id.clone(), at)),
-                        sidebar::RowHit::None => {}
+                        sidebar::RowHit::None | sidebar::RowHit::Eject => {}
                 }
                 for place in &self.known_folders {
                     match sidebar::row(ui, p, place, current) {
                             sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
                             sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
-                            sidebar::RowHit::None => {}
+                            sidebar::RowHit::None | sidebar::RowHit::Eject => {}
+                    }
+                }
+                // The Mac's own two: AirDrop, which is the Finder's window,
+                // and the Trash, browsed here like any folder.
+                if cfg!(target_os = "macos") {
+                    let airdrop = Place {
+                        name: "AirDrop".to_owned(),
+                        id: NodeId::shell("neutron:airdrop", "AirDrop"),
+                        kind: neutron_core::places::PlaceKind::KnownFolder,
+                        capacity: None,
+                    };
+                    if matches!(sidebar::row(ui, p, &airdrop, current), sidebar::RowHit::Open) {
+                        actions.push(Action::OpenAirDrop);
+                    }
+                    if let Some(trash) = trash_folder() {
+                        let place = Place {
+                            name: "Trash".to_owned(),
+                            id: NodeId::path(&trash),
+                            kind: neutron_core::places::PlaceKind::KnownFolder,
+                            capacity: None,
+                        };
+                        match sidebar::row(ui, p, &place, current) {
+                            sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
+                            sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
+                            sidebar::RowHit::None | sidebar::RowHit::Eject => {}
+                        }
                     }
                 }
 
@@ -5044,7 +5718,7 @@ impl NeutronApp {
                         match sidebar::row(ui, p, place, current) {
                                 sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
                                 sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
-                                sidebar::RowHit::None => {}
+                                sidebar::RowHit::None | sidebar::RowHit::Eject => {}
                         }
                     }
                 }
@@ -5055,7 +5729,7 @@ impl NeutronApp {
                         match sidebar::row(ui, p, place, current) {
                                 sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
                                 sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
-                                sidebar::RowHit::None => {}
+                                sidebar::RowHit::None | sidebar::RowHit::Eject => {}
                         }
                     }
                 }
@@ -5063,9 +5737,16 @@ impl NeutronApp {
                 // Everywhere files live: the disks, the cloud, the servers.
                 sidebar::section(ui, p, "Locations");
                 for drive in &self.drives {
-                    match sidebar::row(ui, p, drive, current) {
+                    let path = drive.id.as_path();
+                    let ejectable = path.is_some_and(|p| self.ejectable.contains(p));
+                    match sidebar::drive_row(ui, p, drive, current, ejectable) {
                             sidebar::RowHit::Open => actions.push(Action::Navigate(drive.id.clone())),
                             sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(drive.id.clone(), at)),
+                            sidebar::RowHit::Eject => {
+                                if let Some(path) = path {
+                                    actions.push(Action::Eject(path.to_path_buf()));
+                                }
+                            }
                             sidebar::RowHit::None => {}
                     }
                 }
@@ -5082,7 +5763,7 @@ impl NeutronApp {
                     match sidebar::row(ui, p, place, current) {
                             sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
                             sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
-                            sidebar::RowHit::None => {}
+                            sidebar::RowHit::None | sidebar::RowHit::Eject => {}
                     }
                 }
                 use neutron_cloud::google::DriveState;
@@ -5101,7 +5782,7 @@ impl NeutronApp {
                         match sidebar::row(ui, p, &place, current) {
                                 sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
                                 sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
-                                sidebar::RowHit::None => {}
+                                sidebar::RowHit::None | sidebar::RowHit::Eject => {}
                         }
                     }
                     DriveState::SignedOut => {
@@ -5148,7 +5829,7 @@ impl NeutronApp {
                     match sidebar::row(ui, p, &place, current) {
                             sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
                             sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
-                            sidebar::RowHit::None => {}
+                            sidebar::RowHit::None | sidebar::RowHit::Eject => {}
                     }
                 }
                 if let Some(reason) = &self.sites_error {
@@ -5173,7 +5854,7 @@ impl NeutronApp {
                         match sidebar::row(ui, p, place, current) {
                                 sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
                                 sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
-                                sidebar::RowHit::None => {}
+                                sidebar::RowHit::None | sidebar::RowHit::Eject => {}
                         }
                     }
                 }
@@ -5387,6 +6068,20 @@ impl NeutronApp {
                 ui.add_space(40.0);
                 ui.colored_label(p.danger, "Could not open this location");
                 ui.colored_label(p.text_muted, e.as_str());
+                // macOS keeps the Trash from apps until they are given Full
+                // Disk Access, and the error alone does not say so.
+                if tab.location().as_path() == trash_folder().as_deref() {
+                    ui.add_space(10.0);
+                    ui.colored_label(
+                        p.text_muted,
+                        "macOS shows the Trash only to apps with Full Disk Access. Turn it on for Neutron in \
+                         System Settings, then come back here.",
+                    );
+                    ui.add_space(6.0);
+                    if ui.button("Open Full Disk Access settings").clicked() {
+                        actions.push(Action::OpenFullDiskAccess);
+                    }
+                }
                 // On a server most of what goes wrong is fixed in its settings
                 // — a password that was never saved, a certificate to trust,
                 // a changed port — so the way there is right under the error.
@@ -6096,6 +6791,26 @@ fn interface_faces() -> Option<theme::Faces> {
     system.map(|regular| theme::Faces { regular, strong: None, fallback: None })
 }
 
+/// The user's Trash folder.
+fn trash_folder() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".Trash"))
+}
+
+/// The menu wording for pinning: the Mac calls the list the sidebar.
+fn pin_label(pinned: bool, name: Option<&str>) -> String {
+    let (add, remove, list) = if cfg!(target_os = "macos") {
+        ("Add", "Remove", "Sidebar")
+    } else {
+        ("Pin", "Unpin", "Quick access")
+    };
+    match (pinned, name) {
+        (false, Some(name)) => format!("{add} {name} to {list}"),
+        (true, Some(name)) => format!("{remove} {name} from {list}"),
+        (false, None) => format!("{add} to {list}"),
+        (true, None) => format!("{remove} from {list}"),
+    }
+}
+
 /// A folder's path as a person writes it: under the home folder, `~/…`.
 pub(crate) fn tidy_location(dir: &Path) -> String {
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -6182,14 +6897,47 @@ fn spawn_places_discovery(ctx: egui::Context) -> crossbeam_channel::Receiver<Pla
                 ctx.request_repaint();
             }
 
-            neutron_shell::places::drives_streaming(|place| {
-                if tx.send(PlacesUpdate::Drive(place)).is_ok() {
-                    ctx.request_repaint();
-                }
-            });
+            let scan = |tx: &crossbeam_channel::Sender<PlacesUpdate>| {
+                neutron_shell::places::drives_streaming(|place| {
+                    let path = place.id.as_path().map(Path::to_path_buf);
+                    if tx.send(PlacesUpdate::Drive(place)).is_ok() {
+                        ctx.request_repaint();
+                    }
+                    if let Some(path) = path.filter(|p| neutron_shell::places::ejectable(p)) {
+                        let _ = tx.send(PlacesUpdate::Ejectable(path));
+                    }
+                });
+                let _ = tx.send(PlacesUpdate::Done);
+                ctx.request_repaint();
+            };
+            scan(&tx);
 
-            let _ = tx.send(PlacesUpdate::Done);
-            ctx.request_repaint();
+            // Then watch for disks coming and going. A look at the names in
+            // /Volumes every two seconds costs nothing, and catches a stick
+            // plugged in, an image mounted, or a disk ejected from the Finder
+            // — none of which says anything to this process otherwise.
+            if !cfg!(target_os = "macos") {
+                return;
+            }
+            let names = || -> Vec<std::ffi::OsString> {
+                let mut names: Vec<_> = std::fs::read_dir("/Volumes")
+                    .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
+                    .unwrap_or_default();
+                names.sort();
+                names
+            };
+            let mut seen = names();
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                let now = names();
+                if now != seen {
+                    seen = now;
+                    if tx.send(PlacesUpdate::DrivesReset).is_err() {
+                        return;
+                    }
+                    scan(&tx);
+                }
+            }
         })
         .expect("failed to spawn places thread");
 
@@ -6309,6 +7057,15 @@ mod screens {
         harness.state_mut().menu = None;
         harness.state_mut().menu_reply = None;
 
+        // The folder's own menu, with nothing selected.
+        act(&mut harness, Action::ClearSelection);
+        act(&mut harness, Action::ContextMenu { idx: None, pos: egui::pos2(760.0, 300.0) });
+        settle(&mut harness);
+        shoot(&mut harness, &out, "menu-folder.png");
+        harness.state_mut().menu = None;
+        harness.state_mut().menu_reply = None;
+        act(&mut harness, Action::Select { idx, mode: SelectMode::Replace });
+
         act(&mut harness, Action::ToggleFinder(crate::finder::Mode::Files));
         settle(&mut harness);
         shoot(&mut harness, &out, "finder.png");
@@ -6325,6 +7082,25 @@ mod screens {
         settle(&mut harness);
         shoot(&mut harness, &out, "confirm.png");
         harness.state_mut().confirm = None;
+
+        // A question about clashing names. Nothing is transferred: the
+        // request names no files, and the question is cleared unanswered.
+        {
+            let app = harness.state_mut();
+            let tab = app.workspace.active_tab_id().unwrap();
+            app.clash_questions.push_back(crate::transfers::Question {
+                request: crate::transfers::Request {
+                    tab,
+                    paths: vec![],
+                    destination: PathBuf::from("/Users/someone/Downloads"),
+                    how: neutron_shell::fileops::Transfer::Copy,
+                },
+                names: vec!["report.pdf".into(), "notes.md".into(), "photo.heic".into()],
+            });
+        }
+        settle(&mut harness);
+        shoot(&mut harness, &out, "clash.png");
+        harness.state_mut().clash_questions.clear();
 
         act(&mut harness, Action::OpenConnect);
         settle(&mut harness);
