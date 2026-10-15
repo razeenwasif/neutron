@@ -22,6 +22,7 @@ mod address;
 mod app;
 mod archive_ops;
 mod archives;
+mod batch_rename;
 mod bench;
 #[cfg_attr(target_os = "macos", path = "chrome_macos.rs")]
 mod chrome;

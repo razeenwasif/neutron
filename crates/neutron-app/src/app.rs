@@ -119,6 +119,8 @@ enum Action {
     EditTags,
     /// Give these items exactly these tags.
     SetTags(Vec<PathBuf>, Vec<String>),
+    /// Rename each `(old, new)` in the folder, as one undoable change.
+    BatchRename(PathBuf, Vec<(String, String)>),
     /// Go to the folder `.0` is in, with it selected.
     ShowInFolder(PathBuf),
     /// Reverse the last change to files.
@@ -583,6 +585,7 @@ pub struct NeutronApp {
     /// can be found and put straight into a rename box.
     pending_rename: Option<(TabId, String)>,
     tag_editor: Option<TagEditor>,
+    batch_rename: Option<BatchRenameDialog>,
     /// Folder names as they are created, from the apartment thread that made
     /// them.
     created_tx: crossbeam_channel::Sender<(TabId, String)>,
@@ -882,6 +885,7 @@ impl NeutronApp {
             renames_started: 0,
             pending_rename: None,
             tag_editor: None,
+            batch_rename: None,
             created_tx,
             created_rx,
             cut_dir: None,
@@ -1112,10 +1116,11 @@ impl NeutronApp {
             }
             Action::BeginRename if self.on_server() => self.begin_rename(ctx),
             Action::BeginRename => {
-                if !self.refuse_without_a_path("rename anything in") {
+                if !self.refuse_without_a_path("rename anything in") && !self.begin_batch_rename() {
                     self.begin_rename(ctx);
                 }
             }
+            Action::BatchRename(dir, pairs) => self.batch_rename(dir, pairs),
             Action::RenameTyped(text) => {
                 if let Some(r) = self.rename.as_mut() {
                     r.text = text;
@@ -2547,6 +2552,166 @@ impl NeutronApp {
         self.transfers.push(job);
     }
 
+    /// Opens Rename Items when more than one item is selected in a folder.
+    /// Whether it did.
+    fn begin_batch_rename(&mut self) -> bool {
+        let Some(tab) = self.workspace.active_tab() else { return false };
+        let Some(dir) = tab.location().as_path().map(Path::to_path_buf) else { return false };
+        let selected = visible_selection(tab);
+        if selected.len() < 2 {
+            return false;
+        }
+        let items = selected
+            .into_iter()
+            .map(|i| {
+                let name = tab.list.name(i).to_owned();
+                let is_dir = tab.list.kind(i).is_container() && !crate::columns::is_package(Path::new(&name));
+                (name, is_dir)
+            })
+            .collect();
+        self.batch_rename = Some(BatchRenameDialog {
+            dir,
+            items,
+            mode: 0,
+            find: String::new(),
+            with: String::new(),
+            text: String::new(),
+            after: true,
+            base: String::new(),
+            start: "1".into(),
+            focused: false,
+        });
+        true
+    }
+
+    /// Renames the items on a worker and records the change for undo.
+    fn batch_rename(&mut self, dir: PathBuf, pairs: Vec<(String, String)>) {
+        let notices = self.notice_tx.clone();
+        let undo = self.undo_tx.clone();
+        let done_tx = self.refresh_tx.clone();
+        let tab = self.workspace.active_tab_id();
+        let wake = self.ctx.clone();
+        tracing::info!(dir = %dir.display(), count = pairs.len(), "batch rename");
+        self.sta.submit(move || {
+            let (done, failed) = crate::batch_rename::carry_out(&dir, &pairs);
+            if !failed.is_empty() {
+                report(&notices, format!("Not renamed — {}", failed.join("; ")));
+            } else if !done.is_empty() {
+                let n = done.len();
+                report_info(&notices, format!("Renamed {n} item{}", if n == 1 { "" } else { "s" }));
+            }
+            let _ = undo.send(UndoEvent::Did(crate::undo::Record {
+                label: "Rename".into(),
+                step: crate::undo::Step::Relocated(done),
+            }));
+            if let Some(tab) = tab {
+                let _ = done_tx.send(tab);
+            }
+            wake.request_repaint();
+        });
+    }
+
+    /// The Rename Items dialog, when it is open: a rule, and what it would
+    /// make of the first few names.
+    fn batch_rename_overlay(&mut self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
+        let Some(dialog) = self.batch_rename.as_mut() else { return };
+        let screen = ui.ctx().content_rect();
+        ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(90));
+        let _ = ui.allocate_rect(screen, egui::Sense::click());
+        let mut outcome: Option<bool> = None;
+        let pairs = dialog.pairs();
+        let changes = pairs.iter().any(|(old, new)| old != new);
+        let problem = crate::batch_rename::problem(&pairs.iter().map(|(_, new)| new.clone()).collect::<Vec<_>>());
+        let ready = changes && problem.is_none();
+        egui::Area::new(egui::Id::new("neutron-batch-rename"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                theme::popover(p)
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
+                    .inner_margin(egui::Margin::symmetric(20, 18))
+                    .show(ui, |ui| {
+                        ui.set_width(420.0);
+                        let title = format!("Rename {} Items", dialog.items.len());
+                        ui.label(egui::RichText::new(title).font(theme::strong(ui.ctx(), 15.0)).color(p.text));
+                        ui.add_space(10.0);
+                        let before = dialog.mode;
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut dialog.mode, 0, "Replace Text");
+                            ui.selectable_value(&mut dialog.mode, 1, "Add Text");
+                            ui.selectable_value(&mut dialog.mode, 2, "Format");
+                        });
+                        if dialog.mode != before {
+                            dialog.focused = false;
+                        }
+                        ui.add_space(8.0);
+                        let first = match dialog.mode {
+                            0 => {
+                                let find = ui.add(egui::TextEdit::singleline(&mut dialog.find).hint_text("Find").desired_width(f32::INFINITY));
+                                ui.add(egui::TextEdit::singleline(&mut dialog.with).hint_text("Replace with").desired_width(f32::INFINITY));
+                                find
+                            }
+                            1 => {
+                                let text = ui.add(egui::TextEdit::singleline(&mut dialog.text).hint_text("Text to add").desired_width(f32::INFINITY));
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(&mut dialog.after, false, "Before name");
+                                    ui.radio_value(&mut dialog.after, true, "After name");
+                                });
+                                text
+                            }
+                            _ => {
+                                let base = ui.add(egui::TextEdit::singleline(&mut dialog.base).hint_text("Name, as in \"Holiday\"").desired_width(f32::INFINITY));
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Start numbers at").color(p.text_muted));
+                                    ui.add(egui::TextEdit::singleline(&mut dialog.start).desired_width(60.0));
+                                });
+                                base
+                            }
+                        };
+                        if !dialog.focused {
+                            first.request_focus();
+                            dialog.focused = true;
+                        }
+                        ui.add_space(10.0);
+                        for (old, new) in pairs.iter().take(4) {
+                            ui.label(egui::RichText::new(format!("{old}  →  {new}")).size(12.0).color(p.text_muted));
+                        }
+                        if pairs.len() > 4 {
+                            ui.label(egui::RichText::new(format!("and {} more", pairs.len() - 4)).size(12.0).color(p.text_muted));
+                        }
+                        if let Some(problem) = &problem {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(problem).size(12.0).color(p.danger));
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) && ready {
+                            outcome = Some(true);
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            outcome = Some(false);
+                        }
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                outcome = Some(false);
+                            }
+                            if ui.add_enabled(ready, egui::Button::new("Rename")).clicked() {
+                                outcome = Some(true);
+                            }
+                        });
+                    });
+            });
+        match outcome {
+            Some(true) => {
+                if let Some(dialog) = self.batch_rename.take() {
+                    let pairs = dialog.pairs();
+                    actions.push(Action::BatchRename(dialog.dir, pairs));
+                }
+            }
+            Some(false) => self.batch_rename = None,
+            None => {}
+        }
+    }
+
     /// The Edit Tags dialog, when it is open: tag names, separated by commas.
     fn tag_editor_overlay(&mut self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
         let Some(editor) = self.tag_editor.as_mut() else { return };
@@ -2814,6 +2979,9 @@ impl NeutronApp {
             rows.push(row(hidden, Action::ToggleHidden, &mut actions));
         } else {
             let paths: Vec<PathBuf> = selected.iter().map(|&i| dir.join(tab.list.name(i))).collect();
+            if selected.len() > 1 {
+                rows.push(row(&format!("Rename {} Items…", selected.len()), Action::BeginRename, &mut actions));
+            }
             if let [only] = selected.as_slice() {
                 let path = dir.join(tab.list.name(*only));
                 rows.push(row("Rename", Action::BeginRename, &mut actions));
@@ -3017,6 +3185,7 @@ impl NeutronApp {
             || self.menu.is_some()
             || self.connect.open
             || self.tag_editor.is_some()
+            || self.batch_rename.is_some()
     }
 
     /// What a menu bar item does, now.
@@ -3838,6 +4007,44 @@ struct WindowState {
     rename: Option<RenameEdit>,
     pending_rename: Option<(TabId, String)>,
     tag_editor: Option<TagEditor>,
+    batch_rename: Option<BatchRenameDialog>,
+}
+
+/// The Rename Items dialog: the folder, each item's name and whether it is a
+/// folder, and the rule as typed so far.
+struct BatchRenameDialog {
+    dir: PathBuf,
+    items: Vec<(String, bool)>,
+    /// 0 replaces text, 1 adds text, 2 formats.
+    mode: u8,
+    find: String,
+    with: String,
+    text: String,
+    after: bool,
+    base: String,
+    start: String,
+    focused: bool,
+}
+
+impl BatchRenameDialog {
+    fn rule(&self) -> crate::batch_rename::Rule {
+        use crate::batch_rename::Rule;
+        match self.mode {
+            0 => Rule::Replace { find: self.find.clone(), with: self.with.clone() },
+            1 => Rule::Add { text: self.text.clone(), after: self.after },
+            _ => Rule::Format { base: self.base.clone(), start: self.start.trim().parse().unwrap_or(1) },
+        }
+    }
+
+    /// Each item's name and the name it would get.
+    fn pairs(&self) -> Vec<(String, String)> {
+        let rule = self.rule();
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(i, (name, is_dir))| (name.clone(), crate::batch_rename::apply(&rule, name, i, *is_dir)))
+            .collect()
+    }
 }
 
 /// The Edit Tags dialog: the items, and the names typed so far.
@@ -3876,6 +4083,7 @@ impl WindowState {
             rename: None,
             pending_rename: None,
             tag_editor: None,
+            batch_rename: None,
         }
     }
 }
@@ -4095,6 +4303,7 @@ impl NeutronApp {
         self.confirm_overlay(ui, &p);
         self.clash_overlay(ui, &p);
         self.tag_editor_overlay(ui, &p, &mut actions);
+        self.batch_rename_overlay(ui, &p, &mut actions);
 
         // Queued *after* drawing so a `DropTab` pushed by a tab strip this
         // frame is applied first. Pushed before it, this would clear the drag
@@ -4202,6 +4411,7 @@ impl NeutronApp {
         swap(&mut self.rename, &mut window.rename);
         swap(&mut self.pending_rename, &mut window.pending_rename);
         swap(&mut self.tag_editor, &mut window.tag_editor);
+        swap(&mut self.batch_rename, &mut window.batch_rename);
     }
 
     /// An id for one of a window's own panels. The first window keeps the
