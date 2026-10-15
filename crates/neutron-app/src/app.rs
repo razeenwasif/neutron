@@ -114,7 +114,11 @@ enum Action {
     /// Send the chosen items with AirDrop.
     AirDrop,
     /// Give the chosen items a Finder tag, or take it away.
-    ToggleTag { name: &'static str, on: bool },
+    ToggleTag { color: u8, on: bool },
+    /// Open the Edit Tags dialog on the chosen items.
+    EditTags,
+    /// Give these items exactly these tags.
+    SetTags(Vec<PathBuf>, Vec<String>),
     /// Go to the folder `.0` is in, with it selected.
     ShowInFolder(PathBuf),
     /// Reverse the last change to files.
@@ -574,6 +578,7 @@ pub struct NeutronApp {
     /// A folder just created, waiting for its listing to arrive so the new row
     /// can be found and put straight into a rename box.
     pending_rename: Option<(TabId, String)>,
+    tag_editor: Option<TagEditor>,
     /// Folder names as they are created, from the apartment thread that made
     /// them.
     created_tx: crossbeam_channel::Sender<(TabId, String)>,
@@ -869,6 +874,7 @@ impl NeutronApp {
             rename: None,
             renames_started: 0,
             pending_rename: None,
+            tag_editor: None,
             created_tx,
             created_rx,
             cut_dir: None,
@@ -1149,13 +1155,35 @@ impl NeutronApp {
                     self.notices.error(e);
                 }
             }
-            Action::ToggleTag { name, on } => {
+            Action::EditTags => {
+                let Some(paths) = self.chosen_paths() else { return };
+                // The first item's tags, to start from.
+                let text = paths
+                    .first()
+                    .map(|p| neutron_shell::tags::read(p).into_iter().map(|t| t.name).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default();
+                self.tag_editor = Some(TagEditor { paths, text, focused: false });
+            }
+            Action::SetTags(paths, names) => {
+                let notices = self.notice_tx.clone();
+                let done = self.refresh_tx.clone();
+                let tab = self.workspace.active_tab_id();
+                self.sta.submit(move || {
+                    if let Err(e) = neutron_shell::tags::set_names(&paths, &names) {
+                        report(&notices, format!("The tags could not be set: {e}"));
+                    }
+                    if let Some(tab) = tab {
+                        let _ = done.send(tab);
+                    }
+                });
+            }
+            Action::ToggleTag { color, on } => {
                 let Some(paths) = self.chosen_paths() else { return };
                 let notices = self.notice_tx.clone();
                 let done = self.refresh_tx.clone();
                 let tab = self.workspace.active_tab_id();
                 self.sta.submit(move || {
-                    if let Err(e) = neutron_shell::tags::toggle(&paths, name, on) {
+                    if let Err(e) = neutron_shell::tags::toggle_color(&paths, color, on) {
                         report(&notices, format!("The tag could not be changed: {e}"));
                     }
                     if let Some(tab) = tab {
@@ -2494,6 +2522,74 @@ impl NeutronApp {
         self.transfers.push(job);
     }
 
+    /// The Edit Tags dialog, when it is open: tag names, separated by commas.
+    fn tag_editor_overlay(&mut self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
+        let Some(editor) = self.tag_editor.as_mut() else { return };
+        let screen = ui.ctx().content_rect();
+        ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(90));
+        let _ = ui.allocate_rect(screen, egui::Sense::click());
+        let mut outcome: Option<bool> = None;
+        let count = editor.paths.len();
+        egui::Area::new(egui::Id::new("neutron-tag-editor"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                theme::popover(p)
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
+                    .inner_margin(egui::Margin::symmetric(20, 18))
+                    .show(ui, |ui| {
+                        ui.set_width(380.0);
+                        let title = if count == 1 { "Tags".to_owned() } else { format!("Tags for {count} items") };
+                        ui.label(egui::RichText::new(title).font(theme::strong(ui.ctx(), 15.0)).color(p.text));
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Separate names with commas. A name of a colour tag gets its colour.")
+                                .size(12.0)
+                                .color(p.text_muted),
+                        );
+                        ui.add_space(10.0);
+                        let field = egui::TextEdit::singleline(&mut editor.text)
+                            .hint_text("Red, Work, Receipts")
+                            .desired_width(f32::INFINITY)
+                            .show(ui);
+                        if !editor.focused {
+                            field.response.request_focus();
+                            editor.focused = true;
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            outcome = Some(true);
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            outcome = Some(false);
+                        }
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                outcome = Some(false);
+                            }
+                            if ui.button("Set Tags").clicked() {
+                                outcome = Some(true);
+                            }
+                        });
+                    });
+            });
+        match outcome {
+            Some(true) => {
+                if let Some(editor) = self.tag_editor.take() {
+                    let names: Vec<String> = editor
+                        .text
+                        .split(',')
+                        .map(|n| n.trim().to_owned())
+                        .filter(|n| !n.is_empty())
+                        .collect();
+                    actions.push(Action::SetTags(editor.paths, names));
+                }
+            }
+            Some(false) => self.tag_editor = None,
+            None => {}
+        }
+    }
+
     /// The question about clashing names, when there is one.
     fn clash_overlay(&mut self, ui: &mut egui::Ui, p: &Palette) {
         // One question at a time, and never over the delete confirmation.
@@ -2713,13 +2809,16 @@ impl NeutronApp {
                 rows.push(row("Make Alias", Action::MakeAlias(paths), &mut actions));
                 // Ticked where every selected item has the tag.
                 let bits: Vec<u8> = selected.iter().map(|&i| tab.list.tag_colors(i)).collect();
-                let children = neutron_shell::tags::COLORS
+                let mut children: Vec<MenuItem> = neutron_shell::tags::COLORS
                     .iter()
-                    .map(|&(name, color)| {
+                    .map(|&(_, color)| {
                         let all = bits.iter().all(|b| b & (1 << (color - 1)) != 0);
-                        MenuItem { checked: all, ..row(name, Action::ToggleTag { name, on: !all }, &mut actions) }
+                        let name = neutron_shell::tags::color_name(color);
+                        MenuItem { checked: all, ..row(&name, Action::ToggleTag { color, on: !all }, &mut actions) }
                     })
                     .collect();
+                children.push(MenuItem::separator());
+                children.push(row("Edit Tags…", Action::EditTags, &mut actions));
                 rows.push(MenuItem { label: "Tags".into(), enabled: true, children, ..Default::default() });
             }
         }
@@ -2823,15 +2922,19 @@ impl NeutronApp {
             .active_tab()
             .map(|t| visible_selection(t).into_iter().map(|i| t.list.tag_colors(i)).collect())
             .unwrap_or_default();
-        let children = neutron_shell::tags::COLORS
+        let mut children: Vec<MenuItem> = neutron_shell::tags::COLORS
             .iter()
-            .map(|&(name, color)| {
+            .map(|&(_, color)| {
                 let all = !bits.is_empty() && bits.iter().all(|b| b & (1 << (color - 1)) != 0);
                 *next += 1;
-                self.menu_actions.push((*next, Action::ToggleTag { name, on: !all }));
-                MenuItem { id: *next, label: name.to_owned(), enabled: true, checked: all, ..Default::default() }
+                self.menu_actions.push((*next, Action::ToggleTag { color, on: !all }));
+                MenuItem { id: *next, label: neutron_shell::tags::color_name(color), enabled: true, checked: all, ..Default::default() }
             })
             .collect();
+        *next += 1;
+        self.menu_actions.push((*next, Action::EditTags));
+        children.push(MenuItem::separator());
+        children.push(MenuItem { id: *next, label: "Edit Tags…".into(), enabled: true, ..Default::default() });
         MenuItem { label: "Tags".into(), enabled: true, children, ..Default::default() }
     }
 
@@ -2879,7 +2982,11 @@ impl NeutronApp {
     /// Whether a question or a menu has the window: keys and menu commands
     /// wait until it is answered.
     fn modal(&self) -> bool {
-        self.confirm.is_some() || !self.clash_questions.is_empty() || self.menu.is_some() || self.connect.open
+        self.confirm.is_some()
+            || !self.clash_questions.is_empty()
+            || self.menu.is_some()
+            || self.connect.open
+            || self.tag_editor.is_some()
     }
 
     /// What a menu bar item does, now.
@@ -3700,6 +3807,15 @@ struct WindowState {
     previews: crate::preview::PreviewLoader,
     rename: Option<RenameEdit>,
     pending_rename: Option<(TabId, String)>,
+    tag_editor: Option<TagEditor>,
+}
+
+/// The Edit Tags dialog: the items, and the names typed so far.
+struct TagEditor {
+    paths: Vec<PathBuf>,
+    text: String,
+    /// Whether the field has been given the caret yet.
+    focused: bool,
 }
 
 impl WindowState {
@@ -3729,6 +3845,7 @@ impl WindowState {
             previews: crate::preview::PreviewLoader::spawn(ctx.clone()),
             rename: None,
             pending_rename: None,
+            tag_editor: None,
         }
     }
 }
@@ -3935,6 +4052,7 @@ impl NeutronApp {
         // touched, and its scrim has to cover the overlays too.
         self.confirm_overlay(ui, &p);
         self.clash_overlay(ui, &p);
+        self.tag_editor_overlay(ui, &p, &mut actions);
 
         // Queued *after* drawing so a `DropTab` pushed by a tab strip this
         // frame is applied first. Pushed before it, this would clear the drag
@@ -4041,6 +4159,7 @@ impl NeutronApp {
         swap(&mut self.previews, &mut window.previews);
         swap(&mut self.rename, &mut window.rename);
         swap(&mut self.pending_rename, &mut window.pending_rename);
+        swap(&mut self.tag_editor, &mut window.tag_editor);
     }
 
     /// An id for one of a window's own panels. The first window keeps the
@@ -7009,10 +7128,11 @@ impl NeutronApp {
                 // carries it.
                 if cfg!(target_os = "macos") {
                     sidebar::section(ui, p, "Tags");
-                    for &(name, color) in neutron_shell::tags::COLORS.iter() {
-                        let selected = matches!(current, Some(NodeId::Tag { name: n }) if &**n == name);
-                        if matches!(sidebar::tag_row(ui, p, name, color, selected), sidebar::RowHit::Open) {
-                            actions.push(Action::Navigate(NodeId::Tag { name: name.into() }));
+                    for &(_, color) in neutron_shell::tags::COLORS.iter() {
+                        let name = neutron_shell::tags::color_name(color);
+                        let selected = matches!(current, Some(NodeId::Tag { name: n }) if **n == *name);
+                        if matches!(sidebar::tag_row(ui, p, &name, color, selected), sidebar::RowHit::Open) {
+                            actions.push(Action::Navigate(NodeId::Tag { name: name.as_str().into() }));
                         }
                     }
                 }

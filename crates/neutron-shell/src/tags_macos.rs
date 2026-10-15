@@ -90,6 +90,52 @@ fn color_named(name: &str) -> u8 {
     COLORS.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map_or(0, |(_, c)| *c)
 }
 
+/// What the user's Mac calls colour tag `color` (1 to 7), in their language
+/// and with any renaming they have done — what the Finder shows.
+pub fn color_name(color: u8) -> String {
+    use std::sync::OnceLock;
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        objc2::rc::autoreleasepool(|_| {
+            objc2_app_kit::NSWorkspace::sharedWorkspace().fileLabels().iter().map(|n| n.to_string()).collect()
+        })
+    });
+    names
+        .get(color as usize)
+        .filter(|n| !n.is_empty())
+        .cloned()
+        .or_else(|| COLORS.iter().find(|(_, c)| *c == color).map(|(n, _)| (*n).to_owned()))
+        .unwrap_or_default()
+}
+
+/// Gives each of `paths` colour tag `color`, or takes away every tag of that
+/// colour, leaving their other tags as they are.
+pub fn toggle_color(paths: &[PathBuf], color: u8, on: bool) -> Result<(), String> {
+    let name = color_name(color);
+    let mut failed = Vec::new();
+    for path in paths {
+        let tags = read(path);
+        let has = tags.iter().any(|t| t.color == color || t.name == name);
+        let names: Vec<String> = if on && !has {
+            tags.into_iter().map(|t| t.name).chain(std::iter::once(name.clone())).collect()
+        } else if !on && has {
+            tags.into_iter().filter(|t| t.color != color && t.name != name).map(|t| t.name).collect()
+        } else {
+            continue;
+        };
+        if let Err(why) = set(path, &names) {
+            failed.push(why);
+        }
+    }
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
+}
+
+/// Sets each of `paths` to carry exactly the tags `names`.
+pub fn set_names(paths: &[PathBuf], names: &[String]) -> Result<(), String> {
+    let failed: Vec<String> = paths.iter().filter_map(|p| set(p, names).err()).collect();
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
+}
+
 /// Gives each of `paths` the tag `name`, or takes it away, leaving their other
 /// tags as they are.
 pub fn toggle(paths: &[PathBuf], name: &str, on: bool) -> Result<(), String> {
@@ -256,6 +302,28 @@ mod tests {
 
         toggle(std::slice::from_ref(&file), "Red", false).unwrap();
         assert_eq!(read(&file).iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["Work"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn named_tags_are_set_and_colours_toggled_by_number() {
+        let dir = std::env::temp_dir().join(format!("neutron-tags-named-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let one = std::slice::from_ref(&file);
+
+        set_names(one, &["Work".to_owned(), "Receipts".to_owned()]).unwrap();
+        assert_eq!(read(&file).iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["Work", "Receipts"]);
+
+        toggle_color(one, 4, true).unwrap();
+        assert_eq!(colors(&file), 1 << 3, "blue is on");
+        assert_eq!(read(&file).len(), 3, "the named tags stayed");
+        toggle_color(one, 4, false).unwrap();
+        assert_eq!(colors(&file), 0);
+        assert_eq!(read(&file).len(), 2);
+        assert!(!color_name(6).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

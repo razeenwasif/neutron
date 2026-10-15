@@ -27,6 +27,15 @@ pub fn colors(_path: &Path) -> u8 {
 pub fn toggle(_paths: &[PathBuf], _name: &str, _on: bool) -> Result<(), String> {
     Err("tags are only on macOS".into())
 }
+pub fn color_name(color: u8) -> String {
+    COLORS.iter().find(|(_, c)| *c == color).map(|(n, _)| (*n).to_owned()).unwrap_or_default()
+}
+pub fn toggle_color(_paths: &[PathBuf], _color: u8, _on: bool) -> Result<(), String> {
+    Err("tags are only on macOS".into())
+}
+pub fn set_names(_paths: &[PathBuf], _names: &[String]) -> Result<(), String> {
+    Err("tags are only on macOS".into())
+}
 pub fn search(_name: &str) -> Result<Vec<PathBuf>, String> {
     Err("tags are only on macOS".into())
 }
