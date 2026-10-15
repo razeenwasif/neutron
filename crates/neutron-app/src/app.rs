@@ -536,6 +536,10 @@ pub struct NeutronApp {
     clash_questions: std::collections::VecDeque<crate::transfers::Question>,
     /// What can be undone and redone.
     history: crate::undo::History,
+    /// Files taken out of an archive to be shared: where to point the share
+    /// menu, or `None` for AirDrop. Shared on the main thread, as AppKit needs.
+    share_tx: crossbeam_channel::Sender<ShareRequest>,
+    share_rx: crossbeam_channel::Receiver<ShareRequest>,
     /// The window being drawn: the first is the root viewport.
     viewport: egui::ViewportId,
     /// Origin of the window being drawn, as `WindowState::origin`.
@@ -720,6 +724,7 @@ impl NeutronApp {
         }
         let (planned_tx, planned_rx) = crossbeam_channel::unbounded();
         let (undo_tx, undo_rx) = crossbeam_channel::unbounded();
+        let (share_tx, share_rx) = crossbeam_channel::unbounded();
         let (notice_tx, notice_rx) = crossbeam_channel::unbounded();
         let (refresh_tx, refresh_rx) = crossbeam_channel::unbounded();
         let (open_as_tx, open_as_rx) = crossbeam_channel::unbounded();
@@ -853,6 +858,8 @@ impl NeutronApp {
             planned_rx,
             clash_questions: std::collections::VecDeque::new(),
             history: crate::undo::History::default(),
+            share_tx,
+            share_rx,
             viewport: egui::ViewportId::ROOT,
             origin: None,
             windows: Vec::new(),
@@ -1137,6 +1144,24 @@ impl NeutronApp {
                 if !self.refuse_without_a_path("compress anything in") {
                     self.compress_selection();
                 }
+            }
+            Action::Share | Action::AirDrop if self.in_archive() => {
+                // Taken out into the cache first; shared when they are there.
+                let Some((archive, entries)) = self.archive_selection() else { return };
+                let at = matches!(action, Action::Share).then(|| {
+                    let at = ctx.input(|i| i.pointer.latest_pos()).unwrap_or_else(|| ctx.content_rect().center());
+                    (at.x, at.y)
+                });
+                let shares = self.share_tx.clone();
+                let notices = self.notice_tx.clone();
+                let wake = self.ctx.clone();
+                self.sta.submit(move || match crate::archives::materialise(&archive, &entries) {
+                    Ok(paths) => {
+                        let _ = shares.send((paths, at));
+                        wake.request_repaint();
+                    }
+                    Err(e) => report(&notices, format!("Could not share that: {e}")),
+                });
             }
             Action::Share => {
                 let Some(paths) = self.chosen_paths() else { return };
@@ -2846,6 +2871,11 @@ impl NeutronApp {
             items.push(MenuItem::separator());
             items.push(add("Copy", Action::Clip { cut: false }, &mut self.menu_actions, false));
             items.push(add("Extract to the Archive's Folder", Action::ExtractEntries, &mut self.menu_actions, false));
+            if cfg!(target_os = "macos") {
+                items.push(MenuItem::separator());
+                items.push(add("Share…", Action::Share, &mut self.menu_actions, false));
+                items.push(add("AirDrop…", Action::AirDrop, &mut self.menu_actions, false));
+            }
         } else {
             items.push(add("Extract All", Action::ExtractWholeArchive, &mut self.menu_actions, false));
         }
@@ -3882,6 +3912,9 @@ fn take_mine<T>(all: &mut Vec<T>, mine: impl Fn(&T) -> bool) -> Vec<T> {
     taken
 }
 
+/// Files to share, and where to point the share menu — `None` for AirDrop.
+type ShareRequest = (Vec<PathBuf>, Option<(f32, f32)>);
+
 /// The Group By choices, as the menus offer them.
 const GROUPS: [(&str, neutron_core::GroupBy); 6] = [
     ("None", neutron_core::GroupBy::None),
@@ -3938,6 +3971,15 @@ impl NeutronApp {
             self.refresh_finder();
         }
         neutron_shell::quicklook::pump();
+        while let Ok((paths, at)) = self.share_rx.try_recv() {
+            let shared = match at {
+                Some(at) => neutron_shell::share::share(&paths, at),
+                None => neutron_shell::share::airdrop(&paths),
+            };
+            if let Err(e) = shared {
+                self.notices.error(e);
+            }
+        }
         self.collect_mail();
     }
 
