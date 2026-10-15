@@ -36,6 +36,11 @@ impl Namespace for FsNamespace {
             attrs |= (crate::tags::colors(&entry.path()) as u32) << attr::TAG_SHIFT;
             let kind = if directory { EntryKind::Directory }
                 else if link { EntryKind::Symlink } else { EntryKind::File };
+            // The system's name for this kind of file, learned from the first
+            // file of each extension met: once per extension, not per file.
+            if kind == EntryKind::File {
+                learn_kind(&entry.path());
+            }
             list.push(&Entry { name, kind, size: meta.len(), attrs,
                 modified: millis(meta.modified()), created: millis(meta.created()),
                 sync: sync_state(meta.st_flags()) });
@@ -74,6 +79,30 @@ fn is_package(path: &Path, link: bool) -> bool {
         let read = unsafe { url.getResourceValue_forKey_error(&mut value, NSURLIsPackageKey) };
         read.is_ok() && value.and_then(|v| v.downcast::<NSNumber>().ok()).is_some_and(|n| n.boolValue())
     })
+}
+
+/// Learns what the system calls files like `path`, if its extension is new.
+fn learn_kind(path: &Path) {
+    use objc2_foundation::{NSString, NSURL, NSURLLocalizedTypeDescriptionKey};
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else { return };
+    if neutron_core::kinds::known(ext) {
+        return;
+    }
+    let Some(text) = path.to_str() else { return };
+    let name = objc2::rc::autoreleasepool(|_| {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(text));
+        let mut value = None;
+        // SAFETY: the localized type description is an `NSString`, checked
+        // by the downcast rather than assumed.
+        let read = unsafe { url.getResourceValue_forKey_error(&mut value, NSURLLocalizedTypeDescriptionKey) };
+        read.ok()
+            .and(value)
+            .and_then(|v| v.downcast::<NSString>().ok())
+            .map(|s| s.to_string())
+    });
+    // Learned even when the system has nothing better than a generic name,
+    // so the same extension is not asked about again.
+    neutron_core::kinds::learn(ext, name.unwrap_or_else(|| format!("{} file", ext.to_uppercase())));
 }
 
 fn millis(time: std::io::Result<std::time::SystemTime>) -> i64 {

@@ -3,6 +3,7 @@
 
 pub mod entry;
 pub mod history;
+pub mod kinds;
 pub mod layout;
 pub mod menu;
 pub mod naming;

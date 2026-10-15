@@ -42,7 +42,7 @@ use crate::theme::{self, Palette, RADIUS_CONTROL, ROW_HEIGHT};
 /// Fixed column widths, in points.
 const W_SIZE: f32 = 100.0;
 const W_MODIFIED: f32 = 150.0;
-const W_KIND: f32 = 120.0;
+const W_KIND: f32 = 170.0;
 /// Space reserved for the icon tile at the start of a row.
 const ICON_SLOT: f32 = 36.0;
 /// Padding inside the list, left and right.
@@ -1644,9 +1644,10 @@ pub fn kind_label(kind: EntryKind, name: &str) -> String {
         EntryKind::Virtual => "System".to_owned(),
         EntryKind::File => match name.rfind('.') {
             // A leading dot is part of the name (`.gitignore`), not an extension.
-            Some(i) if i > 0 && i + 1 < name.len() => {
-                format!("{} file", name[i + 1..].to_uppercase())
-            }
+            // The system's own name once the listing has learned it — "PDF
+            // document", "Markdown Document" — and the extension until then.
+            Some(i) if i > 0 && i + 1 < name.len() => neutron_core::kinds::name_of(&name[i + 1..])
+                .unwrap_or_else(|| format!("{} file", name[i + 1..].to_uppercase())),
             _ => "File".to_owned(),
         },
     }
