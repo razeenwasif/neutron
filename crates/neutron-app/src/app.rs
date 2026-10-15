@@ -61,6 +61,8 @@ enum Action {
     Activate(usize),
     Select { idx: usize, mode: SelectMode },
     SortBy(SortColumn),
+    /// Gather the listing into groups under headings, or stop.
+    GroupBy(neutron_core::GroupBy),
     ClearSelection,
     /// A rubber band covered these display positions.
     Marquee { from: usize, to: usize, additive: bool },
@@ -636,6 +638,9 @@ impl NeutronApp {
             ThemeMode::Dark
         };
         theme::apply(&cc.egui_ctx, theme_mode);
+        // The date groups — Today, Yesterday — are the user's days.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        neutron_core::sort::set_local_offset(neutron_ui::format::local_offset_secs(now));
         theme::install_fonts(&cc.egui_ctx, interface_faces());
 
         let hwnd = window_handle(cc);
@@ -1295,6 +1300,25 @@ impl NeutronApp {
                     // it survives untouched — no reload needed.
                     neutron_core::sort::sort(&mut t.list, t.view.sort);
                     t.view.scroll_to = t.selection.cursor();
+                }
+                // Last-opened dates are read only when asked for, so a first
+                // sort by them reloads to fetch them.
+                if column == neutron_core::SortColumn::Opened {
+                    if let Some(tab) = active {
+                        self.refresh_in_place(tab);
+                    }
+                }
+            }
+            Action::GroupBy(group) => {
+                if let Some(t) = self.workspace.active_tab_mut() {
+                    t.view.sort.group = group;
+                    neutron_core::sort::sort(&mut t.list, t.view.sort);
+                    t.view.scroll_to = t.selection.cursor();
+                }
+                if group == neutron_core::GroupBy::Opened {
+                    if let Some(tab) = active {
+                        self.refresh_in_place(tab);
+                    }
                 }
             }
 
@@ -2645,6 +2669,8 @@ impl NeutronApp {
                 ("Kind", neutron_core::SortColumn::Kind),
                 ("Date Modified", neutron_core::SortColumn::Modified),
                 ("Date Created", neutron_core::SortColumn::Created),
+                ("Date Added", neutron_core::SortColumn::Added),
+                ("Date Last Opened", neutron_core::SortColumn::Opened),
                 ("Size", neutron_core::SortColumn::Size),
             ];
             let children = sorts
@@ -2655,6 +2681,14 @@ impl NeutronApp {
                 })
                 .collect();
             rows.push(MenuItem { label: "Sort By".into(), enabled: true, children, ..Default::default() });
+            let children = GROUPS
+                .into_iter()
+                .map(|(label, group)| MenuItem {
+                    checked: tab.view.sort.group == group,
+                    ..row(label, Action::GroupBy(group), &mut actions)
+                })
+                .collect();
+            rows.push(MenuItem { label: "Group By".into(), enabled: true, children, ..Default::default() });
             let hidden = if tab.view.show_hidden { "Hide Hidden Files" } else { "Show Hidden Files" };
             rows.push(row(hidden, Action::ToggleHidden, &mut actions));
         } else {
@@ -2890,6 +2924,14 @@ impl NeutronApp {
             C::SortModified => Action::SortBy(SortColumn::Modified),
             C::SortCreated => Action::SortBy(SortColumn::Created),
             C::SortSize => Action::SortBy(SortColumn::Size),
+            C::SortAdded => Action::SortBy(SortColumn::Added),
+            C::SortOpened => Action::SortBy(SortColumn::Opened),
+            C::GroupNone => Action::GroupBy(neutron_core::GroupBy::None),
+            C::GroupKind => Action::GroupBy(neutron_core::GroupBy::Kind),
+            C::GroupModified => Action::GroupBy(neutron_core::GroupBy::Modified),
+            C::GroupAdded => Action::GroupBy(neutron_core::GroupBy::Added),
+            C::GroupOpened => Action::GroupBy(neutron_core::GroupBy::Opened),
+            C::GroupSize => Action::GroupBy(neutron_core::GroupBy::Size),
             C::ShowPreview => Action::TogglePreview,
             C::ShowHidden => Action::ToggleHidden,
             C::SplitRight => Action::Split(Axis::Horizontal),
@@ -2970,6 +3012,16 @@ impl NeutronApp {
                 neutron_core::SortColumn::Modified => C::SortModified,
                 neutron_core::SortColumn::Created => C::SortCreated,
                 neutron_core::SortColumn::Size => C::SortSize,
+                neutron_core::SortColumn::Added => C::SortAdded,
+                neutron_core::SortColumn::Opened => C::SortOpened,
+            }.tag());
+            checked.insert(match t.view.sort.group {
+                neutron_core::GroupBy::None => C::GroupNone,
+                neutron_core::GroupBy::Kind => C::GroupKind,
+                neutron_core::GroupBy::Modified => C::GroupModified,
+                neutron_core::GroupBy::Added => C::GroupAdded,
+                neutron_core::GroupBy::Opened => C::GroupOpened,
+                neutron_core::GroupBy::Size => C::GroupSize,
             }.tag());
             if t.view.show_hidden {
                 checked.insert(C::ShowHidden.tag());
@@ -3712,6 +3764,16 @@ fn take_mine<T>(all: &mut Vec<T>, mine: impl Fn(&T) -> bool) -> Vec<T> {
     *all = rest;
     taken
 }
+
+/// The Group By choices, as the menus offer them.
+const GROUPS: [(&str, neutron_core::GroupBy); 6] = [
+    ("None", neutron_core::GroupBy::None),
+    ("Kind", neutron_core::GroupBy::Kind),
+    ("Date Modified", neutron_core::GroupBy::Modified),
+    ("Date Added", neutron_core::GroupBy::Added),
+    ("Date Last Opened", neutron_core::GroupBy::Opened),
+    ("Size", neutron_core::GroupBy::Size),
+];
 
 /// What a worker reports to the undo history.
 enum UndoEvent {
@@ -8236,6 +8298,19 @@ mod screens {
             act(&mut harness, Action::Back);
             settle(&mut harness);
         }
+
+        // Grouped by kind, then by date added.
+        act(&mut harness, Action::SetView(file_list::ViewMode::List));
+        act(&mut harness, Action::GroupBy(neutron_core::GroupBy::Kind));
+        settle(&mut harness);
+        shoot(&mut harness, &out, "grouped.png");
+        act(&mut harness, Action::SortBy(neutron_core::SortColumn::Added));
+        act(&mut harness, Action::GroupBy(neutron_core::GroupBy::Added));
+        settle(&mut harness);
+        shoot(&mut harness, &out, "grouped-added.png");
+        act(&mut harness, Action::GroupBy(neutron_core::GroupBy::None));
+        act(&mut harness, Action::SortBy(neutron_core::SortColumn::Name));
+        settle(&mut harness);
 
         // A second window: its own tabs, its listing routed to it.
         act(&mut harness, Action::NewWindow);

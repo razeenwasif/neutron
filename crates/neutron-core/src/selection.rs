@@ -420,6 +420,7 @@ mod tests {
                 column: SortColumn::Name,
                 order: SortOrder::Descending,
                 dirs_first: false,
+                group: crate::sort::GroupBy::None,
             },
         );
         // Display order is now e, d, c, b, a — storage 4, 3, 2, 1, 0.
@@ -447,6 +448,7 @@ mod tests {
                 column: SortColumn::Size,
                 order: SortOrder::Descending,
                 dirs_first: false,
+                group: crate::sort::GroupBy::None,
             },
         );
 

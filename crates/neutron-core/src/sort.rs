@@ -16,6 +16,117 @@ pub enum SortColumn {
     Modified,
     Created,
     Kind,
+    /// When each item was put in its folder.
+    Added,
+    /// When each item was last opened.
+    Opened,
+}
+
+/// How a listing is gathered into groups under headings, as the Finder's Use
+/// Groups does. Groups come first in the order; within one, the sort column
+/// decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupBy {
+    #[default]
+    None,
+    Kind,
+    Modified,
+    Added,
+    Opened,
+    Size,
+}
+
+/// The UTC offset the date groups are reckoned in, in seconds: "Today" is the
+/// user's today. Set once by the application; UTC until then.
+static LOCAL_OFFSET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn set_local_offset(seconds: i64) {
+    LOCAL_OFFSET.store(seconds, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Which group entry `i` falls in under `group`: an order among the groups,
+/// lowest first, and the heading. `now` is milliseconds since the epoch.
+pub fn group_of(list: &EntryList, i: usize, group: GroupBy, now: i64) -> (u64, String) {
+    match group {
+        GroupBy::None => (0, String::new()),
+        GroupBy::Kind => {
+            if list.kind(i).is_container() {
+                return (0, "Folders".to_owned());
+            }
+            let name = list.name(i);
+            let kind = match name.rfind('.') {
+                Some(dot) if dot > 0 && dot + 1 < name.len() => crate::kinds::name_of(&name[dot + 1..])
+                    .unwrap_or_else(|| format!("{} file", name[dot + 1..].to_uppercase())),
+                _ => "Other".to_owned(),
+            };
+            (1, kind)
+        }
+        GroupBy::Modified => date_group(list.modified(i), now),
+        GroupBy::Added => date_group(list.added(i), now),
+        GroupBy::Opened => date_group(list.opened(i), now),
+        GroupBy::Size => {
+            if list.kind(i).is_container() {
+                return (0, "Folders".to_owned());
+            }
+            const MB: u64 = 1 << 20;
+            match list.size(i) {
+                s if s >= 1024 * MB => (1, "Huge".to_owned()),
+                s if s >= 100 * MB => (2, "Very large".to_owned()),
+                s if s >= 10 * MB => (3, "Large".to_owned()),
+                s if s >= MB => (4, "Medium".to_owned()),
+                s if s >= 100 * 1024 => (5, "Small".to_owned()),
+                0 => (7, "Empty".to_owned()),
+                _ => (6, "Tiny".to_owned()),
+            }
+        }
+    }
+}
+
+/// The Finder's date groups: Today, Yesterday, the previous week and month,
+/// then each earlier month of this year, then each earlier year.
+fn date_group(millis: i64, now: i64) -> (u64, String) {
+    const DAY: i64 = 86_400_000;
+    const MONTHS: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+        "November", "December",
+    ];
+    if millis <= 0 {
+        return (u64::MAX, "Unknown".to_owned());
+    }
+    let offset = LOCAL_OFFSET.load(std::sync::atomic::Ordering::Relaxed) * 1000;
+    let day = |m: i64| (m + offset).div_euclid(DAY);
+    let (today, then) = (day(now), day(millis));
+    match today - then {
+        i64::MIN..=0 => (0, "Today".to_owned()),
+        1 => (1, "Yesterday".to_owned()),
+        2..=7 => (2, "Previous 7 Days".to_owned()),
+        8..=30 => (3, "Previous 30 Days".to_owned()),
+        _ => {
+            let (year, month) = civil(then);
+            let (this_year, _) = civil(today);
+            if year == this_year {
+                // Earlier months of this year, newest first.
+                (4 + (12 - month) as u64, MONTHS[month as usize - 1].to_owned())
+            } else {
+                // Earlier years, newest first.
+                (100 + (this_year - year).max(0) as u64, year.to_string())
+            }
+        }
+    }
+}
+
+/// The year and month (1 to 12) of a day counted from 1970-01-01.
+fn civil(days: i64) -> (i64, u32) {
+    // Howard Hinnant's days-to-civil.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,6 +160,8 @@ pub struct SortSpec {
     /// Applied before the column comparison, so it is never inverted by
     /// `Descending` — users expect folders to stay on top either way.
     pub dirs_first: bool,
+    /// Gathered into groups under headings, or not.
+    pub group: GroupBy,
 }
 
 impl Default for SortSpec {
@@ -57,6 +170,7 @@ impl Default for SortSpec {
             column: SortColumn::Name,
             order: SortOrder::Ascending,
             dirs_first: true,
+            group: GroupBy::None,
         }
     }
 }
@@ -213,9 +327,26 @@ pub fn apply_filtered(list: &mut EntryList, spec: SortSpec, show_hidden: bool, n
 /// sort's allocation.
 pub fn sort(list: &mut EntryList, spec: SortSpec) {
     let mut order: Vec<u32> = list.order().to_vec();
+    // Each entry's group, worked out once rather than on every comparison.
+    let groups: Vec<(u64, String)> = if spec.group == GroupBy::None {
+        Vec::new()
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        (0..list.len()).map(|i| group_of(list, i, spec.group, now)).collect()
+    };
 
     order.par_sort_unstable_by(|&a, &b| {
         let (ai, bi) = (a as usize, b as usize);
+
+        if !groups.is_empty() {
+            let (ga, gb) = (&groups[ai], &groups[bi]);
+            match ga.0.cmp(&gb.0).then_with(|| natural_cmp(&ga.1, &gb.1)) {
+                Ordering::Equal => {}
+                other => return other,
+            }
+        }
 
         if spec.dirs_first {
             let (ad, bd) = (
@@ -233,6 +364,8 @@ pub fn sort(list: &mut EntryList, spec: SortSpec) {
             SortColumn::Size => list.size(ai).cmp(&list.size(bi)),
             SortColumn::Modified => list.modified(ai).cmp(&list.modified(bi)),
             SortColumn::Created => list.created(ai).cmp(&list.created(bi)),
+            SortColumn::Added => list.added(ai).cmp(&list.added(bi)),
+            SortColumn::Opened => list.opened(ai).cmp(&list.opened(bi)),
             SortColumn::Kind => cmp_ignore_ascii_case(extension(list.name(ai)), extension(list.name(bi)))
                 .then_with(|| natural_cmp(list.name(ai), list.name(bi))),
         };
@@ -341,6 +474,7 @@ mod tests {
                 column: SortColumn::Name,
                 order: SortOrder::Descending,
                 dirs_first: true,
+                group: GroupBy::None,
             },
         );
 
@@ -364,6 +498,7 @@ mod tests {
                 column: SortColumn::Size,
                 order: SortOrder::Ascending,
                 dirs_first: true,
+                group: GroupBy::None,
             },
         );
 
@@ -387,6 +522,7 @@ mod tests {
                 column: SortColumn::Kind,
                 order: SortOrder::Ascending,
                 dirs_first: true,
+                group: GroupBy::None,
             },
         );
 
@@ -492,5 +628,34 @@ mod tests {
         assert_eq!(extension(".gitignore"), "");
         assert_eq!(extension("archive.tar.gz"), "gz");
         assert_eq!(extension("noext"), "");
+    }
+
+    #[test]
+    fn dates_fall_in_the_finders_groups() {
+        const DAY: i64 = 86_400_000;
+        // 2026-10-15 12:00 UTC.
+        let now = 1_792_065_600_000;
+        assert_eq!(date_group(now - 3_600_000, now).1, "Today");
+        assert_eq!(date_group(now - DAY, now).1, "Yesterday");
+        assert_eq!(date_group(now - 5 * DAY, now).1, "Previous 7 Days");
+        assert_eq!(date_group(now - 20 * DAY, now).1, "Previous 30 Days");
+        assert_eq!(date_group(now - 120 * DAY, now).1, "June");
+        assert_eq!(date_group(now - 400 * DAY, now).1, "2025");
+        assert_eq!(date_group(0, now).1, "Unknown");
+        assert!(date_group(now - DAY, now).0 < date_group(now - 120 * DAY, now).0, "newer groups first");
+        assert!(date_group(now - 120 * DAY, now).0 < date_group(now - 400 * DAY, now).0);
+    }
+
+    #[test]
+    fn groups_come_before_the_sort_column() {
+        let mut list = EntryList::new();
+        list.push(&mk("a.txt", EntryKind::File, 5 << 20, 0));
+        list.push(&mk("b.txt", EntryKind::File, 10, 0));
+        list.push(&mk("c.txt", EntryKind::File, 6 << 20, 0));
+        let spec = SortSpec { group: GroupBy::Size, column: SortColumn::Name, ..Default::default() };
+        sort(&mut list, spec);
+        let names: Vec<&str> = list.order().iter().map(|&i| list.name(i as usize)).collect();
+        // Medium (a, c) before Tiny (b), by name within each.
+        assert_eq!(names, vec!["a.txt", "c.txt", "b.txt"]);
     }
 }

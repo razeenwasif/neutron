@@ -44,6 +44,7 @@ impl Namespace for FsNamespace {
             list.push(&Entry { name, kind, size: meta.len(), attrs,
                 modified: millis(meta.modified()), created: millis(meta.created()),
                 sync: sync_state(meta.st_flags()) });
+            list.set_added(list.len() - 1, added_time(&entry.path()));
         }
         Ok(list)
     }
@@ -105,6 +106,78 @@ fn learn_kind(path: &Path) {
     neutron_core::kinds::learn(ext, name.unwrap_or_else(|| format!("{} file", ext.to_uppercase())));
 }
 
+/// When `path` was put in the folder it is in, in milliseconds; 0 when the
+/// volume does not keep it. One `getattrlist`, as cheap as the stat before it.
+fn added_time(path: &Path) -> i64 {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return 0 };
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_ADDEDTIME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // A length, which attributes came back, then the time if it did.
+    let mut buffer = [0u8; 64];
+    // SAFETY: a valid path, request and buffer of the stated size.
+    let rc = unsafe {
+        libc::getattrlist(
+            c_path.as_ptr(),
+            (&mut request as *mut libc::attrlist).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::FSOPT_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return 0;
+    }
+    let returned = u32::from_ne_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+    if returned & libc::ATTR_CMN_ADDEDTIME == 0 {
+        return 0;
+    }
+    let seconds = i64::from_ne_bytes(buffer[24..32].try_into().unwrap_or([0; 8]));
+    let nanos = i64::from_ne_bytes(buffer[32..40].try_into().unwrap_or([0; 8]));
+    seconds.saturating_mul(1000) + nanos / 1_000_000
+}
+
+#[link(name = "CoreServices", kind = "framework")]
+unsafe extern "C" {
+    fn MDItemCreate(allocator: *const std::ffi::c_void, path: *const objc2::runtime::AnyObject) -> *mut std::ffi::c_void;
+    fn MDItemCopyAttribute(item: *mut std::ffi::c_void, name: *const objc2::runtime::AnyObject) -> *mut objc2::runtime::AnyObject;
+    fn CFRelease(object: *const std::ffi::c_void);
+}
+
+/// When `path` was last opened, as Spotlight recorded it, in milliseconds; 0
+/// when it never was or Spotlight does not know the file. A Spotlight lookup
+/// per file, so it is asked only when a listing is sorted or grouped by it.
+pub fn last_opened(path: &Path) -> i64 {
+    use objc2_foundation::{NSDate, NSString};
+    let Some(text) = path.to_str() else { return 0 };
+    objc2::rc::autoreleasepool(|_| {
+        let path = NSString::from_str(text);
+        let key = NSString::from_str("kMDItemLastUsedDate");
+        // SAFETY: NSString is toll-free bridged to CFString. The item and the
+        // copied attribute are owned here (the Create and Copy rules) and
+        // released below or by `Retained`.
+        unsafe {
+            let item = MDItemCreate(std::ptr::null(), (&*path as *const NSString).cast());
+            if item.is_null() {
+                return 0;
+            }
+            let value = MDItemCopyAttribute(item, (&*key as *const NSString).cast());
+            CFRelease(item);
+            let Some(value) = objc2::rc::Retained::from_raw(value) else { return 0 };
+            value
+                .downcast::<NSDate>()
+                .map_or(0, |date| (date.timeIntervalSince1970() * 1000.0) as i64)
+        }
+    })
+}
+
 fn millis(time: std::io::Result<std::time::SystemTime>) -> i64 {
     time.ok().map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_millis().min(i64::MAX as u128) as i64,
@@ -115,6 +188,33 @@ fn millis(time: std::io::Result<std::time::SystemTime>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_file_has_its_date_added() {
+        let dir = std::env::temp_dir().join(format!("neutron-added-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let now = millis(Ok(std::time::SystemTime::now()));
+        let added = added_time(&dir.join("a.txt"));
+        assert!((now - added).abs() < 60_000, "added {added}, now {now}");
+        assert_eq!(added_time(&dir.join("missing")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Needs Spotlight and something it has seen opened lately.
+    #[test]
+    #[ignore]
+    fn spotlight_says_when_a_used_file_was_last_opened() {
+        let out = std::process::Command::new("/usr/bin/mdfind")
+            .arg("kMDItemLastUsedDate > $time.today(-30)")
+            .output()
+            .unwrap();
+        let first = String::from_utf8_lossy(&out.stdout).lines().next().map(str::to_owned).expect("something used lately");
+        let opened = last_opened(Path::new(&first));
+        assert!(opened > 1_600_000_000_000, "{first}: {opened}");
+        assert_eq!(last_opened(Path::new("/definitely/not/here")), 0);
+    }
 
     #[test]
     fn dataless_files_are_cloud_only() {

@@ -232,6 +232,16 @@ fn worker(
 
         let result = match outcome {
             Ok(mut list) => {
+                // Spotlight's last-opened dates, asked one file at a time, so
+                // only when this listing is sorted or grouped by them.
+                let wants_opened = req.sort.column == neutron_core::SortColumn::Opened
+                    || req.sort.group == neutron_core::GroupBy::Opened;
+                if let (true, Some(dir)) = (wants_opened, req.id.as_path()) {
+                    for i in 0..list.len() {
+                        let opened = neutron_shell::fs::last_opened(&dir.join(list.name(i)));
+                        list.set_opened(i, opened);
+                    }
+                }
                 // Sorting belongs here, not on the UI thread — a 100k-entry
                 // sort is ~35ms, which would drop frames.
                 let sort_started = Instant::now();

@@ -19,7 +19,7 @@ pub use layout::{Axis, GroupId, Layout};
 pub use menu::MenuItem;
 pub use namespace::{Namespace, NamespaceError, NodeId};
 pub use selection::{SelectMode, Selection};
-pub use sort::{SortColumn, SortOrder, SortSpec};
+pub use sort::{GroupBy, SortColumn, SortOrder, SortSpec};
 
 /// Re-exported so callers do not need a separate `use` for the common pairing
 /// of an entry list and the filter+sort that populates its display order.

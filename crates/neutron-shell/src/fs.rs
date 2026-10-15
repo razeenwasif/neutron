@@ -288,3 +288,8 @@ mod tests {
         assert_eq!(s, r"\\?\C:\Windows\*");
     }
 }
+
+/// Spotlight's last-opened date is a Mac thing; elsewhere it is not known.
+pub fn last_opened(_path: &std::path::Path) -> i64 {
+    0
+}

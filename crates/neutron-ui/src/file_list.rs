@@ -33,7 +33,7 @@ use std::collections::HashSet;
 
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, TextStyle, Ui, pos2, vec2};
 use neutron_core::entry::{EntryKind, SyncState};
-use neutron_core::{EntryList, SelectMode, Selection, SortColumn, SortOrder, SortSpec};
+use neutron_core::{EntryList, GroupBy, SelectMode, Selection, SortColumn, SortOrder, SortSpec};
 
 use crate::format;
 use crate::icons;
@@ -237,7 +237,22 @@ fn show_list(
         action = Some(a);
     }
 
-    let row_count = list.order().len();
+    // Grouped, the rows are the entries with a heading at each change of
+    // group; otherwise the entries alone, and no table is built.
+    let dated = dated_column(state.sort.column);
+    let grouped = state.sort.group != GroupBy::None;
+    let rows = if grouped { group_rows(list, state.sort.group) } else { Vec::new() };
+    let row_count = if grouped { rows.len() } else { list.order().len() };
+    let entry_at_row = |row: usize| -> Option<usize> {
+        if grouped {
+            match rows.get(row)? {
+                Row::Entry(idx) => Some(*idx),
+                Row::Heading(_) => None,
+            }
+        } else {
+            (row < list.order().len()).then(|| list.at(row))
+        }
+    };
     let viewport_height = ui.available_height();
 
     let mut scroll = egui::ScrollArea::vertical()
@@ -251,7 +266,12 @@ fn show_list(
     // bottom edge and then scroll one row at a time, not re-centre the list on
     // every keystroke.
     if let Some(target) = state.scroll_to.take() {
-        if let Some(row) = list.rank(target) {
+        let row = if grouped {
+            rows.iter().position(|r| matches!(r, Row::Entry(i) if *i == target))
+        } else {
+            list.rank(target)
+        };
+        if let Some(row) = row {
             let top = row as f32 * ROW_HEIGHT;
             let bottom = top + ROW_HEIGHT;
             let current = scroll_offset(ui, "list");
@@ -296,9 +316,17 @@ fn show_list(
         // `visible` is the only range that costs anything, regardless of how
         // large the directory is.
         for row in visible {
-            let idx = list.at(row);
-            if let Some(a) = draw_row(ui, list, marks, p, idx, name_width, icons) {
-                action = Some(a);
+            match entry_at_row(row) {
+                Some(idx) => {
+                    if let Some(a) = draw_row(ui, list, marks, p, idx, name_width, icons, dated) {
+                        action = Some(a);
+                    }
+                }
+                None => {
+                    if let Some(Row::Heading(label)) = rows.get(row) {
+                        group_heading(ui, p, label);
+                    }
+                }
             }
         }
 
@@ -333,8 +361,7 @@ fn show_list(
         if y < 0.0 {
             return None;
         }
-        let row = (y / ROW_HEIGHT) as usize;
-        (row < row_count).then(|| list.at(row))
+        entry_at_row((y / ROW_HEIGHT) as usize)
     };
     let band = track_band(ui, viewport, start_area, offset, |screen| {
         entry_at(screen).is_some_and(|idx| marks.selection.is_selected(idx))
@@ -351,11 +378,19 @@ fn show_list(
         if row_count > 0 {
             let first = (rect.top() / ROW_HEIGHT).floor().max(0.0) as usize;
             let last = (rect.bottom() / ROW_HEIGHT).floor().max(0.0) as usize;
-            action = Some(FileListAction::Marquee {
-                from: first.min(row_count - 1),
-                to: last.min(row_count - 1),
-                additive: band.additive,
-            });
+            let (first, last) = (first.min(row_count - 1), last.min(row_count - 1));
+            // The band covers rows; the selection counts entries in display
+            // order, so headings are stepped over at both ends.
+            let (from, to) = if grouped {
+                let from = (first..=last).find_map(&entry_at_row).and_then(|i| list.rank(i));
+                let to = (first..=last).rev().find_map(&entry_at_row).and_then(|i| list.rank(i));
+                (from, to)
+            } else {
+                (Some(first), Some(last))
+            };
+            if let (Some(from), Some(to)) = (from, to) {
+                action = Some(FileListAction::Marquee { from, to, additive: band.additive });
+            }
         }
         // The band follows the pointer, so the frame has to keep coming even
         // while the mouse is held still.
@@ -363,6 +398,65 @@ fn show_list(
     }
 
     action
+}
+
+/// A row of a grouped listing: a heading, or an entry by storage index.
+enum Row {
+    Heading(String),
+    Entry(usize),
+}
+
+/// The entries in display order, with a heading wherever the group changes.
+fn group_rows(list: &EntryList, group: GroupBy) -> Vec<Row> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let mut rows = Vec::with_capacity(list.order().len() + 8);
+    let mut current: Option<(u64, String)> = None;
+    for &idx in list.order() {
+        let idx = idx as usize;
+        let key = neutron_core::sort::group_of(list, idx, group, now);
+        if current.as_ref() != Some(&key) {
+            rows.push(Row::Heading(key.1.clone()));
+            current = Some(key);
+        }
+        rows.push(Row::Entry(idx));
+    }
+    rows
+}
+
+/// A group's heading: its name in small capitals, on a row of its own.
+fn group_heading(ui: &mut Ui, p: &Palette, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let y = rect.bottom() - 12.0;
+    ui.painter().text(
+        pos2(rect.left() + LIST_PAD + 4.0, y),
+        Align2::LEFT_CENTER,
+        label.to_uppercase(),
+        theme::strong(ui.ctx(), 10.5),
+        p.text_faint,
+    );
+}
+
+/// The date the date column shows: the one being sorted by, when it is a
+/// date other than the last modification.
+fn dated_column(sort: SortColumn) -> SortColumn {
+    match sort {
+        SortColumn::Created | SortColumn::Added | SortColumn::Opened => sort,
+        _ => SortColumn::Modified,
+    }
+}
+
+fn dated_label(sort: SortColumn) -> &'static str {
+    match dated_column(sort) {
+        SortColumn::Created => "Created",
+        SortColumn::Added => "Date Added",
+        SortColumn::Opened => "Last Opened",
+        _ => "Modified",
+    }
 }
 
 /// Where the listing's scroll area is scrolled to, as of the last frame.
@@ -664,8 +758,8 @@ fn header(
             Align2::LEFT_CENTER,
         ),
         (
-            SortColumn::Modified,
-            "Modified",
+            dated_column(state.sort.column),
+            dated_label(state.sort.column),
             W_MODIFIED,
             Align2::LEFT_CENTER,
         ),
@@ -978,6 +1072,7 @@ fn draw_row(
     idx: usize,
     name_width: f32,
     icons: Option<&dyn IconSource>,
+    dated: SortColumn,
 ) -> Option<FileListAction> {
     let full = ui.available_width();
     let (outer, response) = ui.allocate_exact_size(vec2(full, ROW_HEIGHT), Sense::click());
@@ -1108,10 +1203,18 @@ fn draw_row(
 
     // --- modified ---
     let mod_rect = Rect::from_min_size(pos2(x, outer.top()), vec2(W_MODIFIED, ROW_HEIGHT));
+    let when = match dated {
+        SortColumn::Created => list.created(idx),
+        SortColumn::Added => list.added(idx),
+        SortColumn::Opened => list.opened(idx),
+        _ => list.modified(idx),
+    };
     draw_cell_text(
         ui,
         mod_rect,
-        &format::timestamp(list.modified(idx)),
+        // Blank rather than 1970 for a date nobody recorded — a file never
+        // opened, or a volume that keeps no "added" time.
+        &if when > 0 { format::timestamp(when) } else { String::new() },
         &small,
         p.text_muted,
         Align2::LEFT_CENTER,

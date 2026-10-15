@@ -102,6 +102,11 @@ pub struct EntryList {
     name_offsets: Vec<u32>,
     sizes: Vec<u64>,
     modified: Vec<i64>,
+    /// When each entry was put in its folder, and when it was last opened —
+    /// milliseconds, 0 when not known. Not part of [`Entry`]: few backends know
+    /// them, and those that do fill them in after pushing.
+    added: Vec<i64>,
+    opened: Vec<i64>,
     created: Vec<i64>,
     attrs: Vec<u32>,
     kinds: Vec<EntryKind>,
@@ -170,6 +175,8 @@ impl EntryList {
             name_offsets,
             sizes: Vec::with_capacity(cap),
             modified: Vec::with_capacity(cap),
+            added: Vec::with_capacity(cap),
+            opened: Vec::with_capacity(cap),
             created: Vec::with_capacity(cap),
             attrs: Vec::with_capacity(cap),
             kinds: Vec::with_capacity(cap),
@@ -225,6 +232,8 @@ impl EntryList {
         self.name_offsets.push(self.name_arena.len() as u32);
         self.sizes.push(entry.size);
         self.modified.push(entry.modified);
+        self.added.push(0);
+        self.opened.push(0);
         self.created.push(entry.created);
         self.attrs.push(entry.attrs);
         self.kinds.push(entry.kind);
@@ -246,6 +255,24 @@ impl EntryList {
 
     pub fn size(&self, i: usize) -> u64 {
         self.sizes[i]
+    }
+
+    /// When entry `i` was put in its folder; 0 when not known.
+    pub fn added(&self, i: usize) -> i64 {
+        self.added[i]
+    }
+
+    /// When entry `i` was last opened; 0 when not known or never.
+    pub fn opened(&self, i: usize) -> i64 {
+        self.opened[i]
+    }
+
+    pub fn set_added(&mut self, i: usize, millis: i64) {
+        self.added[i] = millis;
+    }
+
+    pub fn set_opened(&mut self, i: usize, millis: i64) {
+        self.opened[i] = millis;
     }
 
     pub fn modified(&self, i: usize) -> i64 {

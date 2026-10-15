@@ -485,6 +485,10 @@ pub struct PersistedPrefs {
     pub sort: String,
     #[serde(default)]
     pub descending: bool,
+    /// One of `kind`, `modified`, `added`, `opened`, `size`, or empty for no
+    /// groups.
+    #[serde(default)]
+    pub group: String,
 }
 
 impl PersistedPrefs {
@@ -495,8 +499,35 @@ impl PersistedPrefs {
             "modified" => C::Modified,
             "created" => C::Created,
             "kind" => C::Kind,
+            "added" => C::Added,
+            "opened" => C::Opened,
             _ => C::Name,
         }
+    }
+
+    pub fn group(&self) -> neutron_core::GroupBy {
+        use neutron_core::GroupBy as G;
+        match self.group.as_str() {
+            "kind" => G::Kind,
+            "modified" => G::Modified,
+            "added" => G::Added,
+            "opened" => G::Opened,
+            "size" => G::Size,
+            _ => G::None,
+        }
+    }
+
+    pub fn set_group(&mut self, group: neutron_core::GroupBy) {
+        use neutron_core::GroupBy as G;
+        self.group = match group {
+            G::None => "",
+            G::Kind => "kind",
+            G::Modified => "modified",
+            G::Added => "added",
+            G::Opened => "opened",
+            G::Size => "size",
+        }
+        .to_owned();
     }
 
     pub fn set_column(&mut self, column: neutron_core::SortColumn) {
@@ -507,6 +538,8 @@ impl PersistedPrefs {
             C::Modified => "modified",
             C::Created => "created",
             C::Kind => "kind",
+            C::Added => "added",
+            C::Opened => "opened",
         }
         .to_owned();
     }
@@ -683,8 +716,10 @@ impl Workspace {
             columns: tab.view.view == neutron_ui::file_list::ViewMode::Columns,
             sort: String::new(),
             descending: tab.view.sort.order == neutron_core::SortOrder::Descending,
+            group: String::new(),
         };
         prefs.set_column(tab.view.sort.column);
+        prefs.set_group(tab.view.sort.group);
         prefs
     }
 
@@ -754,6 +789,7 @@ impl Workspace {
         // by the user picks them up from the focused tab it is opened beside.
         let sort = neutron_core::SortSpec {
             column: saved.prefs.column(),
+            group: saved.prefs.group(),
             order: if saved.prefs.descending {
                 neutron_core::SortOrder::Descending
             } else {
