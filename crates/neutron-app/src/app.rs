@@ -2427,7 +2427,7 @@ impl NeutronApp {
         for (request, outcome) in finished {
             if let Ok(report) = &outcome {
                 let beside = request.paths.iter().all(|p| p.parent() == Some(request.destination.as_path()));
-                let record = match request.how {
+                let mut record = match request.how {
                     neutron_shell::fileops::Transfer::Move => crate::undo::Record {
                         label: "Move".into(),
                         step: crate::undo::Step::Relocated(report.moved.clone()),
@@ -2437,6 +2437,14 @@ impl NeutronApp {
                         step: crate::undo::Step::Created(report.moved.iter().map(|(_, to)| to.clone()).collect()),
                     },
                 };
+                // What it replaced went to the Trash first; undoing puts it
+                // back after the transfer is undone.
+                if !report.replaced.is_empty() {
+                    record.step = crate::undo::Step::Sequence(vec![
+                        crate::undo::Step::Trashed(report.replaced.clone()),
+                        record.step,
+                    ]);
+                }
                 self.history.record(record);
             }
             let (error, text) = crate::transfers::summary(&request, &outcome);

@@ -29,6 +29,9 @@ pub enum Step {
     Created(Vec<PathBuf>),
     /// `(where it was, where it is in the Trash)`, for each item.
     Trashed(Vec<(PathBuf, PathBuf)>),
+    /// Steps taken one after another, as one change: a paste that replaced
+    /// what was there trashed it first, then transferred. Reversed last first.
+    Sequence(Vec<Step>),
 }
 
 /// One undoable change, as the menu names it.
@@ -102,9 +105,14 @@ impl History {
 }
 
 fn record_is_empty(record: &Record) -> bool {
-    match &record.step {
+    step_is_empty(&record.step)
+}
+
+fn step_is_empty(step: &Step) -> bool {
+    match step {
         Step::Relocated(items) | Step::Trashed(items) => items.is_empty(),
         Step::Created(items) => items.is_empty(),
+        Step::Sequence(steps) => steps.iter().all(step_is_empty),
     }
 }
 
@@ -154,6 +162,22 @@ pub fn reverse(step: &Step) -> Reversed {
                     Step::Trashed(Vec::new())
                 }
             }
+        }
+        // The last step taken is the first undone — the transfer before the
+        // put-back, so the names it took are free again — and the inverse
+        // lists them in the order they were just done, which is the order
+        // redoing them reverses.
+        Step::Sequence(steps) => {
+            let mut inverses = Vec::new();
+            for step in steps.iter().rev() {
+                let done = reverse(step);
+                failed.extend(done.failed);
+                blocked.extend(done.blocked);
+                if let Some(inverse) = done.inverse {
+                    inverses.push(inverse);
+                }
+            }
+            Step::Sequence(inverses)
         }
         Step::Trashed(items) => {
             let mut back = Vec::new();
@@ -245,6 +269,35 @@ mod tests {
         assert_eq!(done.failed.len(), 1);
         assert_eq!(done.inverse, Some(Step::Relocated(Vec::new())));
         assert_eq!(std::fs::read_to_string(dir.join("a/x.txt")).unwrap(), "newer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sequence_is_undone_last_step_first_and_redone_in_order() {
+        let dir = std::env::temp_dir().join(format!("neutron-undo-seq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("stash")).unwrap();
+        std::fs::create_dir_all(dir.join("to")).unwrap();
+        // As a replacing move leaves things: the old file set aside, the new
+        // one in its place. (`stash` stands in for the Trash.)
+        std::fs::write(dir.join("stash/old.txt"), "old").unwrap();
+        std::fs::write(dir.join("to/a.txt"), "new").unwrap();
+        let step = Step::Sequence(vec![
+            Step::Trashed(vec![(dir.join("to/a.txt"), dir.join("stash/old.txt"))]),
+            Step::Relocated(vec![(dir.join("from/a.txt"), dir.join("to/a.txt"))]),
+        ]);
+
+        let done = reverse(&step);
+        assert!(done.failed.is_empty(), "{:?}", done.failed);
+        assert_eq!(std::fs::read_to_string(dir.join("from/a.txt")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(dir.join("to/a.txt")).unwrap(), "old", "the replaced file is back");
+        match done.inverse.unwrap() {
+            Step::Sequence(inverses) => {
+                assert!(matches!(inverses[0], Step::Relocated(_)), "the move was undone first");
+                assert!(matches!(inverses[1], Step::Created(_)), "then the put-back");
+            }
+            other => panic!("{other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

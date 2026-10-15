@@ -97,6 +97,9 @@ pub struct Report {
     /// Each item transferred: where it was, and where it is now. What undoing
     /// the transfer needs.
     pub moved: Vec<(PathBuf, PathBuf)>,
+    /// Each item replaced: where it was, and where in the Trash it went — so
+    /// undoing can put it back once the transfer is undone.
+    pub replaced: Vec<(PathBuf, PathBuf)>,
 }
 
 /// One item of a planned batch.
@@ -165,10 +168,17 @@ pub fn run(
         progress.set_current(&name);
 
         if job.replace {
-            if let Err(e) = crate::fileops::delete(std::slice::from_ref(&job.target), crate::fileops::Disposal::Recycle, 0) {
-                report.failed.push(format!("{name}: what was there could not be moved to the Trash ({e})"));
-                finish(progress, &mut base, size);
-                continue;
+            match crate::fileops::trash(std::slice::from_ref(&job.target)) {
+                Ok(went) => {
+                    if let Some(Some(went)) = went.into_iter().next() {
+                        report.replaced.push((job.target.clone(), went));
+                    }
+                }
+                Err(e) => {
+                    report.failed.push(format!("{name}: what was there could not be moved to the Trash ({e})"));
+                    finish(progress, &mut base, size);
+                    continue;
+                }
             }
         }
 
