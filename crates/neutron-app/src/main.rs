@@ -38,6 +38,7 @@ mod icon_service;
 mod index_client;
 mod loader;
 mod menubar;
+mod new_file;
 mod notice;
 mod preview;
 mod panes;

@@ -99,12 +99,12 @@ Finder's, with every command below in them. The keys follow the Finder's:
 | Key | Does |
 |---|---|
 | `Space`, `⌘Y` | Quick Look the selection; arrows move through the folder with it open |
-| `↩` | Rename |
+| `↩` | Rename; with several selected, Rename Items (replace, add text, or number them) |
 | `⌘O`, `⌘↓` | Open |
 | `⌘↑`, `⌘[`, `⌘]` | Enclosing folder, back, forward |
 | `⌘1` `⌘2` `⌘3` | Grid, list, columns |
 | `⌘D` | Duplicate |
-| `⌘Z`, `⇧⌘Z` | Undo and redo copies, moves, renames, new folders and Move to Trash |
+| `⌘Z`, `⇧⌘Z` | Undo and redo copies, moves, renames, new folders and files, and Move to Trash |
 | `⌘I` | Get Info (the Finder's window) |
 | `⌘⌫`, `⌘⌥⌫` | Move to Trash, delete immediately (asks first) |
 | `⌘⇧H` `⌘⇧D` `⌘⇧O` `⌘⌥L` `⌘⇧A` | Home, Desktop, Documents, Downloads, Applications |
@@ -113,6 +113,7 @@ Finder's, with every command below in them. The keys follow the Finder's:
 | `⌘E` | Eject the disk this folder is on |
 | `⌘K` | Connect to a server |
 | `⌘N`, `⌘W` | New window; close the tab, or the window on its last tab |
+| `⌘⌥N` | New file — an empty `untitled.txt`, ready to rename |
 | `⌃⌘T` | Add the folder to the sidebar |
 | `⌘⇧.` | Show hidden files |
 
@@ -121,13 +122,16 @@ partway through a file; when names are already taken you are asked whether to
 keep both, skip, or replace (the replaced items go to the Trash). Disks appear
 and disappear in the sidebar as they are mounted and ejected, with an eject
 button beside the ones that can be. Finder tags show as coloured dots after a
-file's name; **Tags** in its menu sets the colour tags, and the sidebar's Tags
+file's name; **Tags** in its menu sets the colour tags, **Edit Tags…** gives
+named ones, and the sidebar's Tags
 section lists every file with one, found by Spotlight. **View › Sort By** adds
 Date Added and Date Last Opened (from Spotlight, read only when asked for), and
 **Group By** gathers the list under headings by kind, date or size, as the
 Finder's Use Groups does. **Share…** in a file's
 menu (and in File) opens the system's share menu — AirDrop, Mail, Messages and
-the rest — and **AirDrop…** goes straight to AirDrop. A `.zip`, `.tar` or `.tar.gz` opens as a
+the rest — and **AirDrop…** goes straight to AirDrop, from inside archives
+too. **New File from Template**, in the menu for a folder's empty space,
+copies any file you keep in `~/Library/Application Support/Neutron/Templates`. A `.zip`, `.tar` or `.tar.gz` opens as a
 read-only folder you can browse, preview, Quick Look and copy out of;
 **Extract** in its menu unpacks the whole thing beside itself.
 

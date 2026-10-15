@@ -20,6 +20,7 @@ pub enum Cmd {
     NewWindow = 1,
     NewTab,
     NewFolder,
+    NewFile,
     Open,
     CloseTab,
     GetInfo,
@@ -92,7 +93,7 @@ pub enum Cmd {
 
 impl Cmd {
     const ALL: &'static [Cmd] = &[
-        Cmd::NewWindow, Cmd::NewTab, Cmd::NewFolder, Cmd::Open, Cmd::CloseTab, Cmd::GetInfo,
+        Cmd::NewWindow, Cmd::NewTab, Cmd::NewFolder, Cmd::NewFile, Cmd::Open, Cmd::CloseTab, Cmd::GetInfo,
         Cmd::Rename, Cmd::Duplicate, Cmd::MakeAlias, Cmd::QuickLook, Cmd::Share, Cmd::Compress, Cmd::Extract,
         Cmd::MoveToTrash, Cmd::DeleteImmediately, Cmd::Eject, Cmd::AddToSidebar, Cmd::Undo,
         Cmd::Redo, Cmd::Cut, Cmd::Copy, Cmd::Paste, Cmd::SelectAll, Cmd::CopyPath, Cmd::Filter,
@@ -152,6 +153,7 @@ pub fn menus() -> Vec<Menu> {
     let file = vec![
         item(Cmd::NewWindow, "New Window", cmd("n")),
         item(Cmd::NewFolder, "New Folder", Some(Key::cmd("n").shift())),
+        item(Cmd::NewFile, "New File", Some(Key::cmd("n").option())),
         item(Cmd::NewTab, "New Tab", cmd("t")),
         item(Cmd::Open, "Open", cmd("o")),
         item(Cmd::CloseTab, "Close Tab", cmd("w")),

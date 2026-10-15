@@ -96,6 +96,11 @@ enum Action {
     RenameCancel,
     /// Make a folder in the focused tab, then rename it.
     NewFolder,
+    /// Make a file in the focused tab — empty, or a copy of the named
+    /// template — then rename it.
+    NewFile(Option<String>),
+    /// Show the folder templates are kept in.
+    OpenTemplates,
     /// Rebuild the search index from the volumes, which needs administrator
     /// rights.
     RefreshIndex,
@@ -586,6 +591,8 @@ pub struct NeutronApp {
     pending_rename: Option<(TabId, String)>,
     tag_editor: Option<TagEditor>,
     batch_rename: Option<BatchRenameDialog>,
+    /// The names in the Templates folder, as last read on a worker.
+    templates: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// Folder names as they are created, from the apartment thread that made
     /// them.
     created_tx: crossbeam_channel::Sender<(TabId, String)>,
@@ -886,6 +893,7 @@ impl NeutronApp {
             pending_rename: None,
             tag_editor: None,
             batch_rename: None,
+            templates: Default::default(),
             created_tx,
             created_rx,
             cut_dir: None,
@@ -902,6 +910,7 @@ impl NeutronApp {
         if restore_windows {
             app.restore_windows(cc);
         }
+        app.refresh_templates();
         app
     }
 
@@ -1137,6 +1146,20 @@ impl NeutronApp {
             Action::NewFolder => {
                 if !self.refuse_without_a_path("create folders in") {
                     self.new_folder();
+                }
+            }
+            Action::NewFile(_) if self.on_server() => {
+                self.notices.error("New files can only be made in folders on this Mac");
+            }
+            Action::NewFile(template) => {
+                if !self.refuse_without_a_path("create files in") {
+                    self.new_file(template);
+                }
+            }
+            Action::OpenTemplates => {
+                // Made by the first reading of it, at startup.
+                if let (Some(dir), Some(tab)) = (crate::new_file::templates_dir(), self.workspace.active_tab_id()) {
+                    self.navigate(tab, NodeId::path(&dir));
                 }
             }
             Action::RefreshIndex => self.index.refresh_index(),
@@ -2318,6 +2341,46 @@ impl NeutronApp {
         });
     }
 
+    /// Creates a file in the focused tab and opens its rename box.
+    fn new_file(&mut self, template: Option<String>) {
+        let Some(tab_id) = self.workspace.active_tab_id() else { return };
+        let Some(dir) = self.workspace.tabs.get(&tab_id).and_then(|t| t.location().as_path()).map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let template = template.and_then(|name| crate::new_file::templates_dir().map(|d| d.join(name)));
+        let wake = self.ctx.clone();
+        let done = self.refresh_tx.clone();
+        let created = self.created_tx.clone();
+        let undo = self.undo_tx.clone();
+        let notices = self.notice_tx.clone();
+        self.sta.submit(move || {
+            match crate::new_file::create(&dir, template.as_deref()) {
+                Ok(name) => {
+                    let _ = undo.send(UndoEvent::Did(crate::undo::Record {
+                        label: "New File".into(),
+                        step: crate::undo::Step::Created(vec![dir.join(&name)]),
+                    }));
+                    let _ = created.send((tab_id, name));
+                }
+                Err(e) => report(&notices, format!("Could not create a file here: {e}")),
+            }
+            let _ = done.send(tab_id);
+            wake.request_repaint();
+        });
+    }
+
+    /// Reads the Templates folder again on a worker, for the next menu.
+    fn refresh_templates(&self) {
+        let templates = self.templates.clone();
+        self.sta.submit(move || {
+            let names = crate::new_file::templates();
+            if let Ok(mut held) = templates.lock() {
+                *held = names;
+            }
+        });
+    }
+
     /// Puts a newly created folder into its rename box, once its row exists.
     fn open_pending_rename(&mut self, ctx: &egui::Context) {
         let Some((tab_id, name)) = self.pending_rename.clone() else {
@@ -2940,6 +3003,20 @@ impl NeutronApp {
         let selected = visible_selection(tab);
 
         if selected.is_empty() {
+            // Moved up beside the system's New Folder; see `context_menu_overlay`.
+            rows.push(row("New File", Action::NewFile(None), &mut actions));
+            // As last read: reading them again now, for the next time, keeps
+            // the disk off the paint thread.
+            self.refresh_templates();
+            let templates = self.templates.lock().map(|t| t.clone()).unwrap_or_default();
+            let mut children: Vec<MenuItem> =
+                templates.into_iter().map(|name| row(&name, Action::NewFile(Some(name.clone())), &mut actions)).collect();
+            if !children.is_empty() {
+                children.push(MenuItem::separator());
+            }
+            children.push(row("Open Templates Folder", Action::OpenTemplates, &mut actions));
+            rows.push(MenuItem { label: "New File from Template".into(), enabled: true, children, ..Default::default() });
+            rows.push(MenuItem::separator());
             let views = [
                 ("List", file_list::ViewMode::List),
                 ("Grid", file_list::ViewMode::Grid),
@@ -3197,6 +3274,7 @@ impl NeutronApp {
             C::NewWindow => Action::NewWindow,
             C::NewTab => Action::NewTab(self.workspace.focused_group()?.id),
             C::NewFolder => Action::NewFolder,
+            C::NewFile => Action::NewFile(None),
             C::Open => Action::Activate(self.workspace.active_tab()?.selection.cursor()?),
             C::CloseTab => Action::CloseActiveTab,
             C::GetInfo => Action::GetInfoSelection,
@@ -3295,7 +3373,7 @@ impl NeutronApp {
                 C::Open | C::GetInfo | C::Rename | C::Duplicate | C::MakeAlias | C::QuickLook | C::Share | C::Compress
                 | C::MoveToTrash | C::DeleteImmediately | C::Cut | C::Copy => selected.is_empty(),
                 C::Extract => !archive,
-                C::NewFolder | C::Paste | C::Terminal => dir.is_none(),
+                C::NewFolder | C::NewFile | C::Paste | C::Terminal => dir.is_none(),
                 C::Back => !tab.is_some_and(|t| t.history.can_go_back()),
                 C::Forward => !tab.is_some_and(|t| t.history.can_go_forward()),
                 C::Eject => !ejectable,
@@ -3638,7 +3716,16 @@ impl NeutronApp {
                     self.menu_actions.push((id, action));
                 }
             }
-            let rows = self.menu_rows();
+            let mut rows = self.menu_rows();
+            // New File and its templates go just after the system's New
+            // Folder, where they are looked for.
+            if let Some(at) = items.iter().position(|i| i.label == "New Folder")
+                && rows.first().is_some_and(|r| r.label == "New File")
+            {
+                let new: Vec<_> = rows.drain(..2).collect();
+                rows.drain(..usize::from(rows.first().is_some_and(|r| r.separator)));
+                items.splice(at + 1..at + 1, new);
+            }
             if !rows.is_empty() {
                 items.push(neutron_core::MenuItem::separator());
                 items.extend(rows);
@@ -5804,6 +5891,7 @@ impl NeutronApp {
             C::Paste => Some(Action::Paste),
             C::Rename => Some(Action::BeginRename),
             C::NewFolder => Some(Action::NewFolder),
+            C::NewFile => Some(Action::NewFile(None)),
             C::Extract => Some(Action::ExtractSelection),
             C::Compress => Some(Action::CompressSelection),
             C::Duplicate => Some(Action::Duplicate),
