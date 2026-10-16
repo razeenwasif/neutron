@@ -32,6 +32,9 @@ pub mod attr {
     /// listing sets reaches: bit `n - 1` of the byte for Finder colour `n`.
     pub const TAG_SHIFT: u32 = 24;
     pub const TAG_MASK: u32 = 0x7F << TAG_SHIFT;
+    /// A folder whose size has been added up, so its size column holds the
+    /// total of what is in it rather than nothing in particular.
+    pub const MEASURED: u32 = 1 << 31;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -273,6 +276,18 @@ impl EntryList {
 
     pub fn set_opened(&mut self, i: usize, millis: i64) {
         self.opened[i] = millis;
+    }
+
+    /// Gives folder `i` the size of everything in it.
+    pub fn set_folder_size(&mut self, i: usize, size: u64) {
+        self.sizes[i] = size;
+        self.attrs[i] |= attr::MEASURED;
+    }
+
+    /// Whether entry `i`'s size means anything: a file's always does, a
+    /// folder's once it has been added up.
+    pub fn size_known(&self, i: usize) -> bool {
+        !self.kinds[i].is_container() || self.attrs[i] & attr::MEASURED != 0
     }
 
     pub fn modified(&self, i: usize) -> i64 {

@@ -127,7 +127,9 @@ named ones, and the sidebar's Tags
 section lists every file with one, found by Spotlight. **View › Sort By** adds
 Date Added and Date Last Opened (from Spotlight, read only when asked for), and
 **Group By** gathers the list under headings by kind, date or size, as the
-Finder's Use Groups does. **Share…** in a file's
+Finder's Use Groups does. **View › Calculate All Sizes** adds up every folder
+shown, in the background, newest folder first; **Calculate Size** in a
+folder's menu does it for that one. **Share…** in a file's
 menu (and in File) opens the system's share menu — AirDrop, Mail, Messages and
 the rest — and **AirDrop…** goes straight to AirDrop, from inside archives
 too. **New File from Template**, in the menu for a folder's empty space,

@@ -1221,9 +1221,9 @@ fn draw_row(
     );
     x += W_MODIFIED;
 
-    // --- size (blank for containers) ---
+    // --- size (blank for folders not added up) ---
     let size_rect = Rect::from_min_size(pos2(x, outer.top()), vec2(W_SIZE, ROW_HEIGHT));
-    let size_text = format::size((!kind.is_container()).then(|| list.size(idx)));
+    let size_text = format::size(list.size_known(idx).then(|| list.size(idx)));
     draw_cell_text(
         ui,
         size_rect.shrink2(vec2(12.0, 0.0)),

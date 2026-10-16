@@ -33,6 +33,7 @@ mod confirm;
 mod connect;
 mod dashboard;
 mod finder;
+mod folder_sizes;
 mod header;
 mod icon_service;
 mod index_client;

@@ -65,7 +65,8 @@ pub fn group_of(list: &EntryList, i: usize, group: GroupBy, now: i64) -> (u64, S
         GroupBy::Added => date_group(list.added(i), now),
         GroupBy::Opened => date_group(list.opened(i), now),
         GroupBy::Size => {
-            if list.kind(i).is_container() {
+            // A folder added up goes by its size, as a file does.
+            if !list.size_known(i) {
                 return (0, "Folders".to_owned());
             }
             const MB: u64 = 1 << 20;
@@ -361,7 +362,12 @@ pub fn sort(list: &mut EntryList, spec: SortSpec) {
 
         let ord = match spec.column {
             SortColumn::Name => natural_cmp(list.name(ai), list.name(bi)),
-            SortColumn::Size => list.size(ai).cmp(&list.size(bi)),
+            // A folder not added up counts as nothing: what the system
+            // reports for a folder itself says little about what is in it.
+            SortColumn::Size => {
+                let size = |i| if list.size_known(i) { list.size(i) } else { 0 };
+                size(ai).cmp(&size(bi))
+            }
             SortColumn::Modified => list.modified(ai).cmp(&list.modified(bi)),
             SortColumn::Created => list.created(ai).cmp(&list.created(bi)),
             SortColumn::Added => list.added(ai).cmp(&list.added(bi)),
@@ -657,5 +663,22 @@ mod tests {
         let names: Vec<&str> = list.order().iter().map(|&i| list.name(i as usize)).collect();
         // Medium (a, c) before Tiny (b), by name within each.
         assert_eq!(names, vec!["a.txt", "c.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn folders_go_by_their_size_once_added_up_and_as_nothing_before() {
+        let mut list = EntryList::new();
+        list.push(&mk("small", EntryKind::Directory, 4096, 0));
+        list.push(&mk("big", EntryKind::Directory, 96, 0));
+        list.push(&mk("unknown", EntryKind::Directory, 9999, 0));
+        list.set_folder_size(0, 10);
+        list.set_folder_size(1, 1 << 30);
+        assert!(!list.size_known(2) && list.size_known(1));
+        let spec = SortSpec { column: SortColumn::Size, order: SortOrder::Descending, ..Default::default() };
+        sort(&mut list, spec);
+        let names: Vec<&str> = list.order().iter().map(|&i| list.name(i as usize)).collect();
+        assert_eq!(names, vec!["big", "small", "unknown"]);
+        assert_eq!(group_of(&list, 1, GroupBy::Size, 0).1, "Huge");
+        assert_eq!(group_of(&list, 2, GroupBy::Size, 0).1, "Folders");
     }
 }

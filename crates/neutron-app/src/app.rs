@@ -68,6 +68,10 @@ enum Action {
     Marquee { from: usize, to: usize, additive: bool },
     SelectAll,
     ToggleHidden,
+    /// Add up the size of every folder shown, or stop.
+    ToggleAllSizes,
+    /// Add up the size of these folders.
+    CalculateSizes(Vec<PathBuf>),
     /// Step to the next view: list, grid, columns.
     ToggleView,
     /// Show the focused tab in this view.
@@ -553,6 +557,12 @@ pub struct NeutronApp {
     origin: Option<egui::Pos2>,
     /// The other windows, each with its state; see `WindowState`.
     windows: Vec<WindowState>,
+    /// Folder sizes, added up on a thread of their own.
+    sizer: crate::folder_sizes::Sizer,
+    /// Whether every folder shown is added up; see View › Calculate All Sizes.
+    all_sizes: bool,
+    /// The sizer's version each tab last took sizes from.
+    sizes_seen: std::collections::HashMap<TabId, u64>,
     /// Counts windows opened, to name each viewport.
     windows_opened: u64,
     mail: Mail,
@@ -893,6 +903,9 @@ impl NeutronApp {
             pending_rename: None,
             tag_editor: None,
             batch_rename: None,
+            sizer: crate::folder_sizes::Sizer::spawn(cc.egui_ctx.clone()),
+            all_sizes: saved_prefs(cc).all_sizes,
+            sizes_seen: std::collections::HashMap::new(),
             templates: Default::default(),
             created_tx,
             created_rx,
@@ -1403,6 +1416,22 @@ impl NeutronApp {
                 }
             }
 
+            Action::ToggleAllSizes => {
+                self.all_sizes = !self.all_sizes;
+                if self.all_sizes {
+                    let folders = self.shown_folders(|_| true);
+                    self.sizer.request(folders);
+                } else {
+                    // Forgotten, and each listing read again so its folders
+                    // lose the sizes they were given.
+                    self.sizer.clear();
+                    let tabs: Vec<TabId> = self.workspace.tabs.keys().copied().collect();
+                    for tab in tabs {
+                        self.refresh_in_place(tab);
+                    }
+                }
+            }
+            Action::CalculateSizes(folders) => self.sizer.request(folders),
             Action::ToggleHidden => {
                 // Every tab, not just the focused one. "Show hidden files" is
                 // an answer to "what do I want to see", not a property of one
@@ -2381,6 +2410,61 @@ impl NeutronApp {
         });
     }
 
+    /// The folders listed in this window's tabs, of those `pick` accepts.
+    fn shown_folders(&self, pick: impl Fn(&crate::workspace::Tab) -> bool) -> Vec<PathBuf> {
+        let mut folders = Vec::new();
+        for tab in self.workspace.tabs.values().filter(|t| pick(t)) {
+            if let Some(dir) = tab.location().as_path() {
+                folders.extend(
+                    (0..tab.list.len()).filter(|&i| tab.list.kind(i).is_container()).map(|i| dir.join(tab.list.name(i))),
+                );
+            }
+        }
+        folders
+    }
+
+    /// Takes in folder sizes, and while any are being added up, tells the
+    /// worker which folders every window still shows.
+    fn pump_sizes(&mut self) {
+        self.sizer.pump();
+        if self.sizer.busy() {
+            let shown = std::iter::once(&self.workspace)
+                .chain(self.windows.iter().map(|w| &w.workspace))
+                .flat_map(|ws| ws.tabs.values())
+                .filter_map(|t| t.location().as_path().map(Path::to_path_buf))
+                .collect();
+            self.sizer.set_shown(shown);
+        }
+    }
+
+    /// Gives this window's folders the sizes added up since they last looked.
+    fn apply_folder_sizes(&mut self) {
+        let version = self.sizer.version();
+        for (id, tab) in self.workspace.tabs.iter_mut() {
+            if self.sizes_seen.get(id) == Some(&version) {
+                continue;
+            }
+            self.sizes_seen.insert(*id, version);
+            let Some(dir) = tab.location().as_path().map(Path::to_path_buf) else { continue };
+            let mut changed = false;
+            for i in 0..tab.list.len() {
+                if !tab.list.kind(i).is_container() {
+                    continue;
+                }
+                if let Some(size) = self.sizer.get(&dir.join(tab.list.name(i)))
+                    && !(tab.list.size_known(i) && tab.list.size(i) == size)
+                {
+                    tab.list.set_folder_size(i, size);
+                    changed = true;
+                }
+            }
+            let by_size = tab.view.sort.column == SortColumn::Size || tab.view.sort.group == neutron_core::GroupBy::Size;
+            if changed && by_size {
+                neutron_core::sort::sort(&mut tab.list, tab.view.sort);
+            }
+        }
+    }
+
     /// Puts a newly created folder into its rename box, once its row exists.
     fn open_pending_rename(&mut self, ctx: &egui::Context) {
         let Some((tab_id, name)) = self.pending_rename.clone() else {
@@ -3072,6 +3156,11 @@ impl NeutronApp {
             if paths.iter().any(|p| neutron_archive::format_of(p).is_some()) {
                 rows.push(row("Extract", Action::ExtractSelection, &mut actions));
             }
+            let folders: Vec<PathBuf> =
+                selected.iter().filter(|&&i| tab.list.kind(i).is_container()).map(|&i| dir.join(tab.list.name(i))).collect();
+            if !folders.is_empty() && !self.all_sizes {
+                rows.push(row("Calculate Size", Action::CalculateSizes(folders), &mut actions));
+            }
             if cfg!(target_os = "macos") {
                 rows.push(row("Share…", Action::Share, &mut actions));
                 rows.push(row("AirDrop…", Action::AirDrop, &mut actions));
@@ -3318,6 +3407,7 @@ impl NeutronApp {
             C::GroupSize => Action::GroupBy(neutron_core::GroupBy::Size),
             C::ShowPreview => Action::TogglePreview,
             C::ShowHidden => Action::ToggleHidden,
+            C::AllSizes => Action::ToggleAllSizes,
             C::SplitRight => Action::Split(Axis::Horizontal),
             C::SplitDown => Action::Split(Axis::Vertical),
             C::AddressBar | C::GoToFolder => Action::ToggleAddress,
@@ -3413,6 +3503,9 @@ impl NeutronApp {
         }
         if self.preview.open {
             checked.insert(C::ShowPreview.tag());
+        }
+        if self.all_sizes {
+            checked.insert(C::AllSizes.tag());
         }
         neutron_shell::menubar::set_state(disabled, checked);
         // "Undo Move to Trash", as the Finder names it.
@@ -4002,6 +4095,7 @@ impl eframe::App for NeutronApp {
         // The theme belongs to the window, not to the pane tree, so the
         // workspace cannot fill it in itself.
         snapshot.prefs.light_theme = self.theme_mode == ThemeMode::Light;
+        snapshot.prefs.all_sizes = self.all_sizes;
         if let Ok(json) = serde_json::to_string(&snapshot) {
             storage.set_string(STORAGE_KEY, json);
         }
@@ -4266,6 +4360,7 @@ impl NeutronApp {
             self.refresh_finder();
         }
         neutron_shell::quicklook::pump();
+        self.pump_sizes();
         while let Ok((paths, at)) = self.share_rx.try_recv() {
             let shared = match at {
                 Some(at) => neutron_shell::share::share(&paths, at),
@@ -4323,6 +4418,7 @@ impl NeutronApp {
         }
 
         self.drain_loads(&ctx);
+        self.apply_folder_sizes();
         self.drain_refreshes();
         self.drain_open_as();
         self.drain_goto();
@@ -4639,6 +4735,16 @@ impl NeutronApp {
                         elapsed: loaded.enumerate_time + loaded.sort_time,
                     };
                     tab.list = loaded.list;
+                    self.sizes_seen.remove(&tab_id);
+                    if self.all_sizes
+                        && let Some(dir) = tab.location().as_path()
+                    {
+                        let folders = (0..tab.list.len())
+                            .filter(|&i| tab.list.kind(i).is_container())
+                            .map(|i| dir.join(tab.list.name(i)))
+                            .collect();
+                        self.sizer.request(folders);
+                    }
                     // The loader sorts and hides, but it never sees the filter
                     // field — a refresh keeps the filter text, so without this
                     // F5 or any change on disk listed the whole folder under a

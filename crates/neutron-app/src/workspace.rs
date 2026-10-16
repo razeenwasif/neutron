@@ -489,6 +489,9 @@ pub struct PersistedPrefs {
     /// groups.
     #[serde(default)]
     pub group: String,
+    /// Whether every folder shown has its size added up.
+    #[serde(default)]
+    pub all_sizes: bool,
 }
 
 impl PersistedPrefs {
@@ -717,6 +720,7 @@ impl Workspace {
             sort: String::new(),
             descending: tab.view.sort.order == neutron_core::SortOrder::Descending,
             group: String::new(),
+            all_sizes: false,
         };
         prefs.set_column(tab.view.sort.column);
         prefs.set_group(tab.view.sort.group);
