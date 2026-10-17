@@ -158,6 +158,22 @@ fn drag_event(mtm: MainThreadMarker, app: &NSApplication, window: &NSWindow) -> 
     .ok_or_else(|| "could not describe the drag to macOS".to_owned())
 }
 
+/// Where the pointer is on screen, in points from the top-left corner of the
+/// main display — the frame window positions are given in. `None` off the
+/// main thread.
+///
+/// Read from AppKit rather than from window events because while a drag is
+/// over a window, macOS sends it the drag and no mouse movement: the pointer
+/// the window last heard of is wherever the drag came in.
+pub fn pointer() -> Option<[f32; 2]> {
+    let mtm = MainThreadMarker::new()?;
+    let at = NSEvent::mouseLocation();
+    // AppKit counts up from the bottom of the main display.
+    let main = objc2_app_kit::NSScreen::screens(mtm).firstObject()?;
+    let height = main.frame().size.height;
+    Some([at.x as f32, (height - at.y) as f32])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

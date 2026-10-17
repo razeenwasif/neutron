@@ -131,6 +131,8 @@ pub enum ColumnAction {
         entry: Option<(String, EntryKind)>,
         double: bool,
     },
+    /// A row of another column dragged: drag that item out, as a file.
+    DragOut(PathBuf),
 }
 
 /// Draws the columns side by side. Returns the first action taken.
@@ -476,8 +478,17 @@ fn draw_column(ui: &mut Ui, p: &Palette, column: &Column<'_>) -> Option<ColumnAc
         None => scroll,
     };
 
+    let current = matches!(column.role, Role::Current { .. });
+    // A rubber band sweeps the current column, and dragged past its top or
+    // bottom edge scrolls it, as in the list.
+    let auto_scroll = if current { file_list::band_scroll_delta(ui, rect, ui.input(|i| i.stable_dt)) } else { 0.0 };
+
     let mut action = None;
     let output = scroll.show_rows(ui, ROW, rows, |ui, visible| {
+        if auto_scroll != 0.0 {
+            ui.scroll_with_delta_animation(vec2(0.0, auto_scroll), egui::style::ScrollAnimation::none());
+            ui.ctx().request_repaint();
+        }
         for position in visible {
             let idx = list.at(position);
             if let Some(a) = draw_entry(ui, p, column, list, idx) {
@@ -492,6 +503,12 @@ fn draw_column(ui: &mut Ui, p: &Palette, column: &Column<'_>) -> Option<ColumnAc
 
     if rows == 0 {
         note(ui, rect, "Empty folder", p.text_faint);
+    }
+
+    if let Role::Current { selection, .. } = &column.role {
+        if let Some(a) = sweep(ui, p, list, selection, rect, &output) {
+            action = Some(a);
+        }
     }
 
     // The space under the last row. `show_rows` sizes its content to exactly
@@ -529,6 +546,43 @@ fn draw_column(ui: &mut Ui, p: &Palette, column: &Column<'_>) -> Option<ColumnAc
     }
 
     action
+}
+
+/// The rubber band in the current column, and the drag of its selection out
+/// of the application: a press on a selected row drags them all, a press
+/// anywhere else sweeps a band. The list's gestures, on the column's rows.
+fn sweep(
+    ui: &Ui,
+    p: &Palette,
+    list: &EntryList,
+    selection: &Selection,
+    viewport: Rect,
+    output: &egui::scroll_area::ScrollAreaOutput<()>,
+) -> Option<ColumnAction> {
+    let rows = list.order().len();
+    let pitch = pitch(ui);
+    let offset = output.state.offset.y;
+    let start_area = file_list::band_start_area(ui.spacing().scroll, viewport, output.content_size.y > viewport.height());
+    // Arithmetic, as in the list: rows are all one height.
+    let position_at = |screen: egui::Pos2| -> Option<usize> {
+        let y = screen.y - viewport.top() + offset;
+        (y >= 0.0).then(|| (y / pitch) as usize).filter(|&row| row < rows)
+    };
+    let band = file_list::track_band(ui, viewport, start_area, offset, |screen| {
+        position_at(screen).is_some_and(|row| selection.is_selected(list.at(row)))
+    });
+    if band.drag_out {
+        return Some(ColumnAction::Current(FileListAction::DragOut));
+    }
+    let rect = band.rect?;
+    file_list::draw_band(ui, p, rect, viewport, offset);
+    ui.ctx().request_repaint();
+    if rows == 0 {
+        return None;
+    }
+    let from = ((rect.top() / pitch).floor().max(0.0) as usize).min(rows - 1);
+    let to = ((rect.bottom() / pitch).floor().max(0.0) as usize).min(rows - 1);
+    Some(ColumnAction::Current(FileListAction::Marquee { from, to, additive: band.additive }))
 }
 
 /// The vertical offset to jump to this frame, if any.
@@ -618,8 +672,10 @@ fn draw_entry(
     list: &EntryList,
     idx: usize,
 ) -> Option<ColumnAction> {
-    let (outer, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
+    // Rows of other columns can be dragged out one at a time; the current
+    // column's drags are its selection's, tracked for the whole column.
+    let sense = if matches!(column.role, Role::Named { .. }) { Sense::click_and_drag() } else { Sense::click() };
+    let (outer, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), sense);
     if !ui.is_rect_visible(outer) {
         return None;
     }
@@ -627,6 +683,9 @@ fn draw_entry(
 
     let name = list.name(idx);
     let kind = list.kind(idx);
+    if crate::drop::accepts(name, kind) {
+        crate::drop::offer(ui, rect, &column.dir.join(name), 11.0);
+    }
 
     let (selected, is_cursor, rename) = match &column.role {
         Role::Current { selection, rename, .. } => (
@@ -780,6 +839,9 @@ fn draw_entry(
             }
         }
         Role::Named { .. } => {
+            if response.drag_started() {
+                return Some(ColumnAction::DragOut(column.dir.join(name)));
+            }
             // A right-click picks the row too: what it is about has to be the
             // selection before any menu can act on it.
             let double = response.double_clicked();
@@ -1168,6 +1230,101 @@ mod tests {
         assert_eq!(
             action,
             Some(ColumnAction::Current(FileListAction::Select { idx: here.at(9), mode: SelectMode::Replace }))
+        );
+    }
+
+    /// Frames in turn, one batch of events each; the actions each returned.
+    fn run_frames(columns: &[Column<'_>], frames: Vec<Vec<egui::Event>>) -> Vec<Option<ColumnAction>> {
+        run_frames_in(&egui::Context::default(), columns, frames)
+    }
+
+    fn run_frames_in(ctx: &egui::Context, columns: &[Column<'_>], frames: Vec<Vec<egui::Event>>) -> Vec<Option<ColumnAction>> {
+        let input = |events| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut actions = Vec::new();
+        for events in std::iter::once(Vec::new()).chain(frames) {
+            let mut action = None;
+            let mut output = ctx.run_ui(input(events), |ui| {
+                action = show(ui, &Palette::LIGHT, columns, None);
+            });
+            output.textures_delta.clear();
+            actions.push(action);
+        }
+        actions
+    }
+
+    fn press(at: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn a_band_in_the_current_column_selects_the_rows_it_covers() {
+        let parent = listing(&[("src", EntryKind::Directory)]);
+        let here = listing(&["a", "b", "c", "d", "e"].map(|n| (n, EntryKind::File)));
+        let selection = Selection::new();
+        let columns = [
+            Column { dir: Path::new("/p"), contents: Contents::Ready(&parent), role: Role::Named { highlight: Some("src") }, cut: None, icons: None },
+            Column {
+                dir: Path::new("/p/src"),
+                contents: Contents::Ready(&here),
+                role: Role::Current { selection: &selection, rename: None, scroll_to: None },
+                cut: None,
+                icons: None,
+            },
+        ];
+        let pitch = ROW + egui::Style::default().spacing.item_spacing.y;
+        let x = COLUMN_WIDTH + 100.0;
+        let (from, to) = (pos2(x, pitch * 0.5), pos2(x + 10.0, pitch * 2.5));
+        let ctx = egui::Context::default();
+        let actions = run_frames_in(
+            &ctx,
+            &columns,
+            vec![
+                vec![egui::Event::PointerMoved(from), press(from, true)],
+                vec![egui::Event::PointerMoved(to)],
+            ],
+        );
+        assert_eq!(
+            actions.last().cloned().flatten(),
+            Some(ColumnAction::Current(FileListAction::Marquee { from: 0, to: 2, additive: false }))
+        );
+        // What follows the selection waits while the band is held …
+        assert!(file_list::sweeping(&ctx));
+        // … and not once it is let go.
+        run_frames_in(&ctx, &columns, vec![vec![press(to, false)], vec![]]);
+        assert!(!file_list::sweeping(&ctx));
+    }
+
+    #[test]
+    fn a_row_of_another_column_is_dragged_out_by_its_path() {
+        let parent = listing(&[("docs", EntryKind::Directory), ("src", EntryKind::Directory)]);
+        let here = listing(&[("main.rs", EntryKind::File)]);
+        let selection = Selection::new();
+        let columns = [
+            Column { dir: Path::new("/p"), contents: Contents::Ready(&parent), role: Role::Named { highlight: Some("src") }, cut: None, icons: None },
+            Column {
+                dir: Path::new("/p/src"),
+                contents: Contents::Ready(&here),
+                role: Role::Current { selection: &selection, rename: None, scroll_to: None },
+                cut: None,
+                icons: None,
+            },
+        ];
+        let (from, to) = (pos2(100.0, ROW / 2.0), pos2(160.0, ROW / 2.0 + 40.0));
+        let actions = run_frames(
+            &columns,
+            vec![
+                vec![egui::Event::PointerMoved(from), press(from, true)],
+                vec![egui::Event::PointerMoved(pos2(110.0, ROW / 2.0))],
+                vec![egui::Event::PointerMoved(to)],
+            ],
+        );
+        assert!(
+            actions.contains(&Some(ColumnAction::DragOut(PathBuf::from("/p/docs")))),
+            "{actions:?}"
         );
     }
 }

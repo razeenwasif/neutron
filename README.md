@@ -608,7 +608,8 @@ do not.
 | `Alt+←` `Alt+→` | Back / forward |
 | *type a name* | Jump to it; repeat a letter to cycle matches |
 | `Ctrl+A` | Select all |
-| *press and drag* | Rubber-band select (hold `Ctrl` to add) |
+| *press and drag* | Rubber-band select (hold `Ctrl`, `⌘` on a Mac, to add), in the list, grid and columns |
+| *drag a selected item* | Drag the whole selection out — to another app, or onto a folder row or sidebar place to put it inside (the Trash moves it to the Trash; hold `⌥` to copy) |
 | `Ctrl+C` `Ctrl+X` `Ctrl+V` | Copy / cut / paste, through the real Windows clipboard |
 | `F2` | Rename in place, with the stem selected |
 | `Ctrl+Shift+N` | New folder, ready to be named |

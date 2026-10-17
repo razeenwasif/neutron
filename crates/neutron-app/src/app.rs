@@ -90,6 +90,8 @@ enum Action {
     FocusFilter,
     /// Drag the selection out to another application.
     DragOut,
+    /// Drag these items out, whatever is selected.
+    DragPaths(Vec<PathBuf>),
     /// Start renaming the focused tab's cursor row.
     BeginRename,
     /// The rename box's contents changed.
@@ -210,6 +212,8 @@ enum Action {
     ContextMenu { idx: Option<usize>, pos: egui::Pos2 },
     /// Files dropped from another application onto a pane.
     DropFiles { group: GroupId, paths: Vec<PathBuf>, copy: bool },
+    /// Files dropped onto a folder: a row, or a place in the sidebar.
+    DropInto { dir: PathBuf, paths: Vec<PathBuf>, copy: bool },
 
     // --- finder overlay ---
     ToggleFinder(Mode),
@@ -475,6 +479,12 @@ pub struct NeutronApp {
     tab_drag: Option<TabDrag>,
     /// Last title pushed to the OS, so it is only sent when it changes.
     last_title: String,
+    /// Where a drag over this window is, this frame, and the panes it could
+    /// land in; see `resolve_drop`.
+    drop_at: Option<egui::Pos2>,
+    drop_panes: std::cell::RefCell<Vec<(GroupId, egui::Rect)>>,
+    #[cfg(test)]
+    drop_debug: Vec<neutron_ui::drop::Target>,
     /// The first window's frame as last seen, saved in eframe's own format;
     /// see `root_window_settings`.
     root_frame: Option<String>,
@@ -849,6 +859,10 @@ impl NeutronApp {
             tab_drag: None,
             last_title: String::new(),
             root_frame: None,
+            drop_at: None,
+            drop_panes: Default::default(),
+            #[cfg(test)]
+            drop_debug: Vec::new(),
             icon_texture: None,
             ctx: cc.egui_ctx.clone(),
             index,
@@ -1135,6 +1149,11 @@ impl NeutronApp {
                 }
             }
 
+            Action::DragPaths(paths) => {
+                if let Some(tab) = self.workspace.active_tab_id() {
+                    self.drag_paths(tab, paths);
+                }
+            }
             Action::DragOut => {
                 if !self.refuse_without_a_path("drag files out of") {
                     self.drag_out();
@@ -1736,6 +1755,7 @@ impl NeutronApp {
                     self.drop_files(group, paths, copy);
                 }
             }
+            Action::DropInto { dir, paths, copy } => self.drop_into(dir, paths, copy),
 
             Action::ToggleFinder(mode) => {
                 self.finder.toggle(mode);
@@ -2152,6 +2172,12 @@ impl NeutronApp {
         let Some((tab_id, _, paths)) = self.selection_paths() else {
             return;
         };
+        self.drag_paths(tab_id, paths);
+    }
+
+    /// Drags `paths` out of the application, re-listing `tab_id` after a drop
+    /// where the system cannot say whether they left.
+    fn drag_paths(&mut self, tab_id: TabId, paths: Vec<PathBuf>) {
 
         // On the Mac a drag is started on the UI thread and does not block:
         // AppKit runs it from the event loop this thread already owns. On
@@ -3601,7 +3627,12 @@ impl NeutronApp {
         let Some(paths) = self.chosen_paths() else {
             return;
         };
+        self.dispose(tab_id, paths, permanent);
+    }
 
+    /// Moves `paths` to the Trash, or deletes them for good, then re-lists
+    /// `tab_id`.
+    fn dispose(&mut self, tab_id: TabId, paths: Vec<PathBuf>, permanent: bool) {
         let disposal = if permanent {
             neutron_shell::fileops::Disposal::Permanent
         } else {
@@ -3645,6 +3676,75 @@ impl NeutronApp {
         });
     }
 
+    /// A drag over this window: lights the folder or pane it would land in,
+    /// and on the drop sends the files there. A folder under the pointer — a
+    /// row, a place in the sidebar — wins over the pane around it.
+    fn resolve_drop(&mut self, ctx: &egui::Context, p: &Palette, actions: &mut Vec<Action>) {
+        let targets = neutron_ui::drop::take(ctx);
+        #[cfg(test)]
+        {
+            self.drop_debug = targets.clone();
+        }
+        if !neutron_ui::drop::active(ctx) || self.modal() {
+            return;
+        }
+        let Some(at) = self.drop_at else { return };
+        let pane = self.drop_panes.borrow().iter().find(|(_, r)| r.contains(at)).copied();
+        // Later offers are drawn on top.
+        let hit = targets.iter().rev().find(|t| t.rect.contains(at));
+        // A name in a list is inside the folder its pane shows.
+        let dir = hit.and_then(|t| {
+            if t.path.is_absolute() {
+                return Some(t.path.clone());
+            }
+            let (group, _) = pane?;
+            let tab = self.workspace.groups.get(&group)?.active_tab()?;
+            Some(self.workspace.tabs.get(&tab)?.location().as_path()?.join(&t.path))
+        });
+
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("neutron-drop")));
+        match (hit, &dir, pane) {
+            (Some(t), Some(_), _) => {
+                painter.rect_filled(t.rect, t.radius, theme::with_alpha(p.accent, 40));
+                painter.rect_stroke(t.rect, t.radius, egui::Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+            }
+            // The only place the accent outlines a whole pane, which is what
+            // makes "this one" unmistakable while dragging.
+            (_, _, Some((_, rect))) => {
+                painter.rect_stroke(
+                    rect.shrink(2.0),
+                    theme::RADIUS_CARD as f32,
+                    egui::Stroke::new(2.0, p.accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            _ => {}
+        }
+        ctx.request_repaint();
+
+        let (dropped, copy) = ctx.input(|i| {
+            (
+                i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>(),
+                if cfg!(target_os = "macos") { i.modifiers.alt } else { i.modifiers.ctrl },
+            )
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        match (dir, pane) {
+            (Some(dir), _) => actions.push(Action::DropInto { dir, paths: dropped, copy }),
+            (None, Some((group, _))) => {
+                // The drop lands here, and the checks that run on it — is this
+                // a folder with a path at all? — read the focused pane.
+                if group != self.workspace.focused {
+                    actions.push(Action::FocusGroup(group));
+                }
+                actions.push(Action::DropFiles { group, paths: dropped, copy });
+            }
+            _ => {}
+        }
+    }
+
     /// Copies or moves files dropped from another application into `group`.
     fn drop_files(&mut self, group: GroupId, paths: Vec<PathBuf>, copy: bool) {
         let Some(tab_id) = self
@@ -3664,7 +3764,32 @@ impl NeutronApp {
         else {
             return;
         };
+        self.transfer_dropped(tab_id, dir, paths, copy);
+    }
 
+    /// Puts files dropped on a folder inside it — or, dropped on the Trash,
+    /// in the Trash, as the Finder does.
+    fn drop_into(&mut self, dir: PathBuf, paths: Vec<PathBuf>, copy: bool) {
+        let Some(tab_id) = self.workspace.active_tab_id() else { return };
+        if trash_folder().is_some_and(|t| t == dir) {
+            self.dispose(tab_id, paths, false);
+            return;
+        }
+        // Not into itself, nor into a folder inside it; and what is already
+        // in the folder stays where it is.
+        if let Some(inside) = paths.iter().find(|p| dir.starts_with(p)) {
+            let name = inside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            self.notices.error(format!("{name} cannot be put inside itself"));
+            return;
+        }
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| p.parent() != Some(dir.as_path()) || copy).collect();
+        if !paths.is_empty() {
+            self.transfer_dropped(tab_id, dir, paths, copy);
+        }
+    }
+
+    /// Plans the copy or move of dropped files into `dir`, on a worker.
+    fn transfer_dropped(&mut self, tab_id: TabId, dir: PathBuf, paths: Vec<PathBuf>, copy: bool) {
         use neutron_shell::fileops::Transfer;
         let wake = self.ctx.clone();
         let planned = self.planned_tx.clone();
@@ -4458,6 +4583,9 @@ impl NeutronApp {
             neutron_ui::ambient::paint(&bg, screen, &p);
         }
 
+        self.drop_at = drop_pointer(&ctx);
+        self.drop_panes.borrow_mut().clear();
+        neutron_ui::drop::take(&ctx);
         self.drain_loads(&ctx);
         self.apply_folder_sizes();
         self.drain_refreshes();
@@ -4528,6 +4656,7 @@ impl NeutronApp {
         self.clash_overlay(ui, &p);
         self.tag_editor_overlay(ui, &p, &mut actions);
         self.batch_rename_overlay(ui, &p, &mut actions);
+        self.resolve_drop(&ctx, &p, &mut actions);
 
         // Queued *after* drawing so a `DropTab` pushed by a tab strip this
         // frame is applied first. Pushed before it, this would clear the drag
@@ -7110,7 +7239,8 @@ impl NeutronApp {
     /// Called before drawing, so the pane paints this frame's answer rather
     /// than last frame's.
     fn pump_preview(&mut self, ctx: &egui::Context) {
-        if !self.preview.open {
+        // Not while a band sweeps the rows: the cursor moves with it.
+        if !self.preview.open || file_list::sweeping(ctx) {
             return;
         }
 
@@ -7758,58 +7888,11 @@ impl NeutronApp {
             });
         }
 
-        // Files dragged in from another application. winit owns the window's
-        // IDropTarget, so this arrives through egui as plain paths rather than
-        // through an IDropTarget of our own — enough to act on, though it means
-        // no drop-effect feedback in the source application.
-        //
-        // Handled here rather than centrally because the pane under the pointer
-        // is the destination, and only that pane can answer which one it is.
+        // Files dragged over the window are seen to once it is all drawn, when
+        // every folder a drop could go into has said where it is; see
+        // `resolve_drop`. All this pane says is where it is.
         let pane_rect = ui.min_rect().union(ui.max_rect());
-        let pointer_here = ui
-            .ctx()
-            .pointer_hover_pos()
-            .is_some_and(|p| pane_rect.contains(p));
-
-        if pointer_here {
-            let (hovering, dropped, ctrl) = ui.ctx().input(|i| {
-                (
-                    !i.raw.hovered_files.is_empty(),
-                    i.raw
-                        .dropped_files
-                        .iter()
-                        .map(|f| f.path().to_path_buf())
-                        .collect::<Vec<_>>(),
-                    if cfg!(target_os = "macos") { i.modifiers.alt } else { i.modifiers.ctrl },
-                )
-            });
-
-            if hovering {
-                // The only place the accent outlines a whole pane, which is
-                // what makes "this one" unmistakable while dragging.
-                ui.painter().rect_stroke(
-                    pane_rect.shrink(2.0),
-                    theme::RADIUS_CARD as f32,
-                    egui::Stroke::new(2.0, p.accent),
-                    egui::StrokeKind::Inside,
-                );
-            }
-
-            if !dropped.is_empty() {
-                // The drop lands here, and the checks that run on it — is this
-                // a folder with a path at all? — read the focused pane. So this
-                // one is focused first; otherwise a drop on a local pane while
-                // a server pane had focus was refused in the server's name.
-                if group_id != self.workspace.focused {
-                    actions.push(Action::FocusGroup(group_id));
-                }
-                actions.push(Action::DropFiles {
-                    group: group_id,
-                    paths: dropped,
-                    copy: ctrl,
-                });
-            }
-        }
+        self.drop_panes.borrow_mut().push((group_id, pane_rect));
 
         // A folder's footer is carved off the bottom of its pane before the
         // listing is laid out, so the rows end above it rather than under it.
@@ -7982,7 +8065,9 @@ impl NeutronApp {
         use neutron_ui::columns::{Column, ColumnAction, Contents, Role};
 
         let chain = crate::columns::chain(dir, self.home.as_deref());
-        let peek = crate::columns::peek(tab);
+        // Not while a band sweeps: a folder it crosses first would open its
+        // column for a moment.
+        let peek = crate::columns::peek(tab).filter(|_| !file_list::sweeping(ui.ctx()));
         let arriving = crate::columns::arriving(tab);
         let current = chain.len() - 1;
 
@@ -8051,7 +8136,7 @@ impl NeutronApp {
         // The selected file, described in a column at the end — when exactly
         // one thing is selected and it is not a folder, whose contents take
         // that place instead.
-        let described = (!arriving && peek.is_none())
+        let described = (!arriving && peek.is_none() && !file_list::sweeping(ui.ctx()))
             .then(|| visible_selection(tab))
             .filter(|selected| selected.len() == 1)
             .map(|selected| selected[0])
@@ -8076,6 +8161,7 @@ impl NeutronApp {
                 ColumnAction::Pick { dir, entry, double } => {
                     actions.push(Action::ColumnPick { dir, entry, double })
                 }
+                ColumnAction::DragOut(path) => actions.push(Action::DragPaths(vec![path])),
                 ColumnAction::Open => {
                     if let Some(idx) = described {
                         actions.push(Action::Activate(idx));
@@ -8136,7 +8222,7 @@ impl NeutronApp {
             let chain = crate::columns::chain(dir, self.home.as_deref());
             let upto = if crate::columns::arriving(tab) { chain.len() } else { chain.len() - 1 };
             wanted.extend(chain.into_iter().take(upto).map(want));
-            if let Some(peek) = crate::columns::peek(tab) {
+            if let Some(peek) = crate::columns::peek(tab).filter(|_| !file_list::sweeping(&self.ctx)) {
                 wanted.push(want(peek));
             }
         }
@@ -8559,6 +8645,21 @@ fn interface_faces() -> Option<theme::Faces> {
 }
 
 /// The user's Trash folder.
+/// Where the pointer is in this window, in its own points. While files are
+/// dragged over it the window hears of the drag, not of the pointer moving,
+/// so the system is asked directly.
+fn drop_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
+    if neutron_ui::drop::active(ctx) {
+        let (inner, native, ppp) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().native_pixels_per_point, i.pixels_per_point));
+        if let (Some([x, y]), Some(inner)) = (neutron_shell::dragout::pointer(), inner) {
+            // Screen points to egui's, which differ when the interface is zoomed.
+            let scale = native.unwrap_or(ppp) / ppp;
+            return Some(egui::pos2(x * scale, y * scale) - inner.min.to_vec2());
+        }
+    }
+    ctx.pointer_hover_pos()
+}
+
 fn trash_folder() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".Trash"))
 }
@@ -8769,6 +8870,56 @@ mod screens {
     fn act(harness: &mut egui_kittest::Harness<'_, NeutronApp>, action: Action) {
         let ctx = harness.ctx.clone();
         harness.state_mut().apply(&ctx, action);
+    }
+
+    /// A file as the system hands over a drop of one.
+    #[derive(Debug)]
+    struct Dropped(PathBuf);
+
+    impl egui::DroppedFile for Dropped {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+
+    /// A file dropped on a folder's row goes inside that folder, in each view.
+    #[test]
+    #[ignore]
+    fn a_drop_on_a_folder_row_goes_inside_it() {
+        let root = std::env::temp_dir().join(format!("neutron-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (here, away) = (root.join("here"), root.join("away"));
+        std::fs::create_dir_all(here.join("inbox")).unwrap();
+        std::fs::create_dir_all(&away).unwrap();
+        for view in [file_list::ViewMode::List, file_list::ViewMode::Grid, file_list::ViewMode::Columns] {
+            let file = away.join(format!("{view:?}.txt"));
+            std::fs::write(&file, "x").unwrap();
+            let (_keep, opened) = crossbeam_channel::unbounded();
+            let folder = here.display().to_string();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1440.0, 900.0))
+                .with_pixels_per_point(1.0)
+                .wgpu()
+                .build_eframe(|cc| NeutronApp::new(cc, StartupTimer::new(Instant::now()), Some(folder), opened));
+            act(&mut harness, Action::SetView(view));
+            settle(&mut harness);
+            // Where the inbox is drawn: the target it offers while a drag is on.
+            harness.input_mut().hovered_files.push(egui::HoveredFile { path: Some(file.clone()), ..Default::default() });
+            harness.run_steps(2);
+            let target = harness.state().drop_debug.clone().into_iter().find(|t| t.path.ends_with("inbox")).unwrap();
+            harness.hover_at(target.rect.center());
+            harness.input_mut().hovered_files.push(egui::HoveredFile { path: Some(file.clone()), ..Default::default() });
+            harness.run_steps(1);
+            harness.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(file.clone())));
+            harness.run_steps(1);
+            settle(&mut harness);
+            assert!(here.join("inbox").join(file.file_name().unwrap()).exists(), "{view:?}: not moved into the folder");
+            assert!(!file.exists(), "{view:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -145,6 +145,11 @@ pub fn drive_row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeI
     if !ui.is_rect_visible(rect) {
         return RowHit::of(&response, rect);
     }
+    // A folder on disk takes a drop, as the Finder's sidebar does; the Trash
+    // takes one as a move to the Trash.
+    if let Some(path) = place.id.as_path() {
+        neutron_ui::drop::offer(ui, rect, path, 12.0);
+    }
 
     let selected = current == Some(&place.id);
     let corners = CornerRadius::same(12);

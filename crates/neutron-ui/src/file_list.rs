@@ -487,13 +487,13 @@ fn remember_scroll(ui: &Ui, which: &str, id: egui::Id) {
 /// moved underneath, so the selection would drift away from the rows the user
 /// was pointing at. Anchoring in content space means the origin stays glued to
 /// the row it started on.
-struct Band {
+pub(crate) struct Band {
     /// Rectangle in content coordinates, or `None` when no band is in progress.
-    rect: Option<Rect>,
-    additive: bool,
+    pub rect: Option<Rect>,
+    pub additive: bool,
     /// The press was on a selected row and has now travelled: drag the
     /// selection out of the application.
-    drag_out: bool,
+    pub drag_out: bool,
 }
 
 impl Band {
@@ -567,7 +567,7 @@ const BAND_SCROLL_MARGIN: f32 = 24.0;
 /// Read from the drag state stored last frame, because this has to be applied
 /// *inside* the scroll area and the band is not tracked until after it. One
 /// frame of lag during a continuous gesture is not visible.
-fn band_scroll_delta(ui: &Ui, viewport: Rect, seconds: f32) -> f32 {
+pub(crate) fn band_scroll_delta(ui: &Ui, viewport: Rect, seconds: f32) -> f32 {
     let dragging_band = ui
         .ctx()
         .data(|d| d.get_temp::<Drag>(band_origin_id(ui)))
@@ -604,7 +604,7 @@ fn band_scroll_delta(ui: &Ui, viewport: Rect, seconds: f32) -> f32 {
 }
 
 /// `viewport` with the scroll bar's strip taken off its right edge.
-fn band_start_area(
+pub(crate) fn band_start_area(
     scroll: egui::style::ScrollStyle,
     viewport: Rect,
     overflowing: bool,
@@ -623,7 +623,7 @@ fn band_start_area(
 /// `viewport` is the scroll area's rect, used to convert screen positions into
 /// content ones. `start_area` is where a press may *begin* a band, which is
 /// `viewport` minus the scroll bar's strip.
-fn track_band(
+pub(crate) fn track_band(
     ui: &Ui,
     viewport: Rect,
     start_area: Rect,
@@ -703,6 +703,9 @@ fn track_band(
         };
     }
 
+    // Read before taking the lock: asking for it inside would wait on itself.
+    let now = ui.ctx().cumulative_pass_nr();
+    ui.ctx().data_mut(|d| d.insert_temp(sweeping_id(), now));
     Band {
         rect: Some(rect),
         additive: ctrl,
@@ -710,7 +713,24 @@ fn track_band(
     }
 }
 
-fn draw_band(ui: &Ui, p: &Palette, band: Rect, viewport: Rect, scroll_offset: f32) {
+fn sweeping_id() -> egui::Id {
+    egui::Id::new("neutron-sweeping")
+}
+
+/// Whether a rubber band is being dragged in this window, in any list, grid or
+/// column. The selection changes with every row the band crosses, so what
+/// follows the selection — a preview, the column describing the one file
+/// chosen — waits for the band to be let go rather than flashing up for the
+/// first row it touches.
+///
+/// True for the frame after the band was last tracked too: what reads this is
+/// drawn before the band is, and would otherwise see the frame before.
+pub fn sweeping(ctx: &egui::Context) -> bool {
+    let now = ctx.cumulative_pass_nr();
+    ctx.data(|d| d.get_temp::<u64>(sweeping_id())).is_some_and(|at| at + 1 >= now)
+}
+
+pub(crate) fn draw_band(ui: &Ui, p: &Palette, band: Rect, viewport: Rect, scroll_offset: f32) {
     let screen = Rect::from_min_max(
         pos2(
             band.left() + viewport.left(),
@@ -1088,6 +1108,10 @@ fn draw_row(
         pos2(outer.left() + LIST_PAD * 0.5, outer.top() + 1.0),
         pos2(outer.right() - LIST_PAD * 0.5, outer.bottom() - 1.0),
     );
+
+    if crate::drop::accepts(list.name(idx), list.kind(idx)) {
+        crate::drop::offer(ui, rect, std::path::Path::new(list.name(idx)), RADIUS_CONTROL as f32);
+    }
 
     let selected = marks.selection.is_selected(idx);
     let is_cursor = marks.selection.cursor() == Some(idx);
@@ -1484,6 +1508,9 @@ fn draw_tile(
     icons: Option<&dyn IconSource>,
 ) -> Option<FileListAction> {
     let response = ui.interact(rect, ui.id().with(("tile", idx)), Sense::click());
+    if crate::drop::accepts(list.name(idx), list.kind(idx)) {
+        crate::drop::offer(ui, rect, std::path::Path::new(list.name(idx)), theme::RADIUS_WELL as f32);
+    }
 
     let selected = marks.selection.is_selected(idx);
     let is_cursor = marks.selection.cursor() == Some(idx);

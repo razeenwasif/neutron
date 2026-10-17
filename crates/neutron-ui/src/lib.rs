@@ -7,6 +7,7 @@ pub mod ambient;
 pub mod atlas;
 pub mod columns;
 pub mod context_menu;
+pub mod drop;
 pub mod file_list;
 pub mod format;
 pub mod icons;

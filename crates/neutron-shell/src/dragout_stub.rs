@@ -11,3 +11,7 @@ pub enum Dropped {
 pub fn drag(_paths: &[PathBuf], _owner: isize) -> Result<Dropped, String> {
     Err("dragging out is Windows-only".to_owned())
 }
+
+pub fn pointer() -> Option<[f32; 2]> {
+    None
+}

@@ -234,3 +234,7 @@ impl Drop for Pidl {
         unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(self.0 as *const _)) };
     }
 }
+
+pub fn pointer() -> Option<[f32; 2]> {
+    None
+}
