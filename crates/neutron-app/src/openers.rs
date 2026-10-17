@@ -6,9 +6,10 @@
 //! { "pdf": "/Applications/Quark.app" }
 //! ```
 //!
-//! The app is started with the file as its argument, a new instance each
-//! time, so an app that reads its files from the command line rather than
-//! declaring document types to macOS still opens them.
+//! An app that declares document types to macOS is sent the file as the
+//! Finder sends one, so a running app opens it rather than a second copy
+//! starting. One that declares none is started with the file as its
+//! argument, a new instance each time — the only way such an app hears of it.
 
 use std::path::{Path, PathBuf};
 
@@ -30,16 +31,26 @@ fn app_in(config: &str, file: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(app)).filter(|p| p.exists())
 }
 
+/// Whether `app` tells macOS what documents it opens.
+fn declares_documents(app: &Path) -> bool {
+    std::process::Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleDocumentTypes", "raw", "-o", "/dev/null"])
+        .arg(app.join("Contents/Info.plist"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Opens `file` with `app`. Blocks until the launch is handed to macOS.
 pub fn open_with(app: &Path, file: &Path) -> Result<(), String> {
-    let status = std::process::Command::new("/usr/bin/open")
-        .arg("-n")
-        .arg("-a")
-        .arg(app)
-        .arg("--args")
-        .arg(file)
-        .status()
-        .map_err(|e| e.to_string())?;
+    let mut open = std::process::Command::new("/usr/bin/open");
+    if declares_documents(app) {
+        open.arg("-a").arg(app).arg(file);
+    } else {
+        open.arg("-n").arg("-a").arg(app).arg("--args").arg(file);
+    }
+    let status = open.status().map_err(|e| e.to_string())?;
     if status.success() { Ok(()) } else { Err(format!("{} would not start", app.display())) }
 }
 
@@ -54,5 +65,11 @@ mod tests {
         assert_eq!(app_in(config, Path::new("/a/b.txt")), None, "an app that is not there is not used");
         assert_eq!(app_in(config, Path::new("/a/b.md")), None);
         assert_eq!(app_in("not json", Path::new("/a/b.pdf")), None);
+    }
+
+    #[test]
+    fn an_app_is_known_by_whether_it_declares_documents() {
+        assert!(declares_documents(Path::new("/System/Applications/Preview.app")));
+        assert!(!declares_documents(Path::new("/nowhere/Missing.app")));
     }
 }

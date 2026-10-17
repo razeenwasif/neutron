@@ -150,8 +150,9 @@ code in a tab to read: pages drawn as you scroll, lines numbered and coloured
 for most languages, zoom, find, and copying lines. To open a kind of file in an app of
 your choosing rather than the system's, name it in
 `~/Library/Application Support/Neutron/openers.json` —
-`{ "pdf": "/Applications/Quark.app" }` — and the app is started with the file
-as its argument. A `.zip`, `.tar` or `.tar.gz` opens as a
+`{ "pdf": "/Applications/Quark.app" }`. An app that declares the documents
+it opens is sent the file as the Finder sends it, so one already running opens
+it; any other is started with the file as its argument. A `.zip`, `.tar` or `.tar.gz` opens as a
 read-only folder you can browse, preview, Quick Look and copy out of;
 **Extract** in its menu unpacks the whole thing beside itself.
 
