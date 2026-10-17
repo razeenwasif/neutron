@@ -492,6 +492,9 @@ pub struct PersistedPrefs {
     /// Whether every folder shown has its size added up.
     #[serde(default)]
     pub all_sizes: bool,
+    /// The grid's tile size, as a scale of the standard one; 0 for standard.
+    #[serde(default)]
+    pub tile_scale: f32,
 }
 
 impl PersistedPrefs {
@@ -574,6 +577,11 @@ pub enum PersistedLocation {
     Archive { archive: String, inner: String },
     /// Every file with a Finder tag.
     Tag { tag: String },
+    /// A terminal, by the folder it was started in: it comes back as a fresh
+    /// shell there.
+    Terminal { terminal: String },
+    /// A file open in the viewer.
+    Viewer { viewer: String },
 }
 
 impl PersistedLocation {
@@ -590,6 +598,10 @@ impl PersistedLocation {
                 path: path.to_string(),
             }),
             NodeId::Tag { name } => Some(PersistedLocation::Tag { tag: name.to_string() }),
+            NodeId::Terminal { dir, .. } => {
+                Some(PersistedLocation::Terminal { terminal: dir.to_string_lossy().into_owned() })
+            }
+            NodeId::Viewer { path } => Some(PersistedLocation::Viewer { viewer: path.to_string_lossy().into_owned() }),
             NodeId::Archive { archive, inner } => Some(PersistedLocation::Archive {
                 archive: archive.to_string_lossy().into_owned(),
                 inner: inner.to_string(),
@@ -611,6 +623,8 @@ impl PersistedLocation {
                 NodeId::remote(site.as_str(), path.as_str())
             }
             PersistedLocation::Tag { tag } => NodeId::Tag { name: tag.as_str().into() },
+            PersistedLocation::Terminal { terminal } => NodeId::terminal(PathBuf::from(terminal)),
+            PersistedLocation::Viewer { viewer } => NodeId::Viewer { path: PathBuf::from(viewer) },
             PersistedLocation::Archive { archive, inner } => {
                 NodeId::archive(PathBuf::from(archive), inner.as_str())
             }
@@ -703,6 +717,7 @@ impl Workspace {
         let mut view = FileListState::default();
         view.sort = tab.view.sort;
         view.show_hidden = tab.view.show_hidden;
+        view.tile_scale = tab.view.tile_scale;
         view.view = tab.view.view;
         view
     }
@@ -721,6 +736,7 @@ impl Workspace {
             descending: tab.view.sort.order == neutron_core::SortOrder::Descending,
             group: String::new(),
             all_sizes: false,
+            tile_scale: tab.view.tile_scale,
         };
         prefs.set_column(tab.view.sort.column);
         prefs.set_group(tab.view.sort.group);
@@ -812,6 +828,7 @@ impl Workspace {
             tab.view.sort = sort;
             tab.view.show_hidden = saved.prefs.show_hidden;
             tab.view.view = mode;
+            tab.view.tile_scale = saved.prefs.tile_scale;
         }
 
         // Drop any pane that ended up with no tabs, so a partially-restorable

@@ -97,6 +97,16 @@ pub struct FileListState {
     /// clear it itself once a frame has drawn it. Left standing, it pins the
     /// listing to that row and the wheel cannot scroll away from it.
     pub scroll_to: Option<usize>,
+    /// How big the grid's tiles are, as a scale of the standard size; 0 for
+    /// the standard size. See [`FileListState::tile_scale`].
+    pub tile_scale: f32,
+}
+
+impl FileListState {
+    /// The grid's tile scale, the standard size when none was chosen.
+    pub fn tile_scale(&self) -> f32 {
+        if self.tile_scale > 0.0 { self.tile_scale.clamp(TILE_SCALE_MIN, TILE_SCALE_MAX) } else { 1.0 }
+    }
 }
 
 
@@ -428,6 +438,11 @@ fn group_rows(list: &EntryList, group: GroupBy) -> Vec<Row> {
 /// A group's heading: its name in small capitals, on a row of its own.
 fn group_heading(ui: &mut Ui, p: &Palette, label: &str) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
+    paint_group_heading(ui, p, rect, label);
+}
+
+/// A group's heading, in `rect`.
+fn paint_group_heading(ui: &Ui, p: &Palette, rect: Rect, label: &str) {
     if !ui.is_rect_visible(rect) {
         return;
     }
@@ -1323,11 +1338,137 @@ const TILE_ICON: f32 = 56.0;
 /// one atlas shared with the list view.
 const TILE_APP_ICON: f32 = 48.0;
 
-/// Draws the grid, virtualized a row of tiles at a time.
+/// How big the grid's tiles are drawn, from the view's tile scale.
+#[derive(Clone, Copy)]
+struct TileSize {
+    w: f32,
+    h: f32,
+    icon: f32,
+    app_icon: f32,
+    /// Space above the icon.
+    top: f32,
+}
+
+impl TileSize {
+    fn at(scale: f32) -> Self {
+        let s = scale.clamp(TILE_SCALE_MIN, TILE_SCALE_MAX);
+        TileSize { w: TILE_W * s, h: TILE_H * s, icon: TILE_ICON * s, app_icon: TILE_APP_ICON * s, top: 14.0 * s }
+    }
+
+    /// From one tile's left to the next's.
+    fn step(&self) -> f32 {
+        self.w + TILE_GAP
+    }
+
+    /// From one row of tiles' top to the next's.
+    fn pitch(&self) -> f32 {
+        self.h + TILE_GAP
+    }
+}
+
+/// The range of tile sizes the grid offers, as scales of the standard one.
+pub const TILE_SCALE_MIN: f32 = 0.75;
+pub const TILE_SCALE_MAX: f32 = 2.0;
+
+/// One line of the grid: a group's heading, or a row of tiles holding display
+/// positions `start..end`.
+#[derive(Debug, Clone, PartialEq)]
+enum GridLine {
+    Heading(String),
+    Tiles(usize, usize),
+}
+
+/// The grid laid out as lines, each with where it starts.
 ///
-/// Same trick as the list: `show_rows` is told the number of tile *rows*, so a
-/// 500k-entry directory costs the same per frame as a 50-entry one. What
-/// changes is that one "row" now holds several entries.
+/// Not a uniform run of rows as the list is: a heading is shorter than a row
+/// of tiles, and each group starts a row of its own. Built in one pass over
+/// the order — a line per row of tiles, so a fraction of the entries.
+struct GridLayout {
+    lines: Vec<(f32, GridLine)>,
+    height: f32,
+}
+
+impl GridLayout {
+    fn new(list: &EntryList, group: GroupBy, columns: usize, pitch: f32) -> Self {
+        let mut lines = Vec::new();
+        let mut y = 0.0;
+        let push_tiles = |lines: &mut Vec<(f32, GridLine)>, y: &mut f32, from: usize, to: usize| {
+            for start in (from..to).step_by(columns) {
+                lines.push((*y, GridLine::Tiles(start, (start + columns).min(to))));
+                *y += pitch;
+            }
+        };
+        let count = list.order().len();
+        if group == GroupBy::None {
+            push_tiles(&mut lines, &mut y, 0, count);
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
+            let mut current: Option<(u64, String)> = None;
+            let mut began = 0;
+            for position in 0..count {
+                let key = neutron_core::sort::group_of(list, list.at(position), group, now);
+                if current.as_ref() != Some(&key) {
+                    push_tiles(&mut lines, &mut y, began, position);
+                    lines.push((y, GridLine::Heading(key.1.clone())));
+                    y += ROW_HEIGHT;
+                    began = position;
+                    current = Some(key);
+                }
+            }
+            push_tiles(&mut lines, &mut y, began, count);
+        }
+        GridLayout { lines, height: y }
+    }
+
+    /// The line at height `y` in the content, if any.
+    fn line_at(&self, y: f32) -> Option<usize> {
+        if y < 0.0 || y >= self.height {
+            return None;
+        }
+        Some(self.lines.partition_point(|(top, _)| *top <= y).saturating_sub(1))
+    }
+
+    /// Where a display position's row of tiles starts.
+    fn top_of(&self, position: usize) -> Option<f32> {
+        self.lines.iter().find_map(|(top, line)| match line {
+            GridLine::Tiles(start, end) if (*start..*end).contains(&position) => Some(*top),
+            _ => None,
+        })
+    }
+
+    /// The display position under content point `(x, y)`, if a tile is there.
+    fn position_at(&self, x: f32, y: f32, step: f32, columns: usize) -> Option<usize> {
+        let GridLine::Tiles(start, end) = &self.lines[self.line_at(y)?].1 else { return None };
+        let column = (x.max(0.0) / step) as usize;
+        (column < columns && start + column < *end).then_some(start + column)
+    }
+
+    /// The span of display positions a band over content rect `rect` covers:
+    /// from the first row of tiles it reaches, at its left edge, to the last,
+    /// at its right — the enclosing span, as Explorer reports it.
+    fn span(&self, rect: Rect, step: f32, columns: usize) -> Option<(usize, usize)> {
+        let first = self.line_at(rect.top().max(0.0))?;
+        let last = self.line_at(rect.bottom().min(self.height - 0.5)).unwrap_or(self.lines.len() - 1);
+        let column_of = |x: f32| ((x.max(0.0) / step) as usize).min(columns - 1);
+        let from = self.lines[first..=last].iter().find_map(|(_, line)| match line {
+            GridLine::Tiles(start, end) => Some((start + column_of(rect.left())).min(end - 1)),
+            GridLine::Heading(_) => None,
+        })?;
+        let to = self.lines[first..=last].iter().rev().find_map(|(_, line)| match line {
+            GridLine::Tiles(start, end) => Some((start + column_of(rect.right())).min(end - 1)),
+            GridLine::Heading(_) => None,
+        })?;
+        (from <= to).then_some((from, to))
+    }
+}
+
+/// Draws the grid, only the lines in view.
+///
+/// As the list does, the cost per frame is what is on screen: lines are found
+/// by their heights with a binary search, so a 500k-entry folder draws as fast
+/// as a 50-entry one. Grouped, each group starts a row under its heading.
 fn show_grid(
     ui: &mut Ui,
     state: &mut FileListState,
@@ -1337,29 +1478,26 @@ fn show_grid(
     icons: Option<&dyn IconSource>,
 ) -> Option<FileListAction> {
     let mut action = None;
+    let tile = TileSize::at(state.tile_scale());
 
-    let avail = (ui.available_width() - LIST_PAD * 2.0).max(TILE_W);
+    let avail = (ui.available_width() - LIST_PAD * 2.0).max(tile.w);
     // At least one column, however narrow the pane: a grid with zero columns
     // divides by zero and shows nothing.
-    let columns = (((avail + TILE_GAP) / (TILE_W + TILE_GAP)).floor() as usize).max(1);
+    let columns = (((avail + TILE_GAP) / tile.step()).floor() as usize).max(1);
     state.columns = columns;
 
-    let count = list.order().len();
-    let rows = count.div_ceil(columns);
+    let layout = GridLayout::new(list, state.sort.group, columns, tile.pitch());
     let viewport_height = ui.available_height();
 
     let mut scroll = egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
         .id_salt("file_grid_scroll");
 
-    // Scroll-into-view, in tile rows rather than list rows.
+    // Scroll-into-view, by the row of tiles the entry is in.
     if let Some(target) = state.scroll_to.take() {
-        if let Some(index) = list.rank(target) {
-            let row = index / columns;
-            let top = row as f32 * (TILE_H + TILE_GAP);
-            let bottom = top + TILE_H + TILE_GAP;
+        if let Some(top) = list.rank(target).and_then(|position| layout.top_of(position)) {
+            let bottom = top + tile.pitch();
             let current = scroll_offset(ui, "grid");
-
             let desired = if top < current {
                 Some(top)
             } else if bottom > current + viewport_height {
@@ -1374,76 +1512,49 @@ fn show_grid(
     }
 
     let viewport = ui.available_rect_before_wrap();
-    let row_pitch = TILE_H + TILE_GAP;
-
-
     let auto_scroll = band_scroll_delta(ui, viewport, ui.input(|i| i.stable_dt));
 
-    let output = scroll.show_rows(ui, row_pitch, rows, |ui, visible| {
+    let output = scroll.show_viewport(ui, |ui, shown| {
         if auto_scroll != 0.0 {
-            ui.scroll_with_delta_animation(
-                vec2(0.0, auto_scroll),
-                egui::style::ScrollAnimation::none(),
-            );
+            ui.scroll_with_delta_animation(vec2(0.0, auto_scroll), egui::style::ScrollAnimation::none());
             ui.ctx().request_repaint();
         }
-
         let full = ui.available_width();
-        for row in visible {
-            let (band, response) =
-                ui.allocate_exact_size(vec2(full, TILE_H + TILE_GAP), Sense::click());
-
-            for column in 0..columns {
-                let index = row * columns + column;
-                if index >= count {
-                    break;
-                }
-                let idx = list.at(index);
-                let rect = Rect::from_min_size(
-                    pos2(
-                        band.left() + LIST_PAD + column as f32 * (TILE_W + TILE_GAP),
-                        band.top() + TILE_GAP / 2.0,
-                    ),
-                    vec2(TILE_W, TILE_H),
-                );
-                if let Some(a) = draw_tile(ui, list, marks, p, idx, rect, icons) {
-                    action = Some(a);
-                }
-            }
-
-            // Clicking the empty space to the right of the last tile in a row
-            // clears the selection, matching the list view's dead space.
-            if response.clicked() && action.is_none() {
-                action = Some(FileListAction::ClearSelection);
-            }
+        let origin = ui.max_rect().min;
+        let (content, _) = ui.allocate_exact_size(vec2(full, layout.height.max(viewport_height)), Sense::hover());
+        // The space between and below the tiles, before them so the tiles win
+        // the pointer: a click there clears the selection, a right-click is
+        // the folder's own menu.
+        if let Some(a) = empty_space(ui, content) {
+            action = Some(a);
         }
 
-        let leftover = ui.available_size();
-        if leftover.y > 0.0 {
-            let (rect, response) = ui.allocate_exact_size(leftover, Sense::click());
-            if response.clicked() {
-                action = Some(FileListAction::ClearSelection);
+        let first = layout.line_at(shown.top().max(0.0)).unwrap_or(layout.lines.len());
+        for (top, line) in layout.lines.iter().skip(first) {
+            if *top > shown.bottom() {
+                break;
             }
-            if response.secondary_clicked() {
-                action = Some(FileListAction::ContextMenu {
-                    idx: None,
-                    pos: response
-                        .interact_pointer_pos()
-                        .unwrap_or_else(|| rect.center()),
-                });
+            match line {
+                GridLine::Heading(label) => {
+                    let rect = Rect::from_min_size(pos2(origin.x, origin.y + top), vec2(full, ROW_HEIGHT));
+                    paint_group_heading(ui, p, rect, label);
+                }
+                GridLine::Tiles(start, end) => {
+                    for (column, position) in (*start..*end).enumerate() {
+                        let rect = Rect::from_min_size(
+                            pos2(origin.x + LIST_PAD + column as f32 * tile.step(), origin.y + top + TILE_GAP / 2.0),
+                            vec2(tile.w, tile.h),
+                        );
+                        if let Some(a) = draw_tile(ui, list, marks, p, list.at(position), rect, icons, tile) {
+                            action = Some(a);
+                        }
+                    }
+                }
             }
         }
     });
 
     remember_scroll(ui, "grid", output.id);
-
-    // See the list view: `show_rows` leaves no allocatable space after the
-    // tiles, so the area below them has to be interacted with directly.
-    if let Some(dead) = dead_space(viewport, rows as f32 * row_pitch, output.state.offset.y) {
-        if let Some(a) = empty_space(ui, dead) {
-            action = Some(a);
-        }
-    }
 
     let start_area =
         band_start_area(ui.spacing().scroll, viewport, output.content_size.y > viewport.height());
@@ -1451,16 +1562,7 @@ fn show_grid(
     let tile_at = |screen: egui::Pos2| -> Option<usize> {
         let y = screen.y - viewport.top() + offset_y;
         let x = screen.x - viewport.left() - LIST_PAD;
-        if y < 0.0 || x < 0.0 {
-            return None;
-        }
-        let row = (y / row_pitch) as usize;
-        let column = (x / (TILE_W + TILE_GAP)) as usize;
-        if column >= columns {
-            return None;
-        }
-        let position = row * columns + column;
-        (position < list.order().len()).then(|| list.at(position))
+        layout.position_at(x, y, tile.step(), columns).map(|position| list.at(position))
     };
     let band = track_band(ui, viewport, start_area, offset_y, |screen| {
         tile_at(screen).is_some_and(|idx| marks.selection.is_selected(idx))
@@ -1470,26 +1572,10 @@ fn show_grid(
     }
     if let Some(rect) = band.rect {
         draw_band(ui, p, rect, viewport, output.state.offset.y);
-
-        // A band over a grid covers a rectangle of tiles, so the covered range
-        // is not contiguous in display order — the tiles in the columns either
-        // side of the band, on the rows it spans, are *not* inside it. Reported
-        // as the enclosing span rather than the exact set, which is what
-        // Explorer does and what reads as predictable while dragging.
-        if count > 0 {
-            let first_row = (rect.top() / row_pitch).floor().max(0.0) as usize;
-            let last_row = (rect.bottom() / row_pitch).floor().max(0.0) as usize;
-            let column_of = |x: f32| {
-                ((x - LIST_PAD).max(0.0) / (TILE_W + TILE_GAP)).floor() as usize
-            };
-            let first = first_row * columns + column_of(rect.left()).min(columns - 1);
-            let last = last_row * columns + column_of(rect.right()).min(columns - 1);
-
-            action = Some(FileListAction::Marquee {
-                from: first.min(count - 1),
-                to: last.min(count - 1),
-                additive: band.additive,
-            });
+        // In content coordinates, less the grid's left margin.
+        let rect = rect.translate(vec2(-LIST_PAD, 0.0));
+        if let Some((from, to)) = layout.span(rect, tile.step(), columns) {
+            action = Some(FileListAction::Marquee { from, to, additive: band.additive });
         }
         ui.ctx().request_repaint();
     }
@@ -1498,6 +1584,7 @@ fn show_grid(
 }
 
 /// One tile: a large icon over a wrapped, centred name.
+#[allow(clippy::too_many_arguments)]
 fn draw_tile(
     ui: &mut Ui,
     list: &EntryList,
@@ -1506,6 +1593,7 @@ fn draw_tile(
     idx: usize,
     rect: Rect,
     icons: Option<&dyn IconSource>,
+    tile: TileSize,
 ) -> Option<FileListAction> {
     let response = ui.interact(rect, ui.id().with(("tile", idx)), Sense::click());
     if crate::drop::accepts(list.name(idx), list.kind(idx)) {
@@ -1546,8 +1634,8 @@ fn draw_tile(
     //
     // A file with something to look at shows it instead, as large as the
     // tile's art area allows.
-    let icon_centre = pos2(rect.center().x, rect.top() + 14.0 + TILE_ICON / 2.0);
-    let art = Rect::from_center_size(icon_centre, vec2(TILE_W - 24.0, TILE_ICON + 8.0));
+    let icon_centre = pos2(rect.center().x, rect.top() + tile.top + tile.icon / 2.0);
+    let art = Rect::from_center_size(icon_centre, vec2(tile.w - 24.0, tile.icon + 8.0));
     let thumb = icons
         .filter(|_| crate::thumb::wants_preview(name, kind) && list.sync(idx) != SyncState::CloudOnly)
         .and_then(|src| src.preview(name, kind, list.modified(idx)));
@@ -1559,7 +1647,7 @@ fn draw_tile(
             crate::thumb::paint(ui.painter(), art, thumb, 8.0, false, hidden);
         }
         (None, Some((src, uv))) => {
-            let icon_rect = Rect::from_center_size(icon_centre, vec2(TILE_APP_ICON, TILE_APP_ICON));
+            let icon_rect = Rect::from_center_size(icon_centre, vec2(tile.app_icon, tile.app_icon));
             let mut mesh = egui::Mesh::with_texture(src.texture());
             let tint = if hidden { Color32::from_white_alpha(110) } else { Color32::WHITE };
             mesh.add_rect_with_uv(icon_rect, uv, tint);
@@ -1567,7 +1655,7 @@ fn draw_tile(
         }
         (None, None) => icons::tile(
             ui.painter(),
-            Rect::from_center_size(icon_centre, vec2(TILE_ICON, TILE_ICON)),
+            Rect::from_center_size(icon_centre, vec2(tile.icon, tile.icon)),
             icons::FileKind::of(name, kind),
             p,
             hidden,
@@ -1577,9 +1665,9 @@ fn draw_tile(
     // Renaming: the box takes the name's place under the icon. Without it a
     // rename started in the grid — F2, or New Folder — was open but invisible,
     // could not be finished, and held back the tab's refreshes until it was.
-    let name_top = rect.top() + 14.0 + TILE_ICON + 10.0;
+    let name_top = rect.top() + tile.top + tile.icon + 10.0;
     if let Some((text, generation)) = marks.rename_text(idx) {
-        let field = Rect::from_min_size(pos2(rect.left() + 6.0, name_top - 4.0), vec2(TILE_W - 12.0, 30.0));
+        let field = Rect::from_min_size(pos2(rect.left() + 6.0, name_top - 4.0), vec2(tile.w - 12.0, 30.0));
         // As in the list: while the box is open the tile is not a target.
         return rename_box(ui, p, field, text, generation);
     }
@@ -1598,11 +1686,11 @@ fn draw_tile(
         name.to_owned(),
         FontId::proportional(12.5),
         colour,
-        TILE_W - 12.0,
+        tile.w - 12.0,
     );
     job.halign = Align2::CENTER_TOP.x();
     job.wrap = egui::text::TextWrapping {
-        max_width: TILE_W - 12.0,
+        max_width: tile.w - 12.0,
         max_rows: 2,
         break_anywhere: true,
         overflow_character: Some('…'),
@@ -2057,5 +2145,60 @@ mod tests {
         let floating = egui::style::ScrollStyle::floating();
         assert!(scrollbar_strip(floating, true) >= floating.bar_width);
         assert!(floating.bar_width > floating.floating_width);
+    }
+
+    fn files(names: &[(&str, EntryKind)]) -> EntryList {
+        let mut list: EntryList = names
+            .iter()
+            .map(|(name, kind)| neutron_core::entry::Entry {
+                name: (*name).to_owned(),
+                kind: *kind,
+                size: 0,
+                modified: 0,
+                created: 0,
+                attrs: 0,
+                sync: SyncState::None,
+            })
+            .collect();
+        neutron_core::sort::apply(&mut list, SortSpec { group: GroupBy::Kind, ..Default::default() }, true);
+        list
+    }
+
+    #[test]
+    fn a_grouped_grid_starts_each_group_on_a_row_under_its_heading() {
+        // Two folders, then three text files, three columns to a row.
+        let list = files(&[
+            ("a.txt", EntryKind::File),
+            ("b.txt", EntryKind::File),
+            ("c.txt", EntryKind::File),
+            ("x", EntryKind::Directory),
+            ("y", EntryKind::Directory),
+        ]);
+        let layout = GridLayout::new(&list, GroupBy::Kind, 3, 100.0);
+        let lines: Vec<&GridLine> = layout.lines.iter().map(|(_, l)| l).collect();
+        assert!(matches!(lines[0], GridLine::Heading(_)));
+        assert_eq!(lines[1], &GridLine::Tiles(0, 2), "the folders, a row of their own");
+        assert!(matches!(lines[2], GridLine::Heading(_)));
+        assert_eq!(lines[3], &GridLine::Tiles(2, 5));
+        assert_eq!(layout.height, 2.0 * ROW_HEIGHT + 200.0);
+
+        // Under the second heading, the second tile of its row.
+        let y = ROW_HEIGHT * 2.0 + 100.0 + 50.0;
+        assert_eq!(layout.position_at(150.0, y, 100.0, 3), Some(3));
+        assert_eq!(layout.position_at(150.0, ROW_HEIGHT / 2.0, 100.0, 3), None, "a heading holds no tile");
+        assert_eq!(layout.top_of(4), Some(ROW_HEIGHT * 2.0 + 100.0));
+        // A band from the folders' row down over the heading to the files'.
+        let band = Rect::from_min_max(pos2(10.0, ROW_HEIGHT + 10.0), pos2(120.0, y));
+        assert_eq!(layout.span(band, 100.0, 3), Some((0, 3)));
+    }
+
+    #[test]
+    fn an_ungrouped_grid_is_rows_of_tiles_only() {
+        let list = files(&[("a", EntryKind::File), ("b", EntryKind::File), ("c", EntryKind::File)]);
+        let layout = GridLayout::new(&list, GroupBy::None, 2, 100.0);
+        assert_eq!(layout.lines, vec![(0.0, GridLine::Tiles(0, 2)), (100.0, GridLine::Tiles(2, 3))]);
+        assert_eq!(layout.position_at(150.0, 150.0, 100.0, 2), None, "past the last tile");
+        assert_eq!(TileSize::at(1.5).w, TILE_W * 1.5);
+        assert_eq!(TileSize::at(9.0).w, TILE_W * TILE_SCALE_MAX, "held to the range");
     }
 }

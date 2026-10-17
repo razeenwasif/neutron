@@ -93,6 +93,15 @@ pub enum NodeId {
     /// Every file carrying a Finder tag, wherever it is, as Spotlight finds
     /// them. Its rows lead to their own paths, so it has none of its own.
     Tag { name: Arc<str> },
+
+    /// A terminal, by the id of its session, started in `dir`. Not a place
+    /// with files: the tab shows the session instead of a listing. Saved as
+    /// the folder, and opened again there as a fresh shell.
+    Terminal { id: u64, dir: PathBuf },
+
+    /// A file open in Neutron's viewer: a PDF, an image, text or code. Up is
+    /// the folder it is in.
+    Viewer { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,6 +181,18 @@ impl NodeId {
         }
     }
 
+    /// A new terminal started in `dir`, with an id no other has had in this
+    /// process.
+    pub fn terminal(dir: impl Into<PathBuf>) -> NodeId {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NodeId::Terminal { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), dir: dir.into() }
+    }
+
+    /// Whether this is a terminal rather than a place with files.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, NodeId::Terminal { .. })
+    }
+
     /// The shell parsing name, when this is a shell node.
     pub fn parsing_name(&self) -> Option<&str> {
         match self {
@@ -198,6 +219,8 @@ impl NodeId {
                 _ => site.to_string(),
             },
             NodeId::Tag { name } => name.to_string(),
+            NodeId::Terminal { .. } => "Terminal".to_owned(),
+            NodeId::Viewer { path } => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             // The folder's own name, or the archive's at its top.
             NodeId::Archive { archive, inner } => match inner.rsplit('/').next() {
                 Some(name) if !name.is_empty() => name.to_owned(),
@@ -210,6 +233,7 @@ impl NodeId {
     pub fn parent(&self) -> Option<NodeId> {
         match self {
             NodeId::Path(p) => p.parent().map(|p| NodeId::Path(p.to_path_buf())),
+            NodeId::Viewer { path } => path.parent().map(|p| NodeId::Path(p.to_path_buf())),
             // A remote path is POSIX and absolute, so its parent is derivable
             // without asking the server. `/` has none, which is what stops the
             // Up button walking off the top of a site.
@@ -252,6 +276,8 @@ impl fmt::Display for NodeId {
             NodeId::Cloud { provider, id, .. } => write!(f, "<{provider:?}:{id}>"),
             NodeId::Remote { site, path } => write!(f, "{site}:{path}"),
             NodeId::Tag { name } => write!(f, "<tag:{name}>"),
+            NodeId::Terminal { id, dir } => write!(f, "<terminal {id}:{}>", dir.display()),
+            NodeId::Viewer { path } => write!(f, "<viewer:{}>", path.display()),
             NodeId::Archive { archive, inner } if inner.is_empty() => write!(f, "{}", archive.display()),
             NodeId::Archive { archive, inner } => write!(f, "{}/{inner}", archive.display()),
         }

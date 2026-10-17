@@ -1,5 +1,10 @@
 # Opening a terminal at a folder
 
+On the Mac, **Open in Terminal**, `Control+\``, and **Open a terminal here** in
+the command palette open Neutron's own terminal in a tab, running your login
+shell in the folder. What follows is about Windows, where Neutron opens an
+external terminal instead.
+
 `Ctrl+\`` — or **Open a terminal here** in the command palette — opens a
 terminal with the current folder as its working directory.
 

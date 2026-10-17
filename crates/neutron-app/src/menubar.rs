@@ -22,6 +22,7 @@ pub enum Cmd {
     NewFolder,
     NewFile,
     Open,
+    OpenInViewer,
     CloseTab,
     GetInfo,
     Rename,
@@ -86,6 +87,8 @@ pub enum Cmd {
     Connect,
     AirDrop,
     Terminal,
+    AskClaude,
+    AskGemini,
 
     NextTab,
     PreviousTab,
@@ -94,7 +97,7 @@ pub enum Cmd {
 
 impl Cmd {
     const ALL: &'static [Cmd] = &[
-        Cmd::NewWindow, Cmd::NewTab, Cmd::NewFolder, Cmd::NewFile, Cmd::Open, Cmd::CloseTab, Cmd::GetInfo,
+        Cmd::NewWindow, Cmd::NewTab, Cmd::NewFolder, Cmd::NewFile, Cmd::Open, Cmd::OpenInViewer, Cmd::CloseTab, Cmd::GetInfo,
         Cmd::Rename, Cmd::Duplicate, Cmd::MakeAlias, Cmd::QuickLook, Cmd::Share, Cmd::Compress, Cmd::Extract,
         Cmd::MoveToTrash, Cmd::DeleteImmediately, Cmd::Eject, Cmd::AddToSidebar, Cmd::Undo,
         Cmd::Redo, Cmd::Cut, Cmd::Copy, Cmd::Paste, Cmd::SelectAll, Cmd::CopyPath, Cmd::Filter,
@@ -105,7 +108,7 @@ impl Cmd {
         Cmd::AddressBar, Cmd::ToggleTheme, Cmd::Back, Cmd::Forward, Cmd::Enclosing,
         Cmd::Dashboard, Cmd::Home, Cmd::Desktop, Cmd::Documents, Cmd::Downloads,
         Cmd::Applications, Cmd::Trash, Cmd::GoToFolder, Cmd::Connect, Cmd::AirDrop,
-        Cmd::Terminal, Cmd::NextTab, Cmd::PreviousTab, Cmd::NextPane,
+        Cmd::Terminal, Cmd::AskClaude, Cmd::AskGemini, Cmd::NextTab, Cmd::PreviousTab, Cmd::NextPane,
     ];
 
     pub fn from_tag(tag: u32) -> Option<Cmd> {
@@ -157,6 +160,7 @@ pub fn menus() -> Vec<Menu> {
         item(Cmd::NewFile, "New File", Some(Key::cmd("n").option())),
         item(Cmd::NewTab, "New Tab", cmd("t")),
         item(Cmd::Open, "Open", cmd("o")),
+        item(Cmd::OpenInViewer, "Open in Viewer", Some(Key::cmd("o").option())),
         item(Cmd::CloseTab, "Close Tab", cmd("w")),
         Separator,
         item(Cmd::GetInfo, "Get Info", cmd("i")),
@@ -242,6 +246,9 @@ pub fn menus() -> Vec<Menu> {
         item(Cmd::GoToFolder, "Go to Folder…", Some(Key::cmd("g").shift())),
         item(Cmd::Connect, "Connect to Server…", cmd("k")),
         item(Cmd::Terminal, "Open in Terminal", None),
+        Separator,
+        item(Cmd::AskClaude, "Ask Claude Code", None),
+        item(Cmd::AskGemini, "Ask Gemini", None),
     ];
     let window = vec![
         Entry::System { title: "Minimize".into(), action: c"performMiniaturize:", key: cmd("m") },

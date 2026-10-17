@@ -71,6 +71,8 @@ pub enum CommandId {
     SignOutDrive,
 
     OpenTerminal,
+    AskClaude,
+    AskGemini,
     NewWindow,
 }
 
@@ -190,6 +192,8 @@ pub const ALL: &[CommandDef] = &[
         // alone: this one really is the Control key there.
         hint: if cfg!(target_os = "macos") { "Control+`" } else { "Ctrl+`" },
     },
+    CommandDef { id: CommandId::AskClaude, title: "Ask Claude Code about this folder", hint: "" },
+    CommandDef { id: CommandId::AskGemini, title: "Ask Gemini about this folder", hint: "" },
     CommandDef { id: CommandId::NewWindow, title: "Open a new window", hint: "Ctrl+N" },
 
     // Saved servers. Adding one has to be a dialog rather than a file, because

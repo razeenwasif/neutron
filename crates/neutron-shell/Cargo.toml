@@ -59,6 +59,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSCell", "NSGraphicsContext", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSResponder", "NSScreen", "NSSharingService",
     "NSView", "NSWindow", "NSWorkspace",
 ] }
+# Drawing PDF pages for the viewer, in process and off the main thread.
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std", "objc2", "CGAffineTransform", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage",
+    "CGPDFDocument", "CGPDFPage",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFURL", "CFCGTypes"] }
 
 # Runs on the process's main thread, which AppKit-facing code requires and the
 # default test harness never provides.

@@ -19,6 +19,7 @@
 //! function reintroduces the stall.
 
 mod address;
+mod agent;
 mod app;
 mod archive_ops;
 mod archives;
@@ -53,8 +54,11 @@ mod remote_ops;
 mod plugins;
 mod sidebar;
 mod thumbs;
+mod term;
 mod transfers;
 mod undo;
+mod viewer;
+mod viewer_ui;
 mod startup;
 mod workspace;
 
@@ -74,6 +78,13 @@ fn main() -> eframe::Result<()> {
         // while it was in fact logging. stderr is unbuffered.
         .with_writer(std::io::stderr)
         .init();
+
+    // `--mcp`: the search tools the AI agents are given, served on stdin and
+    // stdout. Started by the agent's CLI, never by a person; no window.
+    if std::env::args().any(|a| a == "--mcp") {
+        agent::serve_mcp();
+        return Ok(());
+    }
 
     // `--bench <path> [iterations]` measures enumeration and sorting without
     // opening a window, so directory-scaling numbers are not confounded by GPU

@@ -70,6 +70,8 @@ enum Action {
     ToggleHidden,
     /// Add up the size of every folder shown, or stop.
     ToggleAllSizes,
+    /// Draw the grid's tiles at this scale of the standard size.
+    SetTileScale(f32),
     /// Add up the size of these folders.
     CalculateSizes(Vec<PathBuf>),
     /// Step to the next view: list, grid, columns.
@@ -134,6 +136,10 @@ enum Action {
     BatchRename(PathBuf, Vec<(String, String)>),
     /// Go to the folder `.0` is in, with it selected.
     ShowInFolder(PathBuf),
+    /// Open a file in a viewer tab beside the folder.
+    OpenInViewer(PathBuf),
+    /// Open a file with its own app.
+    LaunchPath(PathBuf),
     /// Reverse the last change to files.
     Undo,
     /// Make again the change last undone.
@@ -195,6 +201,9 @@ enum Action {
     DismissNotice,
     /// Open a terminal at the focused tab's folder.
     OpenTerminal,
+    /// Open an AI agent in a terminal tab on the focused folder, told what is
+    /// selected.
+    AskAgent(crate::agent::Agent),
     /// Open another Neutron window on the focused tab's folder.
     NewWindow,
     /// Re-read the plugins folder.
@@ -483,6 +492,9 @@ pub struct NeutronApp {
     /// land in; see `resolve_drop`.
     drop_at: Option<egui::Pos2>,
     drop_panes: std::cell::RefCell<Vec<(GroupId, egui::Rect)>>,
+    /// The folder a drag has rested on, since when, and whether it has
+    /// already sprung open.
+    spring: Option<(PathBuf, Instant, bool)>,
     #[cfg(test)]
     drop_debug: Vec<neutron_ui::drop::Target>,
     /// The first window's frame as last seen, saved in eframe's own format;
@@ -572,6 +584,15 @@ pub struct NeutronApp {
     windows: Vec<WindowState>,
     /// Folder sizes, added up on a thread of their own.
     sizer: crate::folder_sizes::Sizer,
+    /// The terminals tabs show, by the id in their location. Behind a cell
+    /// because panes are drawn through `&self`, and drawing a terminal sends it
+    /// keys and fits it to its pane.
+    terminals: std::cell::RefCell<std::collections::HashMap<u64, crate::term::Session>>,
+    /// Files open in viewer tabs. Behind a cell for the reason the
+    /// terminals are.
+    viewers: std::cell::RefCell<crate::viewer::Viewers>,
+    /// Terminals just opened, which take the keyboard when first drawn.
+    terminal_focus: std::cell::RefCell<std::collections::HashSet<u64>>,
     /// Whether every folder shown is added up; see View › Calculate All Sizes.
     all_sizes: bool,
     /// The sizer's version each tab last took sizes from.
@@ -861,6 +882,7 @@ impl NeutronApp {
             root_frame: None,
             drop_at: None,
             drop_panes: Default::default(),
+            spring: None,
             #[cfg(test)]
             drop_debug: Vec::new(),
             icon_texture: None,
@@ -922,6 +944,9 @@ impl NeutronApp {
             tag_editor: None,
             batch_rename: None,
             sizer: crate::folder_sizes::Sizer::spawn(cc.egui_ctx.clone()),
+            terminals: Default::default(),
+            viewers: std::cell::RefCell::new(crate::viewer::Viewers::spawn(cc.egui_ctx.clone())),
+            terminal_focus: Default::default(),
             all_sizes: saved_prefs(cc).all_sizes,
             sizes_seen: std::collections::HashMap::new(),
             templates: Default::default(),
@@ -1017,6 +1042,11 @@ impl NeutronApp {
         let Some(t) = self.workspace.tabs.get_mut(&tab) else {
             return;
         };
+        // A terminal, or a file in the viewer, has nothing to list.
+        if location.is_terminal() || matches!(location, NodeId::Viewer { .. }) {
+            t.status = Status::Loaded { entries: 0, elapsed: Duration::ZERO };
+            return;
+        }
         t.selection.clear();
         t.reselect = None;
         t.status = Status::Loading;
@@ -1057,6 +1087,9 @@ impl NeutronApp {
         let Some(t) = self.workspace.tabs.get_mut(&tab) else {
             return;
         };
+        if t.location().is_terminal() || matches!(t.location(), NodeId::Viewer { .. }) {
+            return;
+        }
         let remembered = t.remember_selection();
         t.reselect = Some(remembered);
 
@@ -1073,6 +1106,12 @@ impl NeutronApp {
         let Some(t) = self.workspace.tabs.get_mut(&tab) else {
             return;
         };
+        // Going somewhere from a terminal opens it beside the terminal rather
+        // than ending the shell that is running.
+        if t.location().is_terminal() {
+            self.open_in_new_tab(id);
+            return;
+        }
         if t.location() == &id {
             return;
         }
@@ -1338,6 +1377,7 @@ impl NeutronApp {
             Action::ReloadSites => self.refresh_sites(SitesOrigin::Requested),
             Action::DismissNotice => self.notices.dismiss(),
             Action::OpenTerminal => self.open_terminal(),
+            Action::AskAgent(agent) => self.ask_agent(agent),
             Action::NewWindow => self.new_window(),
             Action::CancelDownload => {
                 if let Some(job) = self.download.as_ref() {
@@ -1455,6 +1495,13 @@ impl NeutronApp {
                 }
             }
             Action::CalculateSizes(folders) => self.sizer.request(folders),
+            // Every tab, as Show Hidden Files is: how big icons are is a
+            // preference, not a property of one folder.
+            Action::SetTileScale(scale) => {
+                for tab in self.workspace.tabs.values_mut() {
+                    tab.view.tile_scale = scale;
+                }
+            }
             Action::ToggleHidden => {
                 // Every tab, not just the focused one. "Show hidden files" is
                 // an answer to "what do I want to see", not a property of one
@@ -1548,6 +1595,8 @@ impl NeutronApp {
                 });
             }
             Action::OpenInNewTab(id) => self.open_in_new_tab(id),
+            Action::OpenInViewer(path) => self.open_in_new_tab(NodeId::Viewer { path }),
+            Action::LaunchPath(path) => self.launch(path, neutron_shell::open::Verb::Open),
             Action::ExtractEntries => {
                 // Out to the cache, then copied beside the archive by an
                 // ordinary transfer — so a name already taken there is asked
@@ -1638,14 +1687,7 @@ impl NeutronApp {
                     });
                 }
             }
-            Action::OpenTerminalAt(dir) => {
-                let notices = self.notice_tx.clone();
-                self.sta.submit(move || {
-                    if let Err(e) = neutron_shell::terminal::open_at(&dir) {
-                        report(&notices, format!("Could not open a terminal: {e}"));
-                    }
-                });
-            }
+            Action::OpenTerminalAt(dir) => self.open_program(dir, crate::term::Program::shell(), "Terminal"),
             Action::GetInfoSelection => {
                 if let Some(paths) = self.chosen_paths() {
                     self.apply(ctx, Action::GetInfo(paths));
@@ -3131,6 +3173,9 @@ impl NeutronApp {
             children.push(row("Open Templates Folder", Action::OpenTemplates, &mut actions));
             rows.push(MenuItem { label: "New File from Template".into(), enabled: true, children, ..Default::default() });
             rows.push(MenuItem::separator());
+            rows.push(row("Ask Claude Code", Action::AskAgent(crate::agent::Agent::Claude), &mut actions));
+            rows.push(row("Ask Gemini", Action::AskAgent(crate::agent::Agent::Gemini), &mut actions));
+            rows.push(MenuItem::separator());
             let views = [
                 ("List", file_list::ViewMode::List),
                 ("Grid", file_list::ViewMode::Grid),
@@ -3176,6 +3221,12 @@ impl NeutronApp {
             if let [only] = selected.as_slice() {
                 let path = dir.join(tab.list.name(*only));
                 rows.push(row("Rename", Action::BeginRename, &mut actions));
+                if !tab.list.kind(*only).is_container() && crate::viewer::can_show(tab.list.name(*only)) {
+                    rows.push(MenuItem {
+                        accel: neutron_ui::format::shortcut("Cmd+Alt+O"),
+                        ..row("Open in Viewer", Action::OpenInViewer(path.clone()), &mut actions)
+                    });
+                }
                 if crate::columns::is_package(&path) {
                     rows.push(row("Show Package Contents", Action::Navigate(NodeId::path(&path)), &mut actions));
                 } else if tab.list.kind(*only).is_container() {
@@ -3191,6 +3242,8 @@ impl NeutronApp {
             if !folders.is_empty() && !self.all_sizes {
                 rows.push(row("Calculate Size", Action::CalculateSizes(folders), &mut actions));
             }
+            rows.push(row("Ask Claude Code", Action::AskAgent(crate::agent::Agent::Claude), &mut actions));
+            rows.push(row("Ask Gemini", Action::AskAgent(crate::agent::Agent::Gemini), &mut actions));
             if cfg!(target_os = "macos") {
                 rows.push(row("Share…", Action::Share, &mut actions));
                 rows.push(row("AirDrop…", Action::AirDrop, &mut actions));
@@ -3394,6 +3447,10 @@ impl NeutronApp {
             C::NewTab => Action::NewTab(self.workspace.focused_group()?.id),
             C::NewFolder => Action::NewFolder,
             C::NewFile => Action::NewFile(None),
+            C::OpenInViewer => {
+                let (_, _, paths) = self.selection_paths()?;
+                Action::OpenInViewer(paths.into_iter().next()?)
+            }
             C::Open => Action::Activate(self.workspace.active_tab()?.selection.cursor()?),
             C::CloseTab => Action::CloseActiveTab,
             C::GetInfo => Action::GetInfoSelection,
@@ -3455,6 +3512,8 @@ impl NeutronApp {
             C::Connect => Action::OpenConnect,
             C::AirDrop => Action::OpenAirDrop,
             C::Terminal => Action::OpenTerminal,
+            C::AskClaude => Action::AskAgent(crate::agent::Agent::Claude),
+            C::AskGemini => Action::AskAgent(crate::agent::Agent::Gemini),
             C::NextTab => Action::CycleTab(1),
             C::PreviousTab => Action::CycleTab(-1),
             C::NextPane => Action::FocusNextPane,
@@ -3490,10 +3549,10 @@ impl NeutronApp {
                 c if typing && c.edits_text() => true,
                 C::Undo => self.history.busy || self.history.undo_label().is_none(),
                 C::Redo => self.history.busy || self.history.redo_label().is_none(),
-                C::Open | C::GetInfo | C::Rename | C::Duplicate | C::MakeAlias | C::QuickLook | C::Share | C::Compress
+                C::Open | C::OpenInViewer | C::GetInfo | C::Rename | C::Duplicate | C::MakeAlias | C::QuickLook | C::Share | C::Compress
                 | C::MoveToTrash | C::DeleteImmediately | C::Cut | C::Copy => selected.is_empty(),
                 C::Extract => !archive,
-                C::NewFolder | C::NewFile | C::Paste | C::Terminal => dir.is_none(),
+                C::NewFolder | C::NewFile | C::Paste | C::Terminal | C::AskClaude | C::AskGemini => dir.is_none(),
                 C::Back => !tab.is_some_and(|t| t.history.can_go_back()),
                 C::Forward => !tab.is_some_and(|t| t.history.can_go_forward()),
                 C::Eject => !ejectable,
@@ -3686,6 +3745,7 @@ impl NeutronApp {
             self.drop_debug = targets.clone();
         }
         if !neutron_ui::drop::active(ctx) || self.modal() {
+            self.spring = None;
             return;
         }
         let Some(at) = self.drop_at else { return };
@@ -3702,10 +3762,42 @@ impl NeutronApp {
             Some(self.workspace.tabs.get(&tab)?.location().as_path()?.join(&t.path))
         });
 
+        // Spring-loading: a drag held on a folder opens it, so files can be
+        // carried several folders down in one drag. The Trash is somewhere to
+        // drop things, not to go.
+        let held = dir.as_ref().filter(|d| trash_folder().as_ref() != Some(*d));
+        let rested = match (&mut self.spring, held) {
+            (Some((was, since, _)), Some(now)) if was == now => since.elapsed(),
+            (spring, Some(now)) => {
+                *spring = Some((now.clone(), Instant::now(), false));
+                Duration::ZERO
+            }
+            (spring, None) => {
+                *spring = None;
+                Duration::ZERO
+            }
+        };
+        if rested >= SPRING_DELAY
+            && let Some((dir, _, sprung @ false)) = &mut self.spring
+        {
+            *sprung = true;
+            // In the pane it was rested in; a place in the sidebar opens in the
+            // focused one.
+            let group = pane.filter(|(_, r)| hit.is_some_and(|t| r.contains_rect(t.rect))).map(|(g, _)| g);
+            if let Some(group) = group.filter(|g| *g != self.workspace.focused) {
+                actions.push(Action::FocusGroup(group));
+            }
+            actions.push(Action::Navigate(NodeId::path(dir.clone())));
+        }
+        // It blinks just before it opens, as the Finder's does.
+        let blink = rested >= SPRING_DELAY.saturating_sub(SPRING_BLINK)
+            && rested < SPRING_DELAY
+            && (rested.as_millis() / 80) % 2 == 0;
+
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("neutron-drop")));
         match (hit, &dir, pane) {
             (Some(t), Some(_), _) => {
-                painter.rect_filled(t.rect, t.radius, theme::with_alpha(p.accent, 40));
+                painter.rect_filled(t.rect, t.radius, theme::with_alpha(p.accent, if blink { 110 } else { 40 }));
                 painter.rect_stroke(t.rect, t.radius, egui::Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
             }
             // The only place the accent outlines a whole pane, which is what
@@ -4527,6 +4619,7 @@ impl NeutronApp {
         }
         neutron_shell::quicklook::pump();
         self.pump_sizes();
+        self.reap_terminals();
         while let Ok((paths, at)) = self.share_rx.try_recv() {
             let shared = match at {
                 Some(at) => neutron_shell::share::share(&paths, at),
@@ -4713,6 +4806,18 @@ impl NeutronApp {
             return;
         }
         let mut window = self.windows.remove(0);
+        // The first window cannot close without ending the application, so it
+        // takes the other's place as well as its tabs: moved and sized to
+        // where the other is, it stands in for it as that one closes, and
+        // what is seen is the window closed going and the other staying put.
+        let (outer, inner) =
+            self.ctx.input_for(window.viewport, |i| (i.viewport().outer_rect, i.viewport().inner_rect));
+        if let Some(outer) = outer {
+            self.ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::OuterPosition(outer.min));
+        }
+        if let Some(inner) = inner {
+            self.ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::InnerSize(inner.size()));
+        }
         self.swap_window(&mut window);
         // The state moves; the windows stay. The first window is still the
         // root viewport, and the one emptied is not drawn again, so it closes.
@@ -6193,6 +6298,8 @@ impl NeutronApp {
             }
 
             C::OpenTerminal => Some(Action::OpenTerminal),
+            C::AskClaude => Some(Action::AskAgent(crate::agent::Agent::Claude)),
+            C::AskGemini => Some(Action::AskAgent(crate::agent::Agent::Gemini)),
             C::NewWindow => Some(Action::NewWindow),
 
             C::ConnectServer => Some(Action::OpenConnect),
@@ -6382,7 +6489,7 @@ impl NeutronApp {
 
     /// The strip along the bottom of a folder pane: what the folder holds and
     /// what is selected on the left, the keys worth knowing on the right.
-    fn pane_footer(&self, ui: &egui::Ui, p: &Palette, rect: egui::Rect, tab: &crate::workspace::Tab) {
+    fn pane_footer(&self, ui: &mut egui::Ui, p: &Palette, rect: egui::Rect, tab: &crate::workspace::Tab, actions: &mut Vec<Action>) {
         let painter = ui.painter();
         let font = egui::FontId::proportional(12.0);
         let y = rect.center().y;
@@ -6414,6 +6521,34 @@ impl NeutronApp {
         if let Status::Loaded { elapsed, .. } = &tab.status {
             ui.interact(counted, ui.id().with("footer-count"), egui::Sense::hover())
                 .on_hover_text(format!("Listed and sorted in {:.0} ms", elapsed.as_secs_f64() * 1000.0));
+        }
+
+        // In the grid, the tiles' size instead, as the Finder's icon view has
+        // a slider in its status bar: a small tile, the slider, a large one.
+        if tab.view.view == file_list::ViewMode::Grid {
+            let right = rect.right() - 12.0;
+            let small = egui::Rect::from_center_size(pos(right - 152.0, y), egui::vec2(9.0, 9.0));
+            let large = egui::Rect::from_center_size(pos(right - 7.0, y), egui::vec2(14.0, 14.0));
+            for r in [small, large] {
+                ui.painter().rect_stroke(r, 2.5, egui::Stroke::new(1.2, p.text_faint), egui::StrokeKind::Inside);
+            }
+            let track = egui::Rect::from_min_max(pos(small.right() + 8.0, y - 8.0), pos(large.left() - 8.0, y + 8.0));
+            // The theme's rail is the footer's own colour; this one shows.
+            ui.painter().line_segment(
+                [pos(track.left() + 4.0, y), pos(track.right() - 4.0, y)],
+                egui::Stroke::new(3.0, theme::with_alpha(p.text_faint, 90)),
+            );
+            let mut scale = tab.view.tile_scale();
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(track).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            child.spacing_mut().slider_width = track.width();
+            child.spacing_mut().interact_size.y = track.height();
+            let slider = egui::Slider::new(&mut scale, file_list::TILE_SCALE_MIN..=file_list::TILE_SCALE_MAX)
+                .show_value(false)
+                .handle_shape(egui::style::HandleShape::Circle);
+            if child.add(slider).on_hover_text("Tile size").changed() {
+                actions.push(Action::SetTileScale(scale));
+            }
+            return;
         }
 
         // The keys, right-aligned: the two that open everything else.
@@ -6686,12 +6821,56 @@ impl NeutronApp {
         let Some(dir) = self.focused_folder("open a terminal in") else {
             return;
         };
-        let notices = self.notice_tx.clone();
-        self.sta.submit(move || {
-            if let Err(e) = neutron_shell::terminal::open_at(&dir) {
-                report(&notices, format!("Could not open a terminal: {e}"));
+        self.open_program(dir, crate::term::Program::shell(), "Terminal");
+    }
+
+    /// Opens an agent on the focused folder, told what is selected there.
+    fn ask_agent(&mut self, agent: crate::agent::Agent) {
+        let Some(dir) = self.focused_folder("ask an agent about") else { return };
+        let selected = self.chosen_paths().unwrap_or_default();
+        let program = crate::agent::program(agent, &dir, &selected);
+        self.open_program(dir, program, agent.label());
+    }
+
+    /// Opens a terminal tab in the focused pane running `program` in `dir`.
+    fn open_program(&mut self, dir: PathBuf, program: crate::term::Program, label: &str) {
+        let Some(group) = self.workspace.focused_group().map(|g| g.id) else { return };
+        let location = NodeId::terminal(&dir);
+        let NodeId::Terminal { id, .. } = location else { return };
+        match crate::term::Session::spawn(&dir, &program, label, self.ctx.clone()) {
+            Ok(session) => {
+                self.terminals.borrow_mut().insert(id, session);
+                self.terminal_focus.borrow_mut().insert(id);
+                let view = self.workspace.view_for_new_tab();
+                self.workspace.open_tab(group, location, view);
+                self.workspace.focused = group;
             }
-        });
+            Err(e) => self.notices.error(e),
+        }
+    }
+
+    /// Ends the terminals no tab in any window shows any more.
+    fn reap_terminals(&mut self) {
+        let shown: std::collections::HashSet<u64> = std::iter::once(&self.workspace)
+            .chain(self.windows.iter().map(|w| &w.workspace))
+            .flat_map(|ws| ws.tabs.values())
+            .filter_map(|t| match t.location() {
+                NodeId::Terminal { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        self.terminals.get_mut().retain(|id, _| shown.contains(id));
+        let viewed: std::collections::HashSet<PathBuf> = std::iter::once(&self.workspace)
+            .chain(self.windows.iter().map(|w| &w.workspace))
+            .flat_map(|ws| ws.tabs.values())
+            .filter_map(|t| match t.location() {
+                NodeId::Viewer { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        let viewers = self.viewers.get_mut();
+        viewers.retain(&viewed);
+        viewers.pump(&self.ctx);
     }
 
     /// Opens a second Neutron window on the focused tab's folder.
@@ -7255,7 +7434,7 @@ impl NeutronApp {
                 // Nothing is ever selected on the dashboard, so this is
                 // unreachable in practice — listed rather than wildcarded so a
                 // future location has to decide for itself.
-                NodeId::Home => return None,
+                NodeId::Home | NodeId::Terminal { .. } | NodeId::Viewer { .. } => return None,
                 NodeId::Path(dir) => crate::preview::Source::Local(dir.join(name)),
                 // A server's rows are addressed by joining a name to a POSIX
                 // path. The name went through `safe_name` on the way into the
@@ -7793,6 +7972,70 @@ impl NeutronApp {
     }
 
     /// One pane: tab strip, then header, then listing.
+    /// A terminal tab's name: what the program calls itself, or what it is
+    /// and where.
+    fn terminal_title(&self, id: u64, dir: &Path) -> String {
+        let folder = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into());
+        match self.terminals.borrow().get(&id) {
+            Some(session) => session.title().unwrap_or_else(|| format!("{} — {folder}", session.label)),
+            None => format!("Terminal — {folder}"),
+        }
+    }
+
+    /// A terminal tab: its session drawn to fill the pane, started now if the
+    /// tab came back from a saved session and has none yet.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_terminal(
+        &self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        group_id: GroupId,
+        index: usize,
+        id: u64,
+        dir: &Path,
+        is_focused: bool,
+        actions: &mut Vec<Action>,
+    ) {
+        let mut terminals = self.terminals.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(slot) = terminals.entry(id) {
+            match crate::term::Session::spawn(dir, &crate::term::Program::shell(), "Terminal", self.ctx.clone()) {
+                Ok(session) => {
+                    slot.insert(session);
+                }
+                Err(e) => {
+                    ui.label(egui::RichText::new(e).color(p.danger));
+                    return;
+                }
+            }
+        }
+        let Some(session) = terminals.get_mut(&id) else { return };
+        let focus = self.terminal_focus.borrow_mut().remove(&id);
+        let exited = session.exited();
+        let Some(out) = session.with_screen(|screen| {
+            neutron_ui::term_view::show(ui, p, egui::Id::new(("neutron-terminal", id)), screen, exited, focus)
+        }) else {
+            return;
+        };
+        session.resize(out.grid.0, out.grid.1);
+        if out.scroll != 0 {
+            session.scroll(out.scroll);
+        }
+        if let Some(text) = out.copied {
+            ui.ctx().copy_text(text);
+        }
+        if exited {
+            // Return, or any key, closes a terminal whose program has ended.
+            if !out.input.is_empty() {
+                actions.push(Action::CloseTab { group: group_id, index });
+            }
+        } else {
+            session.write(&out.input);
+        }
+        if !is_focused && ui.ctx().memory(|m| m.has_focus(egui::Id::new(("neutron-terminal", id)))) {
+            actions.push(Action::FocusGroup(group_id));
+        }
+    }
+
     fn draw_group(
         &self,
         ui: &mut egui::Ui,
@@ -7809,7 +8052,10 @@ impl NeutronApp {
             .tabs
             .iter()
             .filter_map(|t| self.workspace.tabs.get(t))
-            .map(|t| t.title())
+            .map(|t| match t.location() {
+                NodeId::Terminal { id, dir } => self.terminal_title(*id, dir),
+                _ => t.title(),
+            })
             .collect();
 
         if let Some(a) = panes::tab_strip(
@@ -7843,6 +8089,25 @@ impl NeutronApp {
         let Some(tab) = group.active_tab().and_then(|t| self.workspace.tabs.get(&t)) else {
             return;
         };
+
+        if let NodeId::Terminal { id, dir } = tab.location() {
+            self.draw_terminal(ui, p, group_id, group.active, *id, dir, is_focused, actions);
+            return;
+        }
+        if let NodeId::Viewer { path } = tab.location() {
+            let mut viewers = self.viewers.borrow_mut();
+            viewers.view(path);
+            let (view, pages) = viewers.parts(path);
+            match crate::viewer_ui::show(ui, p, path, view, pages) {
+                Some(crate::viewer_ui::Ask::Launch) => actions.push(Action::LaunchPath(path.clone())),
+                Some(crate::viewer_ui::Ask::Copy(text)) => ui.ctx().copy_text(text),
+                None => {}
+            }
+            if !is_focused && ui.ui_contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
+                actions.push(Action::FocusGroup(group_id));
+            }
+            return;
+        }
 
         // Header first, so navigation stays available even on a location that
         // failed to open — otherwise a bad path is a dead end with no way back.
@@ -7902,7 +8167,7 @@ impl NeutronApp {
         } else {
             let area = ui.available_rect_before_wrap();
             let footer = egui::Rect::from_min_max(egui::pos2(area.left(), area.bottom() - 34.0), area.max);
-            self.pane_footer(ui, p, footer, tab);
+            self.pane_footer(ui, p, footer, tab, actions);
             content_ui = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(egui::Rect::from_min_max(area.min, egui::pos2(area.right(), footer.top())))
@@ -8645,6 +8910,11 @@ fn interface_faces() -> Option<theme::Faces> {
 }
 
 /// The user's Trash folder.
+/// How long a drag rests on a folder before the folder opens under it, and
+/// how much of that the folder spends blinking to say it is about to.
+const SPRING_DELAY: Duration = Duration::from_millis(900);
+const SPRING_BLINK: Duration = Duration::from_millis(320);
+
 /// Where the pointer is in this window, in its own points. While files are
 /// dragged over it the window hears of the drag, not of the pointer moving,
 /// so the system is asked directly.
@@ -8885,6 +9155,162 @@ mod screens {
         }
     }
 
+    /// "Open in Terminal" opens a terminal tab there, and what is typed into it
+    /// runs.
+    #[test]
+    #[ignore]
+    fn a_terminal_tab_runs_what_is_typed() {
+        let root = std::env::temp_dir().join(format!("neutron-term-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (_keep, opened) = crossbeam_channel::unbounded();
+        let folder = root.display().to_string();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .with_pixels_per_point(1.0)
+            .wgpu()
+            .build_eframe(|cc| NeutronApp::new(cc, StartupTimer::new(Instant::now()), Some(folder), opened));
+        settle(&mut harness);
+        act(&mut harness, Action::OpenTerminalAt(root.clone()));
+        settle(&mut harness);
+        assert!(harness.state().workspace.active_tab().unwrap().location().is_terminal());
+        harness.input_mut().events.push(egui::Event::Text("echo neutron-$((6*7))".into()));
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        let mut seen = String::new();
+        for _ in 0..100 {
+            settle(&mut harness);
+            seen = harness.state().terminals.borrow().values().next().and_then(|s| s.with_screen(|s| s.contents())).unwrap_or_default();
+            if seen.contains("neutron-42") {
+                break;
+            }
+        }
+        assert!(seen.contains("neutron-42"), "{seen}");
+        if let Some(out) = std::env::var_os("NEUTRON_SHOTS").map(PathBuf::from) {
+            shoot(&mut harness, &out, "terminal.png");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ask Claude Code opens it in a terminal tab on the folder, where its
+    /// interface draws. Needs Claude Code installed; it is only started, and
+    /// asked nothing.
+    #[test]
+    #[ignore]
+    fn an_agent_opens_in_a_terminal_tab() {
+        let root = std::env::temp_dir().join(format!("neutron-agent-tab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (_keep, opened) = crossbeam_channel::unbounded();
+        let folder = root.display().to_string();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .with_pixels_per_point(1.0)
+            .wgpu()
+            .build_eframe(|cc| NeutronApp::new(cc, StartupTimer::new(Instant::now()), Some(folder), opened));
+        settle(&mut harness);
+        act(&mut harness, Action::AskAgent(crate::agent::Agent::Claude));
+        let mut seen = String::new();
+        for _ in 0..40 {
+            settle(&mut harness);
+            seen = harness.state().terminals.borrow().values().next().and_then(|s| s.with_screen(|s| s.contents())).unwrap_or_default();
+            if seen.to_lowercase().contains("claude") || seen.contains("trust") {
+                break;
+            }
+        }
+        if let Some(out) = std::env::var_os("NEUTRON_SHOTS").map(PathBuf::from) {
+            shoot(&mut harness, &out, "agent.png");
+        }
+        assert!(seen.to_lowercase().contains("claude") || seen.contains("trust"), "{seen}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The viewer opens code with its lines coloured, and finds in it; and
+    /// draws a PDF's pages. Shots of each with `NEUTRON_SHOTS`;
+    /// `NEUTRON_SHOTS_PDF` names a PDF to show.
+    #[test]
+    #[ignore]
+    fn the_viewer_shows_code_and_pdfs() {
+        let code = Path::new(env!("CARGO_MANIFEST_DIR")).join("../neutron-ui/src/highlight.rs").canonicalize().unwrap();
+        let folder = code.parent().unwrap().display().to_string();
+        let (_keep, opened) = crossbeam_channel::unbounded();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .with_pixels_per_point(1.0)
+            .wgpu()
+            .build_eframe(|cc| NeutronApp::new(cc, StartupTimer::new(Instant::now()), Some(folder), opened));
+        settle(&mut harness);
+        act(&mut harness, Action::OpenInViewer(code.clone()));
+        settle(&mut harness);
+        {
+            let state = harness.state();
+            let mut viewers = state.viewers.borrow_mut();
+            let view = viewers.view(&code);
+            assert!(matches!(view.doc, crate::viewer::Doc::Text(_)));
+            view.find = "carry".into();
+            view.refind();
+            assert!(!view.matches.is_empty());
+        }
+        settle(&mut harness);
+        let out = std::env::var_os("NEUTRON_SHOTS").map(PathBuf::from);
+        if let Some(out) = &out {
+            shoot(&mut harness, out, "viewer-code.png");
+        }
+        if let Some(pdf) = std::env::var_os("NEUTRON_SHOTS_PDF").map(PathBuf::from) {
+            act(&mut harness, Action::OpenInViewer(pdf.clone()));
+            for _ in 0..4 {
+                settle(&mut harness);
+            }
+            assert!(matches!(harness.state().viewers.borrow_mut().view(&pdf).doc, crate::viewer::Doc::Pdf(_)));
+            if let Some(out) = &out {
+                shoot(&mut harness, out, "viewer-pdf.png");
+            }
+        }
+    }
+
+    /// A drag held on a folder's row opens the folder, in each view.
+    #[test]
+    #[ignore]
+    fn a_drag_held_on_a_folder_opens_it() {
+        let root = std::env::temp_dir().join(format!("neutron-spring-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("inbox")).unwrap();
+        let file = root.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        for view in [file_list::ViewMode::List, file_list::ViewMode::Grid, file_list::ViewMode::Columns] {
+            let (_keep, opened) = crossbeam_channel::unbounded();
+            let folder = root.display().to_string();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1440.0, 900.0))
+                .with_pixels_per_point(1.0)
+                .wgpu()
+                .build_eframe(|cc| NeutronApp::new(cc, StartupTimer::new(Instant::now()), Some(folder), opened));
+            act(&mut harness, Action::SetView(view));
+            settle(&mut harness);
+            let hover = |h: &mut egui_kittest::Harness<'_, NeutronApp>| {
+                h.input_mut().hovered_files.push(egui::HoveredFile { path: Some(file.clone()), ..Default::default() });
+                h.run_steps(1);
+            };
+            hover(&mut harness);
+            let target = harness.state().drop_debug.clone().into_iter().find(|t| t.path.ends_with("inbox")).unwrap();
+            harness.hover_at(target.rect.center());
+            let started = Instant::now();
+            while started.elapsed() < SPRING_DELAY + Duration::from_millis(300) {
+                hover(&mut harness);
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            let at = harness.state().workspace.active_tab().unwrap().location().clone();
+            assert_eq!(at, NodeId::path(root.join("inbox")), "{view:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A file dropped on a folder's row goes inside that folder, in each view.
     #[test]
     #[ignore]
@@ -8965,6 +9391,12 @@ mod screens {
         act(&mut harness, Action::SetView(file_list::ViewMode::Grid));
         settle(&mut harness);
         shoot(&mut harness, &out, "grid.png");
+        act(&mut harness, Action::GroupBy(neutron_core::GroupBy::Kind));
+        act(&mut harness, Action::SetTileScale(1.4));
+        settle(&mut harness);
+        shoot(&mut harness, &out, "grid-grouped.png");
+        act(&mut harness, Action::GroupBy(neutron_core::GroupBy::None));
+        act(&mut harness, Action::SetTileScale(1.0));
 
         // The overlays, over the list.
         act(&mut harness, Action::SetView(file_list::ViewMode::List));

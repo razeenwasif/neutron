@@ -127,13 +127,27 @@ named ones, and the sidebar's Tags
 section lists every file with one, found by Spotlight. **View › Sort By** adds
 Date Added and Date Last Opened (from Spotlight, read only when asked for), and
 **Group By** gathers the list under headings by kind, date or size, as the
-Finder's Use Groups does. **View › Calculate All Sizes** adds up every folder
+Finder's Use Groups does, in the grid as well as the list; the grid's tile
+size is set by the slider in its footer. **View › Calculate All Sizes** adds up every folder
 shown, in the background, newest folder first; **Calculate Size** in a
 folder's menu does it for that one. **Share…** in a file's
 menu (and in File) opens the system's share menu — AirDrop, Mail, Messages and
 the rest — and **AirDrop…** goes straight to AirDrop, from inside archives
 too. **New File from Template**, in the menu for a folder's empty space,
-copies any file you keep in `~/Library/Application Support/Neutron/Templates`. A `.zip`, `.tar` or `.tar.gz` opens as a
+copies any file you keep in `~/Library/Application Support/Neutron/Templates`.
+
+**Open in Terminal** opens a terminal in a tab of the pane, in that folder —
+your login shell, with your prompt and PATH — which can be split, dragged and
+closed like any tab; a running shell is kept when you go to a folder from it.
+**Ask Claude Code** and **Ask Gemini** (in Go, the command palette, and every
+right-click menu) open that agent's CLI in such a tab on the folder, signed in
+with your own subscription. Claude Code is told which items were selected,
+and can read and edit files without asking (commands still ask); Gemini edits
+the same way. Both are given Neutron's search as tools — Spotlight name and
+full-text search across the disk, and fuzzy path matching — served by
+`neutron --mcp`. **Open in Viewer** (`⌥⌘O`) opens a PDF, an image, or text and
+code in a tab to read: pages drawn as you scroll, lines numbered and coloured
+for most languages, zoom, find, and copying lines. A `.zip`, `.tar` or `.tar.gz` opens as a
 read-only folder you can browse, preview, Quick Look and copy out of;
 **Extract** in its menu unpacks the whole thing beside itself.
 
@@ -609,7 +623,7 @@ do not.
 | *type a name* | Jump to it; repeat a letter to cycle matches |
 | `Ctrl+A` | Select all |
 | *press and drag* | Rubber-band select (hold `Ctrl`, `⌘` on a Mac, to add), in the list, grid and columns |
-| *drag a selected item* | Drag the whole selection out — to another app, or onto a folder row or sidebar place to put it inside (the Trash moves it to the Trash; hold `⌥` to copy) |
+| *drag a selected item* | Drag the whole selection out — to another app, or onto a folder row or sidebar place to put it inside (the Trash moves it to the Trash; hold `⌥` to copy). Hold the drag on a folder and it opens, to carry files several folders down |
 | `Ctrl+C` `Ctrl+X` `Ctrl+V` | Copy / cut / paste, through the real Windows clipboard |
 | `F2` | Rename in place, with the stem selected |
 | `Ctrl+Shift+N` | New folder, ready to be named |

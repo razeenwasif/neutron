@@ -513,7 +513,7 @@ fn read(path: &Path, is_dir: bool) -> Preview {
 /// By extension rather than by sniffing the header: the decoder sniffs anyway,
 /// and this decides whether to *try*, which is a question about what the user
 /// meant the file to be.
-fn looks_like_image(path: &Path) -> bool {
+pub(crate) fn looks_like_image(path: &Path) -> bool {
     const IMAGE: &[&str] = &[
         "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff",
     ];

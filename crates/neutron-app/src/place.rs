@@ -68,6 +68,14 @@ pub fn pathless(id: &NodeId, sites: &Sites) -> Option<Pathless> {
             name: display.to_string(),
             later: false,
         }),
+        NodeId::Terminal { .. } => Some(Pathless {
+            name: "a terminal".to_owned(),
+            later: false,
+        }),
+        NodeId::Viewer { path } => Some(Pathless {
+            name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            later: false,
+        }),
         // Its files are all over the disk; what needs one folder cannot be
         // done here.
         NodeId::Tag { name } => Some(Pathless {

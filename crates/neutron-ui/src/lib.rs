@@ -10,8 +10,10 @@ pub mod context_menu;
 pub mod drop;
 pub mod file_list;
 pub mod format;
+pub mod highlight;
 pub mod icons;
 pub mod tags;
+pub mod term_view;
 pub mod theme;
 pub mod thumb;
 

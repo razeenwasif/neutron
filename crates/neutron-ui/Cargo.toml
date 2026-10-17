@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 neutron-core.workspace = true
+# The terminal's screen, which `term_view` draws.
+vt100 = "0.16"
 egui.workspace = true
 serde.workspace = true
 
