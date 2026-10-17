@@ -107,7 +107,7 @@ fn main() -> eframe::Result<()> {
         .map(|a| std::path::absolute(a).map_or_else(|_| a.clone(), |p| p.to_string_lossy().into_owned()));
 
     let options = eframe::NativeOptions {
-        viewport: window_builder().with_inner_size([1280.0, 800.0]),
+        viewport: window_builder().with_inner_size([1440.0, 800.0]),
         // Not transparent on Windows. Measurement showed wgpu cannot provide a
         // surface with a transparent `CompositeAlphaMode` on any backend
         // available there (DX12, Vulkan, GL all logged the same rejection), so

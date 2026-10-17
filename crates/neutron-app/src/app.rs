@@ -4686,7 +4686,7 @@ impl NeutronApp {
         let mut i = 0;
         while i < self.windows.len() {
             let mut window = self.windows.remove(i);
-            let mut builder = crate::window_builder().with_inner_size(window.size.unwrap_or(egui::vec2(1100.0, 720.0)));
+            let mut builder = crate::window_builder().with_inner_size(window.size.unwrap_or(egui::vec2(1240.0, 720.0)));
             if let Some(at) = window.origin {
                 builder = builder.with_position(at);
             }
