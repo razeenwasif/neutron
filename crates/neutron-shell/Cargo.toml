@@ -49,7 +49,7 @@ objc2 = { version = "0.6", features = ["exception"] }
 block2 = "0.6"
 libc = "0.2"
 objc2-foundation = { version = "0.3", default-features = false, features = [
-    "std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSDate", "NSEnumerator",
+    "std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSData", "NSDate", "NSEnumerator",
     "NSError", "NSFileManager", "NSGeometry", "NSNotification", "NSObject", "NSProcessInfo", "NSString", "NSThread",
     "NSURL", "NSValue",
 ] }

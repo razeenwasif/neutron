@@ -762,11 +762,25 @@ fn draw_entry(
         }
     }
 
+    // --- size, faint at the right: a file's, or a folder's once added up ---
+    let mut text_right = rect.right() - CHEVRON_SLOT;
+    if list.size_known(idx) && rename.is_none() {
+        let size = crate::format::size(Some(list.size(idx)));
+        let galley = ui.painter().layout_no_wrap(size, FontId::proportional(11.0), p.text_faint);
+        let right = if kind.is_container() { rect.right() - CHEVRON_SLOT } else { rect.right() - 8.0 };
+        // Only where it leaves the name room to be read.
+        if right - galley.size().x > rect.left() + ICON_SLOT + 70.0 {
+            let at = pos2(right - galley.size().x, outer.center().y - galley.size().y / 2.0);
+            text_right = at.x - 8.0;
+            ui.painter().galley(at, galley, p.text_faint);
+        }
+    }
+
     // --- name ---
     let name_left = rect.left() + 6.0 + ICON_SLOT;
     let name_rect = Rect::from_min_max(
         pos2(name_left, outer.top()),
-        pos2(rect.right() - CHEVRON_SLOT, outer.bottom()),
+        pos2(text_right, outer.bottom()),
     );
     let mut rename_action = None;
     if let Some((text, generation)) = rename {

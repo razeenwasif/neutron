@@ -36,6 +36,7 @@ image.workspace = true
 # keep what it draws.
 portable-pty = "0.9"
 vt100 = "0.16"
+libc = "0.2"
 
 [build-dependencies]
 winresource = "0.1"

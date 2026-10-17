@@ -102,6 +102,11 @@ pub enum NodeId {
     /// A file open in Neutron's viewer: a PDF, an image, text or code. Up is
     /// the folder it is in.
     Viewer { path: PathBuf },
+
+    /// The files a search finds, wherever they are: a Smart Folder. `query`
+    /// is a [`crate::query::Query`], written down; `name` what it was saved
+    /// as, or empty.
+    Search { name: Arc<str>, query: Arc<str> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -221,6 +226,8 @@ impl NodeId {
             NodeId::Tag { name } => name.to_string(),
             NodeId::Terminal { .. } => "Terminal".to_owned(),
             NodeId::Viewer { path } => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            NodeId::Search { name, .. } if !name.is_empty() => name.to_string(),
+            NodeId::Search { query, .. } => crate::query::Query::decode(query).describe(),
             // The folder's own name, or the archive's at its top.
             NodeId::Archive { archive, inner } => match inner.rsplit('/').next() {
                 Some(name) if !name.is_empty() => name.to_owned(),
@@ -278,6 +285,7 @@ impl fmt::Display for NodeId {
             NodeId::Tag { name } => write!(f, "<tag:{name}>"),
             NodeId::Terminal { id, dir } => write!(f, "<terminal {id}:{}>", dir.display()),
             NodeId::Viewer { path } => write!(f, "<viewer:{}>", path.display()),
+            NodeId::Search { query, .. } => write!(f, "<search:{}>", crate::query::Query::decode(query).describe()),
             NodeId::Archive { archive, inner } if inner.is_empty() => write!(f, "{}", archive.display()),
             NodeId::Archive { archive, inner } => write!(f, "{}/{inner}", archive.display()),
         }

@@ -69,6 +69,21 @@ impl Index {
             Format::TarGz => {
                 index.tar(tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(archive)?)))?
             }
+            Format::TarXz | Format::TarBz2 | Format::SevenZ | Format::Rar => {
+                for (name, dir, size) in crate::external::list(archive)? {
+                    index.add(&name, dir, size, 0);
+                }
+            }
+            // One file: the archive's own name less `.gz`, from when it was made.
+            Format::Gz => {
+                let modified = fs::metadata(archive)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_millis() as i64);
+                let name = crate::external::gunzipped_name(archive);
+                index.add(&name, false, crate::external::gunzipped_size(archive), modified);
+            }
         }
         Ok(index)
     }

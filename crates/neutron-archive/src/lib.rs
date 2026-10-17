@@ -23,6 +23,7 @@
 pub mod browse;
 pub mod clock;
 pub mod create;
+pub mod external;
 pub mod extract;
 pub mod path;
 
@@ -34,6 +35,21 @@ pub enum Format {
     Zip,
     Tar,
     TarGz,
+    /// Tar compressed with xz or bzip2, 7-Zip and RAR: read through the
+    /// system's libarchive. See [`external`].
+    TarXz,
+    TarBz2,
+    SevenZ,
+    Rar,
+    /// One file, gzipped.
+    Gz,
+}
+
+impl Format {
+    /// Whether it is read through the system's libarchive.
+    pub fn is_external(self) -> bool {
+        matches!(self, Format::TarXz | Format::TarBz2 | Format::SevenZ | Format::Rar)
+    }
 }
 
 impl Format {
@@ -43,6 +59,11 @@ impl Format {
             Format::Zip => &[".zip"],
             Format::Tar => &[".tar"],
             Format::TarGz => &[".tar.gz", ".tgz"],
+            Format::TarXz => &[".tar.xz", ".txz"],
+            Format::TarBz2 => &[".tar.bz2", ".tbz2", ".tbz"],
+            Format::SevenZ => &[".7z"],
+            Format::Rar => &[".rar"],
+            Format::Gz => &[".gz"],
         }
     }
 }
@@ -58,8 +79,17 @@ pub fn format_of(path: &Path) -> Option<Format> {
 
     // Longest first: `.tar.gz` also ends with `.gz`, and a plain `.gz` of
     // something that is not a tar is not something this extracts.
-    [Format::TarGz, Format::Tar, Format::Zip]
-        .into_iter()
+    [
+        Format::TarGz,
+        Format::TarXz,
+        Format::TarBz2,
+        Format::Tar,
+        Format::Zip,
+        Format::SevenZ,
+        Format::Rar,
+        Format::Gz,
+    ]
+    .into_iter()
         .find(|format| format.suffix().iter().any(|s| name.ends_with(s)))
 }
 
@@ -145,7 +175,12 @@ mod tests {
         assert_eq!(format_of(Path::new("a.tar.gz")), Some(Format::TarGz));
         assert_eq!(format_of(Path::new("a.tgz")), Some(Format::TarGz));
         assert_eq!(format_of(Path::new("a.txt")), None);
-        assert_eq!(format_of(Path::new("a.7z")), None);
+        assert_eq!(format_of(Path::new("a.7z")), Some(Format::SevenZ));
+        assert_eq!(format_of(Path::new("a.RAR")), Some(Format::Rar));
+        assert_eq!(format_of(Path::new("a.tar.xz")), Some(Format::TarXz));
+        assert_eq!(format_of(Path::new("a.tbz2")), Some(Format::TarBz2));
+        assert_eq!(format_of(Path::new("notes.txt.gz")), Some(Format::Gz));
+        assert_eq!(format_of(Path::new("a.dmg")), None);
     }
 
     #[test]

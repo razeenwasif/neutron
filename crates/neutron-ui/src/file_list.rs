@@ -65,6 +65,10 @@ pub enum ViewMode {
     /// each with the next step highlighted, and the selected folder's contents
     /// to the right. Drawn by [`crate::columns`], not by this module.
     Columns,
+    /// The Finder's gallery: the current item large, the folder's items a
+    /// strip of thumbnails beneath it. This module draws the strip; the app
+    /// draws the large preview in [`FileListState::gallery_top`].
+    Gallery,
 }
 
 impl ViewMode {
@@ -73,7 +77,8 @@ impl ViewMode {
         match self {
             ViewMode::List => ViewMode::Grid,
             ViewMode::Grid => ViewMode::Columns,
-            ViewMode::Columns => ViewMode::List,
+            ViewMode::Columns => ViewMode::Gallery,
+            ViewMode::Gallery => ViewMode::List,
         }
     }
 }
@@ -100,6 +105,9 @@ pub struct FileListState {
     /// How big the grid's tiles are, as a scale of the standard size; 0 for
     /// the standard size. See [`FileListState::tile_scale`].
     pub tile_scale: f32,
+    /// In the gallery, the space above the strip, for the app to draw the
+    /// current item in. Written during paint, like `columns`.
+    pub gallery_top: Option<Rect>,
 }
 
 impl FileListState {
@@ -225,7 +233,132 @@ pub fn show(
         // `crate::columns`. Falls back to the list if it lands here anyway.
         ViewMode::List | ViewMode::Columns => show_list(ui, state, list, marks, p, icons),
         ViewMode::Grid => show_grid(ui, state, list, marks, p, icons),
+        ViewMode::Gallery => show_gallery(ui, state, list, marks, p, icons),
     }
+}
+
+/// Height of the gallery's strip of thumbnails, and of each thumbnail.
+const STRIP_H: f32 = 124.0;
+const THUMB: f32 = 92.0;
+
+/// The gallery's strip: every item as a thumbnail in one scrolling row, the
+/// current one ringed. Above it is left for the app — see
+/// [`FileListState::gallery_top`].
+fn show_gallery(
+    ui: &mut Ui,
+    state: &mut FileListState,
+    list: &EntryList,
+    marks: &Marks<'_>,
+    p: &Palette,
+    icons: Option<&dyn IconSource>,
+) -> Option<FileListAction> {
+    let mut action = None;
+    let area = ui.available_rect_before_wrap();
+    let strip = Rect::from_min_max(pos2(area.left(), area.bottom() - STRIP_H), area.max);
+    state.gallery_top = Some(Rect::from_min_max(area.min, pos2(area.right(), strip.top() - 6.0)));
+    state.columns = 1;
+    ui.painter().hline(strip.x_range(), strip.top() - 3.0, Stroke::new(1.0, theme::with_alpha(p.text_faint, 40)));
+
+    let count = list.order().len();
+    let step = THUMB + 10.0;
+    let mut scroll = egui::ScrollArea::horizontal().id_salt("gallery-strip").auto_shrink([false; 2]);
+    if let Some(target) = state.scroll_to.take() {
+        if let Some(position) = list.rank(target) {
+            let x = position as f32 * step;
+            let current = scroll_offset(ui, "gallery");
+            if x < current || x + step > current + strip.width() {
+                scroll = scroll.horizontal_scroll_offset((x - strip.width() / 2.0 + step / 2.0).max(0.0));
+            }
+        }
+    }
+    let mut strip_ui = ui.new_child(egui::UiBuilder::new().max_rect(strip).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    let output = scroll.show_viewport(&mut strip_ui, |ui, shown| {
+        ui.set_min_size(vec2(count as f32 * step + 16.0, STRIP_H - 8.0));
+        let origin = ui.max_rect().min;
+        let (content, _) = ui.allocate_exact_size(vec2((count as f32 * step + 16.0).max(strip.width()), STRIP_H - 8.0), Sense::hover());
+        if let Some(a) = empty_space(ui, content) {
+            action = Some(a);
+        }
+        let first = ((shown.left() - 8.0) / step).floor().max(0.0) as usize;
+        let last = (((shown.right() - 8.0) / step).ceil() as usize + 1).min(count);
+        for position in first..last {
+            let idx = list.at(position);
+            let tile = Rect::from_min_size(pos2(origin.x + 8.0 + position as f32 * step, origin.y + 6.0), vec2(THUMB, THUMB + 18.0));
+            if let Some(a) = gallery_tile(ui, list, marks, p, idx, tile, icons) {
+                action = Some(a);
+            }
+        }
+    });
+    remember_scroll(ui, "gallery", output.id);
+    action
+}
+
+/// One thumbnail in the gallery's strip: its picture or icon, and its name.
+fn gallery_tile(
+    ui: &mut Ui,
+    list: &EntryList,
+    marks: &Marks<'_>,
+    p: &Palette,
+    idx: usize,
+    rect: Rect,
+    icons: Option<&dyn IconSource>,
+) -> Option<FileListAction> {
+    let response = ui.interact(rect, ui.id().with(("gallery", idx)), Sense::click());
+    let name = list.name(idx);
+    let kind = list.kind(idx);
+    if crate::drop::accepts(name, kind) {
+        crate::drop::offer(ui, rect, std::path::Path::new(name), 10.0);
+    }
+    let art = Rect::from_min_size(rect.min, vec2(THUMB, THUMB));
+    let selected = marks.selection.is_selected(idx);
+    let cursor = marks.selection.cursor() == Some(idx);
+    if selected {
+        ui.painter().rect_filled(art, 10.0, p.selection);
+    } else if response.hovered() {
+        ui.painter().rect_filled(art, 10.0, p.hover);
+    }
+    let thumb = icons
+        .filter(|_| crate::thumb::wants_preview(name, kind) && list.sync(idx) != SyncState::CloudOnly)
+        .and_then(|src| src.preview(name, kind, list.modified(idx)));
+    match thumb {
+        Some(thumb) => {
+            crate::thumb::paint(ui.painter(), art.shrink(6.0), thumb, 6.0, false, list.is_hidden(idx));
+        }
+        None => icons::tile(
+            ui.painter(),
+            Rect::from_center_size(art.center(), vec2(48.0, 48.0)),
+            icons::FileKind::of(name, kind),
+            p,
+            list.is_hidden(idx),
+        ),
+    }
+    if cursor {
+        ui.painter().rect_stroke(art, 10.0, Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+    }
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_owned(), FontId::proportional(11.0), if selected { p.text } else { p.text_soft() });
+    job.wrap = egui::text::TextWrapping { max_width: THUMB, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    job.halign = Align2::CENTER_TOP.x();
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(pos2(art.center().x, art.bottom() + 3.0), galley, p.text);
+
+    if response.double_clicked() {
+        return Some(FileListAction::Activate(idx));
+    }
+    if response.clicked() {
+        let mods = ui.input(|i| i.modifiers);
+        let mode = if mods.shift {
+            SelectMode::Range
+        } else if mods.ctrl || mods.command {
+            SelectMode::Toggle
+        } else {
+            SelectMode::Replace
+        };
+        return Some(FileListAction::Select { idx, mode });
+    }
+    if response.secondary_clicked() {
+        return Some(FileListAction::ContextMenu { idx: Some(idx), pos: response.interact_pointer_pos().unwrap_or(rect.center()) });
+    }
+    None
 }
 
 /// Draws the header and the virtualized rows.
@@ -1696,8 +1829,15 @@ fn draw_tile(
         overflow_character: Some('…'),
     };
     let galley = ui.painter().layout_job(job);
-    let name_bottom = name_top + galley.size().y;
+    let mut name_bottom = name_top + galley.size().y;
     ui.painter().galley(pos2(rect.center().x, name_top), galley, colour);
+    // Its size, small, under the name — a folder's once it has been added
+    // up — where the tile has room for it.
+    if list.size_known(idx) && name_bottom + 15.0 < rect.bottom() {
+        let info = format::size(Some(list.size(idx)));
+        ui.painter().text(pos2(rect.center().x, name_bottom + 1.0), Align2::CENTER_TOP, info, FontId::proportional(10.5), p.text_faint);
+        name_bottom += 14.0;
+    }
     // Tags, as dots centred under the name.
     let tags = list.tag_colors(idx);
     let dots = crate::tags::width(tags);

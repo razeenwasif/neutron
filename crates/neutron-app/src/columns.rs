@@ -64,6 +64,10 @@ pub struct ColumnCache {
     slots: HashMap<PathBuf, Slot>,
     /// What is wanted right now, shared so the worker can skip what is not.
     wanted: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Folders whose listings arrived since `take_arrived` last asked.
+    arrived: Vec<PathBuf>,
+    /// The folder sizes' version the listings were last given sizes from.
+    sizes_seen: u64,
 }
 
 impl ColumnCache {
@@ -83,6 +87,46 @@ impl ColumnCache {
             replies,
             slots: HashMap::new(),
             wanted,
+            arrived: Vec::new(),
+            sizes_seen: 0,
+        }
+    }
+
+    /// Every folder in every listing held.
+    pub fn folders(&self) -> Vec<PathBuf> {
+        self.slots
+            .iter()
+            .filter_map(|(dir, slot)| match slot {
+                Slot::Ready { list, .. } => Some(
+                    (0..list.len()).filter(|&i| list.kind(i).is_container()).map(|i| dir.join(list.name(i))).collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// The folders whose listings arrived since this was last asked.
+    pub fn take_arrived(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.arrived)
+    }
+
+    /// Gives the folders in every listing the sizes found for them, when
+    /// there are new ones — or new listings to give them to.
+    pub fn apply_sizes(&mut self, version: u64, fresh: bool, size_of: impl Fn(&Path) -> Option<u64>) {
+        if version == self.sizes_seen && !fresh {
+            return;
+        }
+        self.sizes_seen = version;
+        for (dir, slot) in &mut self.slots {
+            let Slot::Ready { list, .. } = slot else { continue };
+            for i in 0..list.len() {
+                if list.kind(i).is_container() {
+                    if let Some(size) = size_of(&dir.join(list.name(i))) {
+                        list.set_folder_size(i, size);
+                    }
+                }
+            }
         }
     }
 
@@ -94,6 +138,9 @@ impl ColumnCache {
             let Some(slot) = self.slots.get_mut(&dir) else {
                 continue;
             };
+            if outcome.is_ok() {
+                self.arrived.push(dir.clone());
+            }
             *slot = match outcome {
                 Ok(list) => Slot::Ready {
                     list: Box::new(list),

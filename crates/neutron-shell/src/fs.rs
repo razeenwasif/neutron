@@ -293,3 +293,13 @@ mod tests {
 pub fn last_opened(_path: &std::path::Path) -> i64 {
     0
 }
+
+/// What a symbolic link stands for.
+pub fn original(path: &Path) -> Result<std::path::PathBuf, String> {
+    std::fs::read_link(path).map_err(|e| e.to_string())
+}
+
+/// When `path` was put in its folder; not kept here.
+pub fn added(_path: &Path) -> i64 {
+    0
+}

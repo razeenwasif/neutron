@@ -154,9 +154,12 @@ pub fn reverse(step: &Step) -> Reversed {
                 failed.push(format!("{}: no longer there", name(gone)));
             }
             match neutron_shell::fileops::trash(&present) {
-                Ok(went) => Step::Trashed(
-                    present.into_iter().zip(went).filter_map(|(was, went)| went.map(|w| (was, w))).collect(),
-                ),
+                Ok(went) => {
+                    let moved: Vec<(PathBuf, PathBuf)> =
+                        present.into_iter().zip(went).filter_map(|(was, went)| went.map(|w| (was, w))).collect();
+                    crate::trash::remember(&moved);
+                    Step::Trashed(moved)
+                }
                 Err(why) => {
                     failed.push(why);
                     Step::Trashed(Vec::new())

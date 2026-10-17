@@ -9,6 +9,7 @@ pub mod menu;
 pub mod naming;
 pub mod namespace;
 pub mod places;
+pub mod query;
 pub mod selection;
 pub mod sort;
 pub mod text;

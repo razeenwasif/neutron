@@ -19,6 +19,9 @@ pub struct Target {
     pub path: PathBuf,
     /// How round its corners are drawn, so the highlight fits it.
     pub radius: f32,
+    /// A tab, by its pane and place in it: held on, it is shown rather than
+    /// its folder opened in the pane.
+    pub tab: Option<(u64, usize)>,
 }
 
 fn id() -> Id {
@@ -40,7 +43,25 @@ pub fn offer(ui: &egui::Ui, rect: Rect, path: &Path, radius: f32) {
     let rect = rect.intersect(ui.clip_rect());
     if rect.is_positive() {
         ui.ctx().data_mut(|d| {
-            d.get_temp_mut_or_default::<Vec<Target>>(id()).push(Target { rect, path: path.to_path_buf(), radius })
+            d.get_temp_mut_or_default::<Vec<Target>>(id()).push(Target { rect, path: path.to_path_buf(), radius, tab: None })
+        });
+    }
+}
+
+/// Offers a tab showing `path` as somewhere to drop, as [`offer`] does.
+pub fn offer_tab(ui: &egui::Ui, rect: Rect, path: &Path, radius: f32, group: u64, index: usize) {
+    if !active(ui.ctx()) {
+        return;
+    }
+    let rect = rect.intersect(ui.clip_rect());
+    if rect.is_positive() {
+        ui.ctx().data_mut(|d| {
+            d.get_temp_mut_or_default::<Vec<Target>>(id()).push(Target {
+                rect,
+                path: path.to_path_buf(),
+                radius,
+                tab: Some((group, index)),
+            })
         });
     }
 }

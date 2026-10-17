@@ -225,6 +225,8 @@ fn worker(
                 .list(archive, inner)
                 .map_err(neutron_core::NamespaceError::Other),
             NodeId::Tag { name } => tagged(name).map_err(neutron_core::NamespaceError::Other),
+            NodeId::Search { query, .. } => searched(&neutron_core::query::Query::decode(query))
+                .map_err(neutron_core::NamespaceError::Other),
             id if shell.handles(id) => shell.enumerate(id),
             id => fs.enumerate(id),
         };
@@ -297,8 +299,46 @@ fn is_stale(generations: &Generations, tab: TabId, generation: u64) -> bool {
 /// Every file Spotlight finds with the tag `name`, each row leading to its
 /// own path.
 fn tagged(name: &str) -> Result<EntryList, String> {
+    found(neutron_shell::tags::search(name)?)
+}
+
+/// Most results a search lists.
+const SEARCH_LIMIT: usize = 10_000;
+
+/// What a search finds, through Spotlight, as a listing whose rows lead to
+/// their own paths.
+fn searched(query: &neutron_core::query::Query) -> Result<EntryList, String> {
+    use std::os::unix::ffi::OsStrExt;
+    if query.is_empty() {
+        return Ok(EntryList::new());
+    }
+    let mut cmd = std::process::Command::new("/usr/bin/mdfind");
+    cmd.arg("-0");
+    if let Some(scope) = &query.scope {
+        cmd.arg("-onlyin").arg(scope);
+    }
+    let out = cmd
+        .arg(query.predicate())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("Spotlight could not be asked: {e}"))?;
+    if !out.status.success() {
+        return Err("Spotlight refused the search".into());
+    }
+    let paths = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .take(SEARCH_LIMIT)
+        .map(|p| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(p)))
+        .collect();
+    found(paths)
+}
+
+/// A listing of files from anywhere, each row leading to its own path.
+fn found(paths: Vec<std::path::PathBuf>) -> Result<EntryList, String> {
     use neutron_core::entry::{Entry, EntryKind, SyncState, attr};
-    let paths = neutron_shell::tags::search(name)?;
     let mut list = EntryList::with_capacity(paths.len());
     for path in paths {
         let Ok(meta) = path.symlink_metadata() else { continue };

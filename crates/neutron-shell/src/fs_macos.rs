@@ -44,7 +44,12 @@ impl Namespace for FsNamespace {
             list.push(&Entry { name, kind, size: meta.len(), attrs,
                 modified: millis(meta.modified()), created: millis(meta.created()),
                 sync: sync_state(meta.st_flags()) });
-            list.set_added(list.len() - 1, added_time(&entry.path()));
+            let (added, alias) = facts(&entry.path());
+            if alias {
+                let i = list.len() - 1;
+                list.mark(i, attr::ALIAS);
+            }
+            list.set_added(list.len() - 1, added);
         }
         Ok(list)
     }
@@ -106,22 +111,24 @@ fn learn_kind(path: &Path) {
     neutron_core::kinds::learn(ext, name.unwrap_or_else(|| format!("{} file", ext.to_uppercase())));
 }
 
-/// When `path` was put in the folder it is in, in milliseconds; 0 when the
-/// volume does not keep it. One `getattrlist`, as cheap as the stat before it.
-fn added_time(path: &Path) -> i64 {
+/// When `path` was put in the folder it is in, in milliseconds — 0 when the
+/// volume does not keep it — and whether it is a Finder alias. One
+/// `getattrlist`, as cheap as the stat before it.
+fn facts(path: &Path) -> (i64, bool) {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return 0 };
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return (0, false) };
     let mut request = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
-        commonattr: libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_ADDEDTIME,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_FNDRINFO | libc::ATTR_CMN_ADDEDTIME,
         volattr: 0,
         dirattr: 0,
         fileattr: 0,
         forkattr: 0,
     };
-    // A length, which attributes came back, then the time if it did.
-    let mut buffer = [0u8; 64];
+    // A length, which attributes came back, then each that did in the order
+    // of their bits: the Finder's thirty-two bytes, then the time.
+    let mut buffer = [0u8; 96];
     // SAFETY: a valid path, request and buffer of the stated size.
     let rc = unsafe {
         libc::getattrlist(
@@ -133,15 +140,49 @@ fn added_time(path: &Path) -> i64 {
         )
     };
     if rc != 0 {
-        return 0;
+        return (0, false);
     }
     let returned = u32::from_ne_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
-    if returned & libc::ATTR_CMN_ADDEDTIME == 0 {
-        return 0;
+    let mut at = 24;
+    let mut alias = false;
+    if returned & libc::ATTR_CMN_FNDRINFO != 0 {
+        // The Finder's flags, big-endian, eight bytes in; `kIsAlias` is the
+        // top bit.
+        alias = u16::from_be_bytes([buffer[at + 8], buffer[at + 9]]) & 0x8000 != 0;
+        at += 32;
     }
-    let seconds = i64::from_ne_bytes(buffer[24..32].try_into().unwrap_or([0; 8]));
-    let nanos = i64::from_ne_bytes(buffer[32..40].try_into().unwrap_or([0; 8]));
-    seconds.saturating_mul(1000) + nanos / 1_000_000
+    if returned & libc::ATTR_CMN_ADDEDTIME == 0 {
+        return (0, alias);
+    }
+    let seconds = i64::from_ne_bytes(buffer[at..at + 8].try_into().unwrap_or([0; 8]));
+    let nanos = i64::from_ne_bytes(buffer[at + 8..at + 16].try_into().unwrap_or([0; 8]));
+    (seconds.saturating_mul(1000) + nanos / 1_000_000, alias)
+}
+
+/// When `path` was put in its folder, in milliseconds; 0 when not known.
+pub fn added(path: &Path) -> i64 {
+    facts(path).0
+}
+
+/// What an alias or a symbolic link stands for. Blocks on the disk.
+pub fn original(path: &Path) -> Result<std::path::PathBuf, String> {
+    if let Ok(target) = std::fs::read_link(path) {
+        let target = if target.is_relative() { path.parent().unwrap_or(Path::new("/")).join(target) } else { target };
+        return if target.symlink_metadata().is_ok() {
+            Ok(target)
+        } else {
+            Err(format!("{} is not there any more", target.display()))
+        };
+    }
+    use objc2_foundation::{NSString, NSURL, NSURLBookmarkResolutionOptions};
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    let resolved = NSURL::URLByResolvingAliasFileAtURL_options_error(&url, NSURLBookmarkResolutionOptions::WithoutUI)
+        .map_err(|e| e.localizedDescription().to_string())?;
+    let target = resolved.path().map(|p| std::path::PathBuf::from(p.to_string())).ok_or("the original has no path")?;
+    if target == path {
+        return Err("this is not an alias".into());
+    }
+    Ok(target)
 }
 
 #[link(name = "CoreServices", kind = "framework")]
@@ -196,9 +237,41 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         let now = millis(Ok(std::time::SystemTime::now()));
-        let added = added_time(&dir.join("a.txt"));
+        let (added, alias) = facts(&dir.join("a.txt"));
         assert!((now - added).abs() < 60_000, "added {added}, now {now}");
-        assert_eq!(added_time(&dir.join("missing")), 0);
+        assert!(!alias);
+        assert_eq!(facts(&dir.join("missing")), (0, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_alias_and_a_link_are_known_and_lead_to_their_originals() {
+        use objc2_foundation::{NSString, NSURL, NSURLBookmarkCreationOptions, NSURLBookmarkFileCreationOptions};
+        let dir = std::env::temp_dir().join(format!("neutron-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("deep")).unwrap();
+        let real = dir.join("deep/real.txt").canonicalize().unwrap_or_else(|_| {
+            std::fs::write(dir.join("deep/real.txt"), "x").unwrap();
+            dir.join("deep/real.txt").canonicalize().unwrap()
+        });
+        let url = |p: &Path| NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy()));
+        let bookmark = url(&real)
+            .bookmarkDataWithOptions_includingResourceValuesForKeys_relativeToURL_error(
+                NSURLBookmarkCreationOptions::SuitableForBookmarkFile,
+                None,
+                None,
+            )
+            .unwrap();
+        NSURL::writeBookmarkData_toURL_options_error(&bookmark, &url(&dir.join("alias")), 0 as NSURLBookmarkFileCreationOptions).unwrap();
+        std::os::unix::fs::symlink("deep/real.txt", dir.join("link")).unwrap();
+
+        assert!(facts(&dir.join("alias")).1, "the Finder's flag says alias");
+        assert_eq!(original(&dir.join("alias")).unwrap(), real);
+        assert_eq!(original(&dir.join("link")).unwrap().canonicalize().unwrap(), real);
+        assert!(original(&real).is_err(), "a plain file is nobody's alias");
+        let list = FsNamespace.enumerate(&NodeId::path(&dir)).unwrap();
+        let at = |n: &str| (0..list.len()).find(|&i| list.name(i) == n).unwrap();
+        assert!(list.is_alias(at("alias")) && list.is_alias(at("link")) && !list.is_alias(at("deep")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

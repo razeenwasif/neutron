@@ -896,11 +896,11 @@ impl Connection {
         use std::os::unix::ffi::OsStringExt;
         use std::process::{Command as Process, Stdio};
         let start = Instant::now();
-        // Spotlight query syntax is escaped independently of process arguments.
-        let escaped: String = query.needle.chars().flat_map(|c| {
-            if matches!(c, '\\' | '\"' | '*' | '?') { vec!['\\', c] } else { vec![c] }
-        }).collect();
-        let predicate = format!("kMDItemFSName == \"*{escaped}*\"cd");
+        // `kind:pdf`, `date:week` and `tag:Red` narrow it, as the Finder's
+        // search tokens do; the rest is the name. Spotlight's query syntax is
+        // escaped by the query, independently of process arguments.
+        let typed = neutron_core::query::Query::typed(&query.needle);
+        let predicate = typed.predicate();
         let mut child = Process::new("/usr/bin/mdfind").args(["-0", &predicate])
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
             .map_err(|e| QueryError::Transport(e.to_string()))?;
@@ -926,7 +926,7 @@ impl Connection {
             return Err(QueryError::Rejected("Spotlight search failed".into()));
         }
 
-        let needle = query.needle.to_lowercase();
+        let needle = typed.text.to_lowercase();
         let mut ranked: Vec<(u8, usize, PathBuf)> = candidates
             .into_iter()
             .filter_map(|path| {

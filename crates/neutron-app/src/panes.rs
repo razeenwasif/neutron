@@ -339,10 +339,12 @@ pub struct TabDrag {
 /// The strip has no background of its own: it sits on the card, and the tabs
 /// are pills. A separately-filled header bar would reintroduce the banded,
 /// ruled look the card design replaces.
+#[allow(clippy::too_many_arguments)]
 pub fn tab_strip(
     ui: &mut Ui,
     group_id: GroupId,
     titles: &[String],
+    folders: &[Option<std::path::PathBuf>],
     active: usize,
     focused: bool,
     drag: Option<TabDrag>,
@@ -413,6 +415,11 @@ pub fn tab_strip(
             ui.id().with(("tab", group_id.0, i)),
             Sense::click_and_drag(),
         );
+        // A tab on a folder takes files dropped on it, and shows itself when
+        // a drag is held there.
+        if let Some(Some(folder)) = folders.get(i) {
+            neutron_ui::drop::offer_tab(ui, tab_rect, folder, tab_rect.height() / 2.0, group_id.0, i);
+        }
         let dragging_this = drag == Some(TabDrag { group: group_id, index: i });
 
         // Tabs are pills; the active one is raised out of the strip. With

@@ -72,6 +72,7 @@ pub enum CommandId {
 
     OpenTerminal,
     AskClaude,
+    NewSmartFolder,
     AskAntigravity,
     NewWindow,
 }
@@ -192,6 +193,7 @@ pub const ALL: &[CommandDef] = &[
         // alone: this one really is the Control key there.
         hint: if cfg!(target_os = "macos") { "Control+`" } else { "Ctrl+`" },
     },
+    CommandDef { id: CommandId::NewSmartFolder, title: "New Smart Folder — search by name, kind, date and tag", hint: "" },
     CommandDef { id: CommandId::AskClaude, title: "Ask Claude Code about this folder", hint: "" },
     CommandDef { id: CommandId::AskAntigravity, title: "Ask Antigravity about this folder", hint: "" },
     CommandDef { id: CommandId::NewWindow, title: "Open a new window", hint: "Ctrl+N" },

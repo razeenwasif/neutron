@@ -197,10 +197,11 @@ pub fn show(
         // view raised out of it. Three states no longer fit one toggle, and a
         // button showing "the next view" makes the user cycle through one they do
         // not want. Laid out from the right, so listed in reverse.
-        let segments = Rect::from_min_size(pos2(right - 117.0, nav.center().y - 18.0), vec2(117.0, 36.0));
+        let segments = Rect::from_min_size(pos2(right - 153.0, nav.center().y - 18.0), vec2(153.0, 36.0));
         theme::paint_well(ui.painter(), segments, theme::pill(36.0), p);
         let mut seg_x = segments.right() - 3.0 - 36.0;
         for (mode, glyph, tip) in [
+            (ViewMode::Gallery, Glyph::Image, "Gallery view (⌘4)"),
             (ViewMode::Columns, Glyph::Columns, if cfg!(target_os = "macos") { "Column view (⌘3)" } else { "Column view (Ctrl+Shift+L cycles views)" }),
             (ViewMode::Grid, Glyph::Grid, if cfg!(target_os = "macos") { "Grid view (⌘1)" } else { "Grid view (Ctrl+Shift+L cycles views)" }),
             (ViewMode::List, Glyph::List, if cfg!(target_os = "macos") { "List view (⌘2)" } else { "List view (Ctrl+Shift+L cycles views)" }),
@@ -733,6 +734,11 @@ fn breadcrumb(ui: &mut Ui, p: &Palette, rect: Rect, location: &NodeId) -> Option
                 ui.id().with(("crumb", i, x as i32)),
                 Sense::click(),
             );
+            // A folder on the path takes files dropped on it, as the
+            // Finder's path bar does.
+            if let NodeId::Path(folder) = target {
+                neutron_ui::drop::offer(ui, hit, folder, 10.0);
+            }
             if response.hovered() {
                 painter
                     .rect_filled(hit, egui::CornerRadius::same(10), p.hover);

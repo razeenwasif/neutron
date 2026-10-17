@@ -32,6 +32,8 @@ pub mod attr {
     /// listing sets reaches: bit `n - 1` of the byte for Finder colour `n`.
     pub const TAG_SHIFT: u32 = 24;
     pub const TAG_MASK: u32 = 0x7F << TAG_SHIFT;
+    /// A Finder alias: a file that stands for another, by bookmark.
+    pub const ALIAS: u32 = 0x0000_0008;
     /// A folder whose size has been added up, so its size column holds the
     /// total of what is in it rather than nothing in particular.
     pub const MEASURED: u32 = 1 << 31;
@@ -276,6 +278,17 @@ impl EntryList {
 
     pub fn set_opened(&mut self, i: usize, millis: i64) {
         self.opened[i] = millis;
+    }
+
+    /// Sets `bits` in entry `i`'s attributes.
+    pub fn mark(&mut self, i: usize, bits: u32) {
+        self.attrs[i] |= bits;
+    }
+
+    /// Whether entry `i` stands for another item: a Finder alias or a
+    /// symbolic link.
+    pub fn is_alias(&self, i: usize) -> bool {
+        self.attrs[i] & attr::ALIAS != 0 || self.kinds[i] == EntryKind::Symlink
     }
 
     /// Gives folder `i` the size of everything in it.

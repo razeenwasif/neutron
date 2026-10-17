@@ -479,6 +479,9 @@ pub struct PersistedPrefs {
     /// session saved by an older build still reads.
     #[serde(default)]
     pub columns: bool,
+    /// The gallery, likewise its own flag.
+    #[serde(default)]
+    pub gallery: bool,
     /// One of `name`, `size`, `modified`, `created`, `kind`. An unknown value
     /// reads as `name` rather than failing the whole session.
     #[serde(default)]
@@ -495,6 +498,11 @@ pub struct PersistedPrefs {
     /// The grid's tile size, as a scale of the standard one; 0 for standard.
     #[serde(default)]
     pub tile_scale: f32,
+    /// Whether the sidebar, and the action rail beside it, are put away.
+    #[serde(default)]
+    pub hide_sidebar: bool,
+    #[serde(default)]
+    pub hide_toolbar: bool,
 }
 
 impl PersistedPrefs {
@@ -582,6 +590,8 @@ pub enum PersistedLocation {
     Terminal { terminal: String },
     /// A file open in the viewer.
     Viewer { viewer: String },
+    /// A search: the name it was saved as, and the query written down.
+    Search { saved: String, search: String },
 }
 
 impl PersistedLocation {
@@ -602,6 +612,9 @@ impl PersistedLocation {
                 Some(PersistedLocation::Terminal { terminal: dir.to_string_lossy().into_owned() })
             }
             NodeId::Viewer { path } => Some(PersistedLocation::Viewer { viewer: path.to_string_lossy().into_owned() }),
+            NodeId::Search { name, query } => {
+                Some(PersistedLocation::Search { saved: name.to_string(), search: query.to_string() })
+            }
             NodeId::Archive { archive, inner } => Some(PersistedLocation::Archive {
                 archive: archive.to_string_lossy().into_owned(),
                 inner: inner.to_string(),
@@ -625,6 +638,9 @@ impl PersistedLocation {
             PersistedLocation::Tag { tag } => NodeId::Tag { name: tag.as_str().into() },
             PersistedLocation::Terminal { terminal } => NodeId::terminal(PathBuf::from(terminal)),
             PersistedLocation::Viewer { viewer } => NodeId::Viewer { path: PathBuf::from(viewer) },
+            PersistedLocation::Search { saved, search } => {
+                NodeId::Search { name: saved.as_str().into(), query: search.as_str().into() }
+            }
             PersistedLocation::Archive { archive, inner } => {
                 NodeId::archive(PathBuf::from(archive), inner.as_str())
             }
@@ -732,11 +748,14 @@ impl Workspace {
             show_hidden: tab.view.show_hidden,
             grid: tab.view.view == neutron_ui::file_list::ViewMode::Grid,
             columns: tab.view.view == neutron_ui::file_list::ViewMode::Columns,
+            gallery: tab.view.view == neutron_ui::file_list::ViewMode::Gallery,
             sort: String::new(),
             descending: tab.view.sort.order == neutron_core::SortOrder::Descending,
             group: String::new(),
             all_sizes: false,
             tile_scale: tab.view.tile_scale,
+            hide_sidebar: false,
+            hide_toolbar: false,
         };
         prefs.set_column(tab.view.sort.column);
         prefs.set_group(tab.view.sort.group);
@@ -817,7 +836,9 @@ impl Workspace {
             },
             ..Default::default()
         };
-        let mode = if saved.prefs.columns {
+        let mode = if saved.prefs.gallery {
+            neutron_ui::file_list::ViewMode::Gallery
+        } else if saved.prefs.columns {
             neutron_ui::file_list::ViewMode::Columns
         } else if saved.prefs.grid {
             neutron_ui::file_list::ViewMode::Grid

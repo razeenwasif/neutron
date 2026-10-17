@@ -128,7 +128,23 @@ section lists every file with one, found by Spotlight. **View › Sort By** adds
 Date Added and Date Last Opened (from Spotlight, read only when asked for), and
 **Group By** gathers the list under headings by kind, date or size, as the
 Finder's Use Groups does, in the grid as well as the list; the grid's tile
-size is set by the slider in its footer. **View › Calculate All Sizes** adds up every folder
+size is set by the slider in its footer. **as Gallery** (`⌘4`) shows the current item large
+over a strip of thumbnails; Left and Right step along it. Sizes show under grid
+tiles and beside column rows, folders' too once added up. **View › Hide
+Sidebar** (`⌃⌘S`) and **Hide Toolbar** (`⌥⌘T`) put the chrome away.
+**File › New Smart Folder…** finds files by name — or what is inside them —
+kind, when last changed, tag, and where to look, through Spotlight; named, it
+is kept under **Searches** in the sidebar. Search Everywhere takes the same
+filters typed: `tax kind:pdf date:year tag:Red`. **Get Info** (`⌘I`) is
+Neutron's own window — size (a folder's added up), dates, owner and
+permissions, tags, an alias's original — with the Finder's a click away.
+**Show Original** (`⌘R` on an alias or link) goes to what it stands for, and
+**Put Back** (`⌘⌫` in the Trash) returns items to where they were, from the
+Finder's record or Neutron's (it needs Full Disk Access, which macOS asks for).
+Archives open and extract as `.zip`, `.tar`, `.tar.gz`, `.tar.xz`, `.tar.bz2`,
+`.7z` and `.rar` — the last few through the system's libarchive — and a plain
+`.gz` unpacks beside itself; a `.dmg` mounts and opens its disk. Tabs and the
+folders in the path bar take dropped files as rows do. **View › Calculate All Sizes** adds up every folder
 shown, in the background, newest folder first; **Calculate Size** in a
 folder's menu does it for that one. **Share…** in a file's
 menu (and in File) opens the system's share menu — AirDrop, Mail, Messages and

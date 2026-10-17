@@ -22,3 +22,11 @@ impl Namespace for FsNamespace {
 pub fn last_opened(_path: &std::path::Path) -> i64 {
     0
 }
+
+pub fn original(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    std::fs::read_link(path).map_err(|e| e.to_string())
+}
+
+pub fn added(_path: &std::path::Path) -> i64 {
+    0
+}

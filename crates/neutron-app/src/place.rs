@@ -76,6 +76,10 @@ pub fn pathless(id: &NodeId, sites: &Sites) -> Option<Pathless> {
             name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             later: false,
         }),
+        NodeId::Search { .. } => Some(Pathless {
+            name: format!("the results of {}", id.display_name()),
+            later: false,
+        }),
         // Its files are all over the disk; what needs one folder cannot be
         // done here.
         NodeId::Tag { name } => Some(Pathless {

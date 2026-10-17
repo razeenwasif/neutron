@@ -33,7 +33,7 @@ pub fn text_for(location: &NodeId) -> Option<String> {
         NodeId::Shell { parsing, .. } => Some(parsing.to_string()),
         NodeId::Remote { site, path } => Some(format!("{site}:{path}")),
         NodeId::Archive { .. } => Some(location.to_string()),
-        NodeId::Home | NodeId::Cloud { .. } | NodeId::Tag { .. } | NodeId::Terminal { .. } => None,
+        NodeId::Home | NodeId::Cloud { .. } | NodeId::Tag { .. } | NodeId::Terminal { .. } | NodeId::Search { .. } => None,
         NodeId::Viewer { path } => Some(path.to_string_lossy().into_owned()),
     }
 }

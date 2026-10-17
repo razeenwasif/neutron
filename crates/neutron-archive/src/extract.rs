@@ -41,6 +41,17 @@ pub fn extract(
     on_progress: impl FnMut(Progress) -> Continue,
 ) -> Result<Summary, ArchiveError> {
     let existed = destination.exists();
+    if format == Format::Gz {
+        return crate::external::gunzip(archive, destination).map(|(target, summary)| {
+            stamp_like(archive, &[target]);
+            summary
+        });
+    }
+    if format.is_external() {
+        let summary = crate::external::extract(archive, destination, None, on_progress)?;
+        stamp_like(archive, &[destination.to_path_buf()]);
+        return Ok(summary);
+    }
     fs::create_dir_all(destination)?;
 
     let mut out = Output {
@@ -71,6 +82,20 @@ pub fn extract_selected(
     selected: &[String],
     on_progress: impl FnMut(Progress) -> Continue,
 ) -> Result<Summary, ArchiveError> {
+    if format == Format::Gz {
+        return crate::external::gunzip(archive, destination).map(|(target, summary)| {
+            stamp_like(archive, &[target]);
+            summary
+        });
+    }
+    if format.is_external() {
+        let selected: Vec<String> = selected.iter().map(|s| crate::browse::normalise(s).0).collect();
+        let summary = crate::external::extract(archive, destination, Some(&selected), on_progress)?;
+        let written: Vec<PathBuf> =
+            selected.iter().map(|s| destination.join(s.rsplit('/').next().unwrap_or(s))).collect();
+        stamp_like(archive, &written);
+        return Ok(summary);
+    }
     fs::create_dir_all(destination)?;
     let selected: Vec<String> = selected.iter().map(|s| crate::browse::normalise(s).0).collect();
     let select = move |name: &str| select(&selected, name);
@@ -99,6 +124,22 @@ fn select(selected: &[String], name: &str) -> Option<String> {
     None
 }
 
+/// Passes the archive's provenance mark on to `written`, and everything
+/// under them, for the formats unpacked outside this crate.
+fn stamp_like(archive: &Path, written: &[PathBuf]) {
+    let Some(value) = mark::read(archive) else { return };
+    let mut stack: Vec<PathBuf> = written.to_vec();
+    while let Some(path) = stack.pop() {
+        let is_dir = path.is_dir();
+        mark::write(&path, &value, is_dir);
+        if is_dir {
+            if let Ok(entries) = fs::read_dir(&path) {
+                stack.extend(entries.flatten().map(|e| e.path()));
+            }
+        }
+    }
+}
+
 fn run(
     archive: &Path,
     format: Format,
@@ -113,6 +154,8 @@ fn run(
             out,
             on_progress,
         ),
+        // Taken before `run` is reached; see `extract`.
+        Format::TarXz | Format::TarBz2 | Format::SevenZ | Format::Rar | Format::Gz => Err(ArchiveError::UnknownFormat),
     }
 }
 
