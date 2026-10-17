@@ -2095,7 +2095,10 @@ impl NeutronApp {
                 let notices = self.notice_tx.clone();
                 self.sta.submit(move || {
                     let opened = crate::archives::materialise(&archive, std::slice::from_ref(&entry))
-                        .and_then(|paths| neutron_shell::open::shell_execute(&paths[0], neutron_shell::open::Verb::Open, 0));
+                        .and_then(|paths| match crate::openers::app_for(&paths[0]) {
+                            Some(app) => crate::openers::open_with(&app, &paths[0]),
+                            None => neutron_shell::open::shell_execute(&paths[0], neutron_shell::open::Verb::Open, 0),
+                        });
                     if let Err(e) = opened {
                         report(&notices, format!("{name} could not be opened: {e}"));
                     }
@@ -4248,7 +4251,14 @@ impl NeutronApp {
         let owner = self.hwnd.unwrap_or(0);
         let notices = self.notice_tx.clone();
         self.sta.submit(move || {
-            if let Err(e) = neutron_shell::open::shell_execute(&path, verb, owner) {
+            // An app chosen for this kind of file in `openers.json` wins over
+            // the system's choice.
+            let chosen = matches!(verb, neutron_shell::open::Verb::Open).then(|| crate::openers::app_for(&path)).flatten();
+            let opened = match chosen {
+                Some(app) => crate::openers::open_with(&app, &path),
+                None => neutron_shell::open::shell_execute(&path, verb, owner),
+            };
+            if let Err(e) = opened {
                 report(
                     &notices,
                     format!("Could not open {}: {e}", path.display()),

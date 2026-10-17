@@ -147,7 +147,11 @@ the same way. Both are given Neutron's search as tools — Spotlight name and
 full-text search across the disk, and fuzzy path matching — served by
 `neutron --mcp`. **Open in Viewer** (`⌥⌘O`) opens a PDF, an image, or text and
 code in a tab to read: pages drawn as you scroll, lines numbered and coloured
-for most languages, zoom, find, and copying lines. A `.zip`, `.tar` or `.tar.gz` opens as a
+for most languages, zoom, find, and copying lines. To open a kind of file in an app of
+your choosing rather than the system's, name it in
+`~/Library/Application Support/Neutron/openers.json` —
+`{ "pdf": "/Applications/Quark.app" }` — and the app is started with the file
+as its argument. A `.zip`, `.tar` or `.tar.gz` opens as a
 read-only folder you can browse, preview, Quick Look and copy out of;
 **Extract** in its menu unpacks the whole thing beside itself.
 

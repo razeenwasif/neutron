@@ -42,6 +42,7 @@ mod loader;
 mod menubar;
 mod new_file;
 mod notice;
+mod openers;
 mod preview;
 mod panes;
 mod persist;
