@@ -475,6 +475,9 @@ pub struct NeutronApp {
     tab_drag: Option<TabDrag>,
     /// Last title pushed to the OS, so it is only sent when it changes.
     last_title: String,
+    /// The first window's frame as last seen, saved in eframe's own format;
+    /// see `root_window_settings`.
+    root_frame: Option<String>,
     /// This frame's atlas texture, resolved once before drawing rather than
     /// per row — uploading is `&mut`, and rows are drawn through `&self`.
     icon_texture: Option<egui::TextureId>,
@@ -845,6 +848,7 @@ impl NeutronApp {
             type_ahead_at: None,
             tab_drag: None,
             last_title: String::new(),
+            root_frame: None,
             icon_texture: None,
             ctx: cc.egui_ctx.clone(),
             index,
@@ -4100,6 +4104,13 @@ impl eframe::App for NeutronApp {
             storage.set_string(STORAGE_KEY, json);
         }
 
+        // Written after eframe's own copy, which it makes only while the
+        // window still exists: once it has closed and the application
+        // carries on, a later save would otherwise keep the size from before.
+        if let Some(frame) = &self.root_frame {
+            storage.set_string("window", frame.clone());
+        }
+
         // The other windows, where they are now and at their current size.
         let windows: Vec<SavedWindow> = self
             .windows
@@ -4133,6 +4144,9 @@ impl eframe::App for NeutronApp {
 
         // Once a frame, for every window.
         self.shared_frame(&ctx);
+        if let Some(frame) = root_window_settings(&ctx) {
+            self.root_frame = Some(frame);
+        }
 
         // The first window, then the others, each with its own state.
         self.window_frame(ui);
@@ -4151,6 +4165,33 @@ impl eframe::App for NeutronApp {
 
         self.startup.mark_frame(frame_started.elapsed());
     }
+}
+
+/// The first window's place and size in the form eframe saves them under
+/// "window" and reads back at launch — positions in pixels, the size in
+/// points — or `None` while the window is not there to measure.
+fn root_window_settings(ctx: &egui::Context) -> Option<String> {
+    let (inner, outer, ppp, fullscreen, maximized, minimized) = ctx.input_for(egui::ViewportId::ROOT, |i| {
+        let v = i.viewport();
+        (v.inner_rect, v.outer_rect, v.native_pixels_per_point, v.fullscreen, v.maximized, v.minimized)
+    });
+    let (inner, outer, ppp) = (inner?, outer?, ppp?);
+    // A minimised window reports a size it will not come back at.
+    if minimized == Some(true) || inner.width() < 1.0 {
+        return None;
+    }
+    Some(format!(
+        "(inner_position_pixels:Some((x:{:.1},y:{:.1})),outer_position_pixels:Some((x:{:.1},y:{:.1})),\
+         fullscreen:{},maximized:{},inner_size_points:Some((x:{:.1},y:{:.1})))",
+        inner.min.x * ppp,
+        inner.min.y * ppp,
+        outer.min.x * ppp,
+        outer.min.y * ppp,
+        fullscreen.unwrap_or(false),
+        maximized.unwrap_or(false),
+        inner.width(),
+        inner.height(),
+    ))
 }
 
 /// What belongs to one window: its panes and tabs, and whatever is open in it.
