@@ -497,7 +497,7 @@ fn draw_column(ui: &mut Ui, p: &Palette, column: &Column<'_>) -> Option<ColumnAc
     // The space under the last row. `show_rows` sizes its content to exactly
     // the rows it was given, so this has to be interacted with directly.
     let inner = output.inner_rect;
-    let bottom = inner.top() + rows as f32 * ROW - output.state.offset.y;
+    let bottom = inner.top() + rows as f32 * pitch(ui) - output.state.offset.y;
     if bottom < inner.bottom() {
         let dead = Rect::from_min_max(pos2(inner.left(), bottom.max(inner.top())), inner.max);
         let response = ui.interact(dead, ui.id().with("empty"), Sense::click());
@@ -538,12 +538,20 @@ fn draw_column(ui: &mut Ui, p: &Palette, column: &Column<'_>) -> Option<ColumnAc
 /// for it. And the current column follows the keyboard cursor, moving the
 /// least distance that brings it into view — but only when the requested row
 /// changes, so the user can still scroll away from it with the wheel.
+/// How far apart rows sit: `show_rows` puts the item spacing below each, so
+/// a row takes up more than its own height. Positions worked out from `ROW`
+/// alone fall short by that gap for every row above — far enough, a few rows
+/// down, to put the empty space under the rows over the last rows themselves.
+fn pitch(ui: &Ui) -> f32 {
+    ROW + ui.spacing().item_spacing.y
+}
+
 fn bring_into_view(ui: &Ui, column: &Column<'_>, list: &EntryList) -> Option<f32> {
     let state = ui
         .data(|d| d.get_temp::<egui::Id>(scroll_id_key(ui)))
         .and_then(|id| egui::scroll_area::State::load(ui.ctx(), id));
     let height = ui.available_height();
-    let row_top = |idx: usize| list.rank(idx).map(|row| row as f32 * ROW);
+    let row_top = |idx: usize| list.rank(idx).map(|row| row as f32 * pitch(ui));
     let applied = ui.id().with("applied-scroll");
 
     if state.is_none() {
@@ -1130,5 +1138,36 @@ mod tests {
             icons: None,
         }];
         assert_eq!(run(&columns, click_at(100.0, ROW / 2.0)), None);
+    }
+
+    #[test]
+    fn the_last_row_of_a_short_column_is_a_row_not_empty_space() {
+        let parent = listing(&[("src", EntryKind::Directory)]);
+        let names = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs", "f.rs", "g.rs", "h.rs", "i.rs", "j.rs"];
+        let here = listing(&names.map(|n| (n, EntryKind::File)));
+        let selection = Selection::new();
+        let columns = [
+            Column {
+                dir: Path::new("/project"),
+                contents: Contents::Ready(&parent),
+                role: Role::Named { highlight: Some("src") },
+                cut: None,
+                icons: None,
+            },
+            Column {
+                dir: Path::new("/project/src"),
+                contents: Contents::Ready(&here),
+                role: Role::Current { selection: &selection, rename: None, scroll_to: None },
+                cut: None,
+                icons: None,
+            },
+        ];
+        let gap = egui::Style::default().spacing.item_spacing.y;
+        // The middle of the tenth row, rows apart by their height and a gap.
+        let action = run(&columns, click_at(COLUMN_WIDTH + 100.0, 9.0 * (ROW + gap) + ROW / 2.0));
+        assert_eq!(
+            action,
+            Some(ColumnAction::Current(FileListAction::Select { idx: here.at(9), mode: SelectMode::Replace }))
+        );
     }
 }
