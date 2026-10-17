@@ -88,7 +88,7 @@ pub enum Cmd {
     AirDrop,
     Terminal,
     AskClaude,
-    AskGemini,
+    AskAntigravity,
 
     NextTab,
     PreviousTab,
@@ -108,7 +108,7 @@ impl Cmd {
         Cmd::AddressBar, Cmd::ToggleTheme, Cmd::Back, Cmd::Forward, Cmd::Enclosing,
         Cmd::Dashboard, Cmd::Home, Cmd::Desktop, Cmd::Documents, Cmd::Downloads,
         Cmd::Applications, Cmd::Trash, Cmd::GoToFolder, Cmd::Connect, Cmd::AirDrop,
-        Cmd::Terminal, Cmd::AskClaude, Cmd::AskGemini, Cmd::NextTab, Cmd::PreviousTab, Cmd::NextPane,
+        Cmd::Terminal, Cmd::AskClaude, Cmd::AskAntigravity, Cmd::NextTab, Cmd::PreviousTab, Cmd::NextPane,
     ];
 
     pub fn from_tag(tag: u32) -> Option<Cmd> {
@@ -248,7 +248,7 @@ pub fn menus() -> Vec<Menu> {
         item(Cmd::Terminal, "Open in Terminal", None),
         Separator,
         item(Cmd::AskClaude, "Ask Claude Code", None),
-        item(Cmd::AskGemini, "Ask Gemini", None),
+        item(Cmd::AskAntigravity, "Ask Antigravity", None),
     ];
     let window = vec![
         Entry::System { title: "Minimize".into(), action: c"performMiniaturize:", key: cmd("m") },

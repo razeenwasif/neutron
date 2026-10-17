@@ -139,13 +139,14 @@ copies any file you keep in `~/Library/Application Support/Neutron/Templates`.
 **Open in Terminal** opens a terminal in a tab of the pane, in that folder —
 your login shell, with your prompt and PATH — which can be split, dragged and
 closed like any tab; a running shell is kept when you go to a folder from it.
-**Ask Claude Code** and **Ask Gemini** (in Go, the command palette, and every
+**Ask Claude Code** and **Ask Antigravity** (in Go, the command palette, and every
 right-click menu) open that agent's CLI in such a tab on the folder, signed in
 with your own subscription. Claude Code is told which items were selected,
-and can read and edit files without asking (commands still ask); Gemini edits
-the same way. Both are given Neutron's search as tools — Spotlight name and
+and can read and edit files without asking (commands still ask); Antigravity
+(`agy`, from Antigravity or the Gemini app) starts in accept-edits mode the
+same way. Both are given Neutron's search as tools — Spotlight name and
 full-text search across the disk, and fuzzy path matching — served by
-`neutron --mcp`. **Open in Viewer** (`⌥⌘O`) opens a PDF, an image, or text and
+`neutron --mcp`; for Antigravity it is added to `agy`'s own MCP list. **Open in Viewer** (`⌥⌘O`) opens a PDF, an image, or text and
 code in a tab to read: pages drawn as you scroll, lines numbered and coloured
 for most languages, zoom, find, and copying lines. To open a kind of file in an app of
 your choosing rather than the system's, name it in

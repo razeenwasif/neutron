@@ -3177,7 +3177,7 @@ impl NeutronApp {
             rows.push(MenuItem { label: "New File from Template".into(), enabled: true, children, ..Default::default() });
             rows.push(MenuItem::separator());
             rows.push(row("Ask Claude Code", Action::AskAgent(crate::agent::Agent::Claude), &mut actions));
-            rows.push(row("Ask Gemini", Action::AskAgent(crate::agent::Agent::Gemini), &mut actions));
+            rows.push(row("Ask Antigravity", Action::AskAgent(crate::agent::Agent::Antigravity), &mut actions));
             rows.push(MenuItem::separator());
             let views = [
                 ("List", file_list::ViewMode::List),
@@ -3246,7 +3246,7 @@ impl NeutronApp {
                 rows.push(row("Calculate Size", Action::CalculateSizes(folders), &mut actions));
             }
             rows.push(row("Ask Claude Code", Action::AskAgent(crate::agent::Agent::Claude), &mut actions));
-            rows.push(row("Ask Gemini", Action::AskAgent(crate::agent::Agent::Gemini), &mut actions));
+            rows.push(row("Ask Antigravity", Action::AskAgent(crate::agent::Agent::Antigravity), &mut actions));
             if cfg!(target_os = "macos") {
                 rows.push(row("Share…", Action::Share, &mut actions));
                 rows.push(row("AirDrop…", Action::AirDrop, &mut actions));
@@ -3516,7 +3516,7 @@ impl NeutronApp {
             C::AirDrop => Action::OpenAirDrop,
             C::Terminal => Action::OpenTerminal,
             C::AskClaude => Action::AskAgent(crate::agent::Agent::Claude),
-            C::AskGemini => Action::AskAgent(crate::agent::Agent::Gemini),
+            C::AskAntigravity => Action::AskAgent(crate::agent::Agent::Antigravity),
             C::NextTab => Action::CycleTab(1),
             C::PreviousTab => Action::CycleTab(-1),
             C::NextPane => Action::FocusNextPane,
@@ -3555,7 +3555,7 @@ impl NeutronApp {
                 C::Open | C::OpenInViewer | C::GetInfo | C::Rename | C::Duplicate | C::MakeAlias | C::QuickLook | C::Share | C::Compress
                 | C::MoveToTrash | C::DeleteImmediately | C::Cut | C::Copy => selected.is_empty(),
                 C::Extract => !archive,
-                C::NewFolder | C::NewFile | C::Paste | C::Terminal | C::AskClaude | C::AskGemini => dir.is_none(),
+                C::NewFolder | C::NewFile | C::Paste | C::Terminal | C::AskClaude | C::AskAntigravity => dir.is_none(),
                 C::Back => !tab.is_some_and(|t| t.history.can_go_back()),
                 C::Forward => !tab.is_some_and(|t| t.history.can_go_forward()),
                 C::Eject => !ejectable,
@@ -6309,7 +6309,7 @@ impl NeutronApp {
 
             C::OpenTerminal => Some(Action::OpenTerminal),
             C::AskClaude => Some(Action::AskAgent(crate::agent::Agent::Claude)),
-            C::AskGemini => Some(Action::AskAgent(crate::agent::Agent::Gemini)),
+            C::AskAntigravity => Some(Action::AskAgent(crate::agent::Agent::Antigravity)),
             C::NewWindow => Some(Action::NewWindow),
 
             C::ConnectServer => Some(Action::OpenConnect),

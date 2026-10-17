@@ -1,5 +1,5 @@
-//! The AI agents: Claude Code and the Gemini CLI, run in a terminal tab in
-//! the folder being looked at, with Neutron's search given to them as tools.
+//! The AI agents: Claude Code and Antigravity, run in a terminal tab in the
+//! folder being looked at, with Neutron's search given to them as tools.
 //!
 //! # Why the CLIs, in a terminal
 //!
@@ -14,8 +14,8 @@
 //!
 //! `neutron --mcp` is a Model Context Protocol server on stdin and stdout: one
 //! JSON-RPC message per line. Each CLI is told to start it — Claude Code with
-//! `--mcp-config`, the Gemini CLI through a defaults file of the lowest
-//! priority, so a user's own settings and servers still win.
+//! `--mcp-config`, for that session; Antigravity, which has no such option,
+//! by `agy mcp add` before it starts, which adds or updates the one entry.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -27,14 +27,15 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
     Claude,
-    Gemini,
+    /// Antigravity's CLI, `agy`, signed in with the user's Google plan.
+    Antigravity,
 }
 
 impl Agent {
     pub fn label(self) -> &'static str {
         match self {
             Agent::Claude => "Claude Code",
-            Agent::Gemini => "Gemini",
+            Agent::Antigravity => "Antigravity",
         }
     }
 }
@@ -45,23 +46,26 @@ impl Agent {
 pub fn program(agent: Agent, dir: &Path, selected: &[PathBuf]) -> crate::term::Program {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let me = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "neutron".into());
-    let server = json!({ "command": me, "args": ["--mcp"] });
-    let mut env = Vec::new();
+    let env = Vec::new();
     let mut argv = vec![shell, "-l".into(), "-c".into(), "exec \"$0\" \"$@\"".into()];
     match agent {
         Agent::Claude => {
             argv.push("claude".into());
             // Reads and edits files without asking; commands still ask.
             argv.extend(["--permission-mode".into(), "acceptEdits".into()]);
+            let server = json!({ "command": me, "args": ["--mcp"] });
             argv.extend(["--mcp-config".into(), json!({ "mcpServers": { "neutron": server } }).to_string()]);
             argv.extend(["--append-system-prompt".into(), context(dir, selected)]);
         }
-        Agent::Gemini => {
-            argv.push("gemini".into());
-            argv.extend(["--approval-mode".into(), "auto_edit".into()]);
-            if let Some(defaults) = gemini_defaults(&server) {
-                env.push(("GEMINI_CLI_SYSTEM_DEFAULTS_PATH".into(), defaults.display().to_string()));
-            }
+        Agent::Antigravity => {
+            // Neutron's tools are added to agy's own list first — it has no
+            // option to be given them for one session — then agy runs in
+            // their place. `$1` is Neutron; what follows it is agy's.
+            argv[3] = "\"$0\" mcp add neutron \"$1\" -- --mcp >/dev/null 2>&1; shift; exec \"$0\" \"$@\"".into();
+            argv.push(agy().map_or_else(|| "agy".into(), |p| p.display().to_string()));
+            argv.push(me);
+            // Reads and edits without asking, as Claude Code is started.
+            argv.extend(["--mode".into(), "accept-edits".into()]);
         }
     }
     crate::term::Program { command: Some(argv), env }
@@ -89,17 +93,19 @@ fn context(dir: &Path, selected: &[PathBuf]) -> String {
     text
 }
 
-/// Writes the Gemini CLI's defaults — Neutron's server — to a file of
-/// Neutron's own, and returns where. Only the server: the CLI has no way to be
-/// handed extra instructions that does not replace its own or send a prompt,
-/// so the folder it is in is all it is told of.
-fn gemini_defaults(server: &Value) -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/Neutron");
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join("gemini-defaults.json");
-    let settings = json!({ "mcpServers": { "neutron": server } });
-    std::fs::write(&path, serde_json::to_vec_pretty(&settings).ok()?).ok()?;
-    Some(path)
+/// Where `agy` is: on the PATH Antigravity's installer sets up, or inside the
+/// Gemini app, which carries it. `None` leaves it to the login shell's PATH.
+fn agy() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut places = Vec::new();
+    if let Some(home) = &home {
+        places.push(home.join(".local/bin/agy"));
+    }
+    places.push(PathBuf::from("/Applications/Gemini.app/Contents/Helpers/agy"));
+    if let Some(home) = &home {
+        places.push(home.join("Applications/Gemini.app/Contents/Helpers/agy"));
+    }
+    places.into_iter().find(|p| p.is_file())
 }
 
 // --- the MCP server ----------------------------------------------------------
@@ -309,6 +315,15 @@ mod tests {
         let text = reply["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.lines().next().unwrap().ends_with("src/main.rs"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn antigravity_is_given_neutrons_tools_and_then_runs() {
+        let argv = program(Agent::Antigravity, Path::new("/tmp"), &[]).command.unwrap();
+        assert!(argv[3].starts_with("\"$0\" mcp add neutron \"$1\" -- --mcp"));
+        assert!(argv[3].ends_with("shift; exec \"$0\" \"$@\""));
+        assert!(argv[4].ends_with("agy"));
+        assert_eq!(argv[6..], ["--mode", "accept-edits"]);
     }
 
     #[test]
