@@ -1,0 +1,76 @@
+# Neutron's .github/workflows/ci.yml (the Linux jobs), on Neutrino.
+#
+# What has to be true of every commit. Changes from the GitHub version:
+#   * ubuntu-latest + rust-toolchain  ->  rust:1-slim and rust:1.85-slim
+#     containers on Graviton (arm64 Linux), with clippy added by rustup; slim
+#     images and no debug info, since a container's files live in its VM's RAM
+#   * rust-cache  ->  a Neutrino cache for cargo's registry and target/
+#   * the macOS and Windows jobs are in native.yml
+# The Linux job is still the only one that runs neutron-plugin's
+# integration tests (they're #![cfg(unix)]).
+
+name: CI
+
+on:
+  push: { branches: [master] }
+  pull_request: {}
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_HOME: /workspace/.cargo
+  PATH: /workspace/.cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+jobs:
+  linux:
+    name: Linux (and the plugin tests, which only run here)
+    image: rust:1-slim
+    resources: { cpus: 4, memory: 6G }
+    timeout-minutes: 45
+    cache:
+      - key: linux-${{ hashFiles('Cargo.lock') }}
+        path: [.cargo, target]
+        restore-keys: [linux-]
+    steps:
+      # neutron-archive's tests make 7z files with bsdtar, as on GitHub's runners.
+      - name: Install bsdtar
+        run: apt-get update && apt-get install -y --no-install-recommends libarchive-tools
+      - run: rustup component add clippy
+      # The crates that don't depend on `windows`. neutron-app is absent: it
+      # pulls eframe, and a headless runner has no use for a renderer.
+      - name: Test the crates that do not need Win32
+        run: >
+          cargo test
+          -p neutron-core
+          -p neutron-ui
+          -p neutron-fuzzy
+          -p neutron-archive
+          -p neutron-plugin
+      - name: Clippy
+        run: >
+          cargo clippy
+          -p neutron-core
+          -p neutron-ui
+          -p neutron-fuzzy
+          -p neutron-archive
+          -p neutron-plugin
+          --all-targets -- -D warnings
+
+  # The version in Cargo.toml is a promise: check it still builds on 1.85.
+  msrv:
+    name: Builds on the stated minimum Rust
+    image: rust:1.85-slim
+    resources: { cpus: 4, memory: 4G }
+    timeout-minutes: 30
+    cache:
+      - key: msrv-${{ hashFiles('Cargo.lock') }}
+        path: [.cargo, target]
+        restore-keys: [msrv-]
+    steps:
+      - run: >
+          cargo check
+          -p neutron-core
+          -p neutron-fuzzy

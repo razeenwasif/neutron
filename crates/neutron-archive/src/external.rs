@@ -13,7 +13,12 @@ use std::process::{Command, Stdio};
 
 use crate::{ArchiveError, Continue, Progress, Summary};
 
+/// macOS's tar is bsdtar. On Linux /usr/bin/tar is GNU tar, which can't read
+/// 7-Zip or RAR; libarchive's comes as `bsdtar` (libarchive-tools).
+#[cfg(not(target_os = "linux"))]
 const BSDTAR: &str = "/usr/bin/tar";
+#[cfg(target_os = "linux")]
+const BSDTAR: &str = "bsdtar";
 
 /// Every entry: its path, whether it is a folder, and its size.
 pub fn list(archive: &Path) -> Result<Vec<(String, bool, u64)>, ArchiveError> {

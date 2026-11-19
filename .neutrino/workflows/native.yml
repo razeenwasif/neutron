@@ -1,0 +1,70 @@
+# Neutron's .github/workflows/ci.yml macOS and Windows jobs, on Neutrino.
+#
+# Windows is the shipped target, so this is the job that matters most.
+# Changes from the GitHub version:
+#   * macOS runs on atlas itself (runs-on: host), Windows on forge through
+#     Nexus (runs-on: nexus)
+#   * it runs for version tags and when started by hand, not on every push:
+#     host jobs need the server started with --host-executor (off for now),
+#     and each Nexus job is a ticket waiting for your Accept in Nexus
+#   * upload-artifact  ->  the zipped app is kept as the run's artifact
+#   * atlas needs Rust (with clippy) on its PATH; forge needs Rust and Git for
+#     Windows' bash
+
+name: native
+
+on:
+  push: { tags: ['v*'] }
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  macos:
+    name: macOS
+    runs-on: host
+    timeout-minutes: 60
+    artifacts: [target/release/Neutron-macOS.zip]
+    steps:
+      - name: Test native backends and workspace
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build application bundle
+        run: cargo xtask bundle
+      - name: Verify bundle
+        run: |
+          plutil -lint target/release/Neutron.app/Contents/Info.plist
+          codesign --verify --deep --strict target/release/Neutron.app
+          target/release/Neutron.app/Contents/MacOS/neutron --bench . 1
+      - name: Archive application
+        run: ditto -c -k --sequesterRsrc --keepParent target/release/Neutron.app target/release/Neutron-macOS.zip
+
+  windows:
+    name: Windows (the shipped target)
+    runs-on: nexus
+    nexus: { node: forge }
+    resources: { cpus: 8, memory: 8G }
+    timeout-minutes: 60
+    steps:
+      # aws-lc-rs needs NASM for the MSVC target; the tree must not pull it in.
+      - name: The crypto backend must stay pure Rust
+        shell: bash
+        run: |
+          if cargo tree --invert aws-lc-rs --edges normal >/dev/null 2>&1; then
+            echo "aws-lc-rs is back in the dependency tree. It needs NASM to build for the MSVC target; pin russh to the ring backend instead."
+            exit 1
+          fi
+          echo "aws-lc-rs is absent, as it should be."
+      - name: Build
+        shell: bash
+        run: cargo build --workspace --all-targets
+      # Includes the FTP and SFTP suites, which need only a loopback interface.
+      - name: Test
+        shell: bash
+        run: cargo test --workspace
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --workspace --all-targets -- -D warnings
