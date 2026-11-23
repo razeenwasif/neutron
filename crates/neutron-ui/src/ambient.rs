@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn orbs_stay_anchored_around_the_window() {
-        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for &mode in ThemeMode::ALL {
             for orb in &Palette::for_mode(mode).orbs {
                 assert!((-0.5..=1.5).contains(&orb.x), "{mode:?}: x {} out of range", orb.x);
                 assert!((-0.5..=1.5).contains(&orb.y), "{mode:?}: y {} out of range", orb.y);
@@ -171,7 +171,7 @@ mod tests {
     /// and the cards are the thing being read.
     #[test]
     fn the_washes_stay_faint() {
-        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for &mode in ThemeMode::ALL {
             for orb in &Palette::for_mode(mode).orbs {
                 assert!(
                     orb.colour.a() <= 40,
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn the_orbs_are_actually_different_hues() {
-        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        for &mode in ThemeMode::ALL {
             let orbs = Palette::for_mode(mode).orbs;
             let hue_key = |c: Color32| {
                 let (r, g, b) = (c.r() as i32, c.g() as i32, c.b() as i32);

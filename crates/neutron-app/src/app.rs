@@ -19,7 +19,7 @@ use neutron_core::places::Place;
 use neutron_core::namespace::CloudProviderId;
 use neutron_core::{Axis, EntryList, GroupId, NodeId, SelectMode, SortColumn};
 use neutron_ui::file_list::{self, FileListAction};
-use neutron_ui::theme::{self, GUTTER, Palette, ThemeMode};
+use neutron_ui::theme::{self, Palette, ThemeMode};
 
 use crate::header;
 use crate::commands;
@@ -89,6 +89,7 @@ enum Action {
         double: bool,
     },
     ToggleTheme,
+    SetTheme(ThemeMode),
     /// Narrow the focused tab's listing. Empty clears the filter.
     SetFilter(String),
     /// Put the caret in the focused pane's filter field.
@@ -742,13 +743,18 @@ impl NeutronApp {
     ) -> Self {
         startup.mark_gpu_ready();
 
-        // Read before the first paint, so a light-theme session does not open
-        // dark and flip a frame later.
-        let theme_mode = if saved_prefs(cc).light_theme {
-            ThemeMode::Light
-        } else {
-            ThemeMode::Dark
-        };
+        // Read before the first paint, so a saved theme does not open in the
+        // default palette and flip a frame later.
+        let prefs = saved_prefs(cc);
+        let theme_mode = prefs
+            .theme
+            .as_deref()
+            .and_then(ThemeMode::from_id)
+            .unwrap_or(if prefs.light_theme {
+                ThemeMode::Light
+            } else {
+                ThemeMode::default()
+            });
         theme::apply(&cc.egui_ctx, theme_mode);
         // The date groups — Today, Yesterday — are the user's days.
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
@@ -1978,8 +1984,11 @@ impl NeutronApp {
             }
 
             Action::ToggleTheme => {
-                let next = self.theme_mode.toggled();
+                let next = self.theme_mode.next();
                 self.set_theme(ctx, next);
+            }
+            Action::SetTheme(mode) => {
+                self.set_theme(ctx, mode);
             }
 
             Action::MoveCursor { delta, extend } => {
@@ -3677,6 +3686,12 @@ impl NeutronApp {
             C::SplitDown => Action::Split(Axis::Vertical),
             C::AddressBar | C::GoToFolder => Action::ToggleAddress,
             C::ToggleTheme => Action::ToggleTheme,
+            C::ThemeObsidian => Action::SetTheme(ThemeMode::Obsidian),
+            C::ThemeFlux => Action::SetTheme(ThemeMode::Flux),
+            C::ThemeFairy => Action::SetTheme(ThemeMode::Fairy),
+            C::ThemeAura => Action::SetTheme(ThemeMode::Aura),
+            C::ThemeGruvbox => Action::SetTheme(ThemeMode::Gruvbox),
+            C::ThemeLight => Action::SetTheme(ThemeMode::Light),
             C::Back => Action::Back,
             C::Forward => Action::Forward,
             C::Enclosing => Action::Up,
@@ -3780,6 +3795,14 @@ impl NeutronApp {
         if self.all_sizes {
             checked.insert(C::AllSizes.tag());
         }
+        checked.insert(match self.theme_mode {
+            ThemeMode::Obsidian => C::ThemeObsidian,
+            ThemeMode::Flux => C::ThemeFlux,
+            ThemeMode::Fairy => C::ThemeFairy,
+            ThemeMode::Aura => C::ThemeAura,
+            ThemeMode::Gruvbox => C::ThemeGruvbox,
+            ThemeMode::Light => C::ThemeLight,
+        }.tag());
         neutron_shell::menubar::set_state(disabled, checked);
         // "Undo Move to Trash", as the Finder names it.
         let mut titles = std::collections::HashMap::new();
@@ -4543,6 +4566,7 @@ impl eframe::App for NeutronApp {
         snapshot.preview = self.preview.open;
         // The theme belongs to the window, not to the pane tree, so the
         // workspace cannot fill it in itself.
+        snapshot.prefs.theme = Some(self.theme_mode.id().to_owned());
         snapshot.prefs.light_theme = self.theme_mode == ThemeMode::Light;
         snapshot.prefs.all_sizes = self.all_sizes;
         snapshot.prefs.hide_sidebar = self.hide_sidebar;
@@ -4973,6 +4997,18 @@ impl NeutronApp {
         self.workspace.consume_scroll_requests();
 
         crate::chrome::resize_edges(ui, screen);
+        if cfg!(target_os = "macos") {
+            let fg = ui.painter().clone().with_layer_id(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("neutron-window-border"),
+            ));
+            fg.rect_stroke(
+                screen,
+                egui::CornerRadius::same(theme::RADIUS_WINDOW),
+                egui::Stroke::new(1.0, p.border),
+                egui::StrokeKind::Inside,
+            );
+        }
 
         // Overlays draw after the panes so they sit on top of them, and the
         // overlay's own keys win while it is open.
@@ -6560,6 +6596,12 @@ impl NeutronApp {
             C::ColumnView => Some(Action::SetView(file_list::ViewMode::Columns)),
             C::TogglePreview => Some(Action::TogglePreview),
             C::ToggleTheme => Some(Action::ToggleTheme),
+            C::ThemeObsidian => Some(Action::SetTheme(ThemeMode::Obsidian)),
+            C::ThemeFlux => Some(Action::SetTheme(ThemeMode::Flux)),
+            C::ThemeFairy => Some(Action::SetTheme(ThemeMode::Fairy)),
+            C::ThemeAura => Some(Action::SetTheme(ThemeMode::Aura)),
+            C::ThemeGruvbox => Some(Action::SetTheme(ThemeMode::Gruvbox)),
+            C::ThemeLight => Some(Action::SetTheme(ThemeMode::Light)),
 
             C::FindInFolder => Some(Action::ToggleFinder(crate::finder::Mode::Files)),
             C::SearchEverything => Some(Action::ToggleFinder(crate::finder::Mode::Everything)),
@@ -6730,10 +6772,10 @@ impl NeutronApp {
             .show(ui.ctx(), |ui| {
                 ui.set_max_width(560.0);
                 egui::Frame::new()
-                    .fill(p.raised)
-                    .corner_radius(theme::pill(34.0))
-                    .stroke(egui::Stroke::new(1.0, p.border))
-                    .inner_margin(egui::Margin::symmetric(16, 8))
+                    .fill(p.elevated)
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_WELL))
+                    .stroke(egui::Stroke::new(1.0, p.border_strong))
+                    .inner_margin(egui::Margin::symmetric(14, 7))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 10],
                         blur: 28,
@@ -7868,20 +7910,15 @@ impl NeutronApp {
 
         egui::Panel::right(self.window_id("preview"))
             .show_separator_line(false)
-            .default_size(320.0)
-            .size_range(egui::Rangef::new(220.0, 640.0))
+            .default_size(300.0)
+            .size_range(egui::Rangef::new(220.0, 600.0))
             .frame(
                 theme::bare_card()
-                    .outer_margin(egui::Margin {
-                        left: 0,
-                        right: GUTTER as i8,
-                        top: GUTTER as i8,
-                        bottom: GUTTER as i8,
-                    })
-                    .inner_margin(egui::Margin::symmetric(14, 14)),
+                    .outer_margin(egui::Margin::ZERO)
+                    .inner_margin(egui::Margin::symmetric(12, 12)),
             )
             .show(ui, |ui| {
-                paint_panel_surface(ui, egui::Margin::symmetric(14, 14), p);
+                paint_chrome_panel(ui, egui::Margin::symmetric(12, 12), ChromeEdge::Left, p);
                 ui.set_min_width(ui.available_width());
                 crate::preview::show(ui, p, &self.preview, subject);
             });
@@ -7912,16 +7949,11 @@ impl NeutronApp {
             .exact_size(crate::rail::WIDTH)
             .frame(
                 theme::bare_card()
-                    .outer_margin(egui::Margin {
-                        left: GUTTER as i8,
-                        right: 0,
-                        top: GUTTER as i8,
-                        bottom: GUTTER as i8,
-                    })
-                    .inner_margin(egui::Margin::symmetric(0, 14)),
+                    .outer_margin(egui::Margin::ZERO)
+                    .inner_margin(egui::Margin::symmetric(0, 10)),
             )
             .show(ui, |ui| {
-                paint_panel_surface(ui, egui::Margin::symmetric(0, 14), p);
+                paint_chrome_panel(ui, egui::Margin::symmetric(0, 10), ChromeEdge::Right, p);
                 if let Some(chosen) = crate::rail::show(ui, p, &state) {
                     actions.push(Action::RunCommand(chosen.command()));
                 }
@@ -7944,17 +7976,11 @@ impl NeutronApp {
             .show_separator_line(false)
             .resizable(false)
             .exact_size(crate::chrome::HEIGHT)
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::TRANSPARENT)
-                    .inner_margin(egui::Margin {
-                        left: GUTTER as i8,
-                        right: 0,
-                        top: 0,
-                        bottom: 0,
-                    }),
-            )
-            .show(ui, |ui| crate::chrome::show(ui, p, &title, &self.snap));
+            .frame(egui::Frame::new().outer_margin(egui::Margin::ZERO))
+            .show(ui, |ui| {
+                paint_chrome_panel(ui, egui::Margin::ZERO, ChromeEdge::Bottom, p);
+                crate::chrome::show(ui, p, &title, &self.snap);
+            });
     }
 
     fn sidebar(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
@@ -7962,26 +7988,24 @@ impl NeutronApp {
 
         egui::Panel::left(self.window_id("sidebar"))
             .show_separator_line(false)
-            .default_size(232.0)
-            .size_range(egui::Rangef::new(180.0, 420.0))
+            .default_size(220.0)
+            .size_range(egui::Rangef::new(180.0, 400.0))
             .frame(
-                // A card like the panes, with the gutter carried on its outer
-                // margin so it lines up with them on every edge.
                 theme::bare_card()
-                    .outer_margin(egui::Margin {
-                        left: GUTTER as i8,
-                        right: 0,
-                        top: GUTTER as i8,
-                        bottom: GUTTER as i8,
-                    })
-                    .inner_margin(egui::Margin { left: 12, right: 12, top: 18, bottom: 12 }),
+                    .outer_margin(egui::Margin::ZERO)
+                    .inner_margin(egui::Margin { left: 10, right: 10, top: 12, bottom: 10 }),
             )
             .show(ui, |ui| {
-                paint_panel_surface(ui, egui::Margin { left: 12, right: 12, top: 18, bottom: 12 }, p);
+                paint_chrome_panel(
+                    ui,
+                    egui::Margin { left: 10, right: 10, top: 12, bottom: 10 },
+                    ChromeEdge::Right,
+                    p,
+                );
                 ui.set_min_width(ui.available_width());
 
                 sidebar::brand(ui, p);
-                ui.add_space(14.0);
+                ui.add_space(10.0);
                 if sidebar::find_pill(ui, p) {
                     actions.push(Action::ToggleFinder(Mode::Files));
                 }
@@ -8275,9 +8299,7 @@ impl NeutronApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::TRANSPARENT))
             .show(ui, |ui| {
-                // Half a gutter here plus half on each leaf gives a full
-                // gutter at the window edge and between adjacent cards alike.
-                let rect = ui.available_rect_before_wrap().shrink(GUTTER / 2.0);
+                let rect = ui.available_rect_before_wrap();
                 let mut pane_actions = Vec::new();
                 let mut group_actions = Vec::new();
 
@@ -9585,10 +9607,52 @@ fn pos(x: f32, y: f32) -> egui::Pos2 {
 /// runs first inside it, on the rectangle the frame would have filled, and
 /// everything the panel draws afterwards lands on top. Clipped to the window
 /// rather than to the panel, so the shadow is not cut off at the panel's edge.
-fn paint_panel_surface(ui: &egui::Ui, inner: egui::Margin, p: &Palette) {
+#[derive(Clone, Copy)]
+enum ChromeEdge {
+    Left,
+    Right,
+    Bottom,
+}
+
+fn paint_chrome_panel(ui: &egui::Ui, inner: egui::Margin, edge: ChromeEdge, p: &Palette) {
     let rect = ui.max_rect() + inner;
-    let painter = ui.painter().with_clip_rect(ui.ctx().content_rect());
-    theme::paint_pane(&painter, rect, theme::RADIUS_CARD as f32, p);
+    let screen = ui.ctx().content_rect();
+    let corners = egui::CornerRadius {
+        nw: if rect.left() <= screen.left() + 1.5 && rect.top() <= screen.top() + 1.5 {
+            theme::RADIUS_WINDOW
+        } else {
+            0
+        },
+        ne: if rect.right() >= screen.right() - 1.5 && rect.top() <= screen.top() + 1.5 {
+            theme::RADIUS_WINDOW
+        } else {
+            0
+        },
+        sw: if rect.left() <= screen.left() + 1.5 && rect.bottom() >= screen.bottom() - 1.5 {
+            theme::RADIUS_WINDOW
+        } else {
+            0
+        },
+        se: if rect.right() >= screen.right() - 1.5 && rect.bottom() >= screen.bottom() - 1.5 {
+            theme::RADIUS_WINDOW
+        } else {
+            0
+        },
+    };
+    let painter = ui.painter().with_clip_rect(screen);
+    painter.rect_filled(rect, corners, p.sidebar);
+    let stroke = egui::Stroke::new(1.0, p.border);
+    match edge {
+        ChromeEdge::Left => {
+            painter.vline(rect.left() + 0.5, rect.y_range(), stroke);
+        }
+        ChromeEdge::Right => {
+            painter.vline(rect.right() - 0.5, rect.y_range(), stroke);
+        }
+        ChromeEdge::Bottom => {
+            painter.hline(rect.x_range(), rect.bottom() - 0.5, stroke);
+        }
+    }
 }
 
 
@@ -10208,10 +10272,11 @@ mod screens {
         // The other theme, back where the list was. Flipped back afterwards:
         // the choice is saved, and a test has no business changing it.
         act(&mut harness, Action::Back);
-        act(&mut harness, Action::ToggleTheme);
+        let original_theme = harness.state().theme_mode;
+        act(&mut harness, Action::SetTheme(ThemeMode::Light));
         settle(&mut harness);
         shoot(&mut harness, &out, "light.png");
-        act(&mut harness, Action::ToggleTheme);
+        act(&mut harness, Action::SetTheme(original_theme));
         settle(&mut harness);
     }
 }

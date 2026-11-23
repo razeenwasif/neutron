@@ -48,6 +48,12 @@ pub enum CommandId {
     ColumnView,
     TogglePreview,
     ToggleTheme,
+    ThemeObsidian,
+    ThemeFlux,
+    ThemeFairy,
+    ThemeAura,
+    ThemeGruvbox,
+    ThemeLight,
 
     FindInFolder,
     SearchEverything,
@@ -147,7 +153,13 @@ pub const ALL: &[CommandDef] = &[
         title: "Show the preview pane",
         hint: "Alt+P",
     },
-    CommandDef { id: CommandId::ToggleTheme, title: "Switch light / dark", hint: "Ctrl+D" },
+    CommandDef { id: CommandId::ToggleTheme, title: "Cycle theme", hint: "Ctrl+D" },
+    CommandDef { id: CommandId::ThemeObsidian, title: "Theme: Obsidian", hint: "" },
+    CommandDef { id: CommandId::ThemeFlux, title: "Theme: Flux", hint: "" },
+    CommandDef { id: CommandId::ThemeFairy, title: "Theme: Fairy", hint: "" },
+    CommandDef { id: CommandId::ThemeAura, title: "Theme: Aura Dark", hint: "" },
+    CommandDef { id: CommandId::ThemeGruvbox, title: "Theme: Gruvbox", hint: "" },
+    CommandDef { id: CommandId::ThemeLight, title: "Theme: Light", hint: "" },
 
     CommandDef { id: CommandId::FindInFolder, title: "Find file in this folder", hint: "Ctrl+P" },
     CommandDef {

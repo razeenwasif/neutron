@@ -20,9 +20,9 @@ use neutron_ui::icons::{self, Glyph};
 use neutron_ui::theme::{self, Palette, ThemeMode, micro_caps};
 
 /// Height of a destination row.
-const ROW: f32 = 36.0;
+const ROW: f32 = 28.0;
 /// Room the footer needs: the storage card, a gap, the button row.
-const FOOTER_HEIGHT: f32 = 122.0;
+const FOOTER_HEIGHT: f32 = 110.0;
 
 /// The wordmark: the app's own icon and its name.
 pub fn brand(ui: &mut Ui, p: &Palette) {
@@ -57,8 +57,8 @@ pub fn brand(ui: &mut Ui, p: &Palette) {
 /// A well that opens the finder: the way in to searching, for whoever has
 /// not learned its shortcut yet. Returns whether it was clicked.
 pub fn find_pill(ui: &mut Ui, p: &Palette) -> bool {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
-    let corners = CornerRadius::same(14);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    let corners = CornerRadius::same(theme::RADIUS_WELL);
     theme::paint_well(ui.painter(), rect, corners, p);
     if response.hovered() {
         ui.painter().rect_filled(rect, corners, p.hover);
@@ -95,7 +95,7 @@ pub fn key_cap(ui: &Ui, p: &Palette, right_centre: egui::Pos2, label: &str) {
 
 /// A group label: small spaced capitals in the faint tone.
 pub fn section(ui: &mut Ui, p: &Palette, label: &str) {
-    ui.add_space(14.0);
+    ui.add_space(10.0);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
     ui.painter().text(
         pos2(rect.left() + 10.0, rect.center().y),
@@ -152,7 +152,7 @@ pub fn drive_row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeI
     }
 
     let selected = current == Some(&place.id);
-    let corners = CornerRadius::same(12);
+    let corners = CornerRadius::same(theme::RADIUS_CONTROL);
 
     if selected {
         ui.painter().rect_filled(rect, corners, p.selection);
@@ -285,52 +285,64 @@ pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: Them
     let card = Rect::from_min_size(rect.min, vec2(rect.width(), 76.0));
     storage_card(ui, p, card, drives);
 
-    let buttons = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 34.0), rect.max);
-    let toggle = Rect::from_min_size(pos2(buttons.right() - 34.0, buttons.top()), vec2(34.0, 34.0));
+    let buttons = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 28.0), rect.max);
+    let theme_label = ui.painter().layout_no_wrap(
+        mode.name().to_owned(),
+        egui::FontId::proportional(11.5),
+        p.text_muted,
+    );
+    let toggle_w = (theme_label.size().x + 28.0).clamp(72.0, 108.0);
+    let toggle = Rect::from_min_size(pos2(buttons.right() - toggle_w, buttons.top()), vec2(toggle_w, 28.0));
     let connect = Rect::from_min_max(buttons.min, pos2(toggle.left() - 6.0, buttons.bottom()));
 
+    let btn_corners = CornerRadius::same(theme::RADIUS_CONTROL);
     let response = ui.interact(connect, ui.id().with("sidebar-connect"), Sense::click());
     if response.hovered() {
-        ui.painter().rect_filled(connect, CornerRadius::same(12), p.hover);
+        ui.painter().rect_filled(connect, btn_corners, p.hover);
     }
     let label = ui.painter().layout_no_wrap(
         "Connect".to_owned(),
-        egui::FontId::proportional(12.5),
+        egui::FontId::proportional(12.0),
         if response.hovered() { p.text } else { p.text_muted },
     );
-    let width = 16.0 + 8.0 + label.size().x;
+    let width = 14.0 + 6.0 + label.size().x;
     let left = connect.center().x - width / 2.0;
     icons::draw(
         ui.painter(),
-        pos2(left + 8.0, connect.center().y),
+        pos2(left + 7.0, connect.center().y),
         Glyph::Plus,
         if response.hovered() { p.text } else { p.text_muted },
     );
     ui.painter()
-        .galley(pos2(left + 24.0, connect.center().y - label.size().y / 2.0), label, p.text_muted);
+        .galley(pos2(left + 20.0, connect.center().y - label.size().y / 2.0), label, p.text_muted);
     if response.clicked() {
         action = FooterAction::Connect;
     }
     response.on_hover_text("Connect to a server");
 
     let response = ui.interact(toggle, ui.id().with("theme"), Sense::click());
-    if response.hovered() {
-        ui.painter().rect_filled(toggle, CornerRadius::same(12), p.hover);
-    }
-    let (glyph, tip) = match mode {
-        ThemeMode::Dark => (Glyph::Sun, "Switch to light (Ctrl+D)"),
-        ThemeMode::Light => (Glyph::Moon, "Switch to dark (Ctrl+D)"),
-    };
-    icons::draw(
-        ui.painter(),
-        toggle.center(),
-        glyph,
-        if response.hovered() { p.text } else { p.icon },
+    ui.painter().rect_filled(
+        toggle,
+        btn_corners,
+        if response.hovered() { p.hover } else { p.inset },
+    );
+    ui.painter().rect_stroke(toggle, btn_corners, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+    ui.painter().circle_filled(pos2(toggle.left() + 11.0, toggle.center().y), 3.5, p.accent);
+    let tgalley = ui.painter().layout_no_wrap(
+        mode.name().to_owned(),
+        egui::FontId::proportional(11.5),
+        if response.hovered() { p.text } else { p.text_muted },
+    );
+    ui.painter().galley(
+        pos2(toggle.left() + 19.0, toggle.center().y - tgalley.size().y / 2.0),
+        tgalley,
+        p.text_muted,
     );
     if response.clicked() {
         action = FooterAction::ToggleTheme;
     }
-    response.on_hover_text(neutron_ui::format::shortcut(tip));
+    let tip = format!("Theme: {} — click to switch (Ctrl+D)", mode.name());
+    response.on_hover_text(neutron_ui::format::shortcut(&tip));
 
     action
 }
@@ -343,8 +355,8 @@ pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: Them
 fn storage_card(ui: &Ui, p: &Palette, rect: Rect, drives: &[Place]) {
     let painter = ui.painter();
     let corners = CornerRadius::same(theme::RADIUS_WELL);
-    painter.rect_filled(rect, corners, Color32::from_white_alpha(6));
-    painter.rect_stroke(rect, corners, Stroke::new(1.0, Color32::from_white_alpha(10)), egui::StrokeKind::Inside);
+    painter.rect_filled(rect, corners, p.inset);
+    painter.rect_stroke(rect, corners, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
 
     let Some((name, cap)) = drives.iter().find_map(|d| d.capacity.map(|c| (d.name.as_str(), c))) else {
         painter.text(

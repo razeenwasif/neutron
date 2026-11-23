@@ -38,9 +38,9 @@ use neutron_ui::icons::{self, Glyph};
 use neutron_ui::theme::{self, Palette, RADIUS_CONTROL};
 
 /// Height of the navigation row.
-const NAV_ROW: f32 = 48.0;
+const NAV_ROW: f32 = 40.0;
 /// Height of the large title block, when it is shown.
-const TITLE_ROW: f32 = 44.0;
+const TITLE_ROW: f32 = 36.0;
 /// Below this pane height the title is dropped in favour of more rows.
 const TITLE_MIN_PANE_HEIGHT: f32 = 300.0;
 /// Below this pane width the filter field is dropped; the breadcrumb and the
@@ -124,8 +124,8 @@ pub fn show(
     // U+2190…U+2192 are not in the font egui bundles and render as empty boxes,
     // so "Alt+↑" reached the screen as "Alt+ □".
     // Back, forward and up share a well: one control for moving about.
-    let group_rect = Rect::from_min_size(pos2(nav.left() + 4.0, nav.center().y - 18.0), vec2(102.0, 36.0));
-    theme::paint_well(ui.painter(), group_rect, egui::CornerRadius::same(14), p);
+    let group_rect = Rect::from_min_size(pos2(nav.left() + 6.0, nav.center().y - 15.0), vec2(96.0, 30.0));
+    theme::paint_well(ui.painter(), group_rect, egui::CornerRadius::same(theme::RADIUS_WELL), p);
     let mut x = group_rect.left() + 3.0;
     for (glyph, enabled, act, tip) in [
         (
@@ -147,11 +147,11 @@ pub fn show(
             "Up (Alt+Up, Backspace)",
         ),
     ] {
-        let r = Rect::from_min_size(pos2(x, group_rect.top() + 3.0), vec2(32.0, 30.0));
+        let r = Rect::from_min_size(pos2(x, group_rect.top() + 2.0), vec2(30.0, 26.0));
         if icon_button(ui, p, r, glyph, enabled, false, tip) {
             action = Some(act);
         }
-        x += 32.0;
+        x += 30.0;
     }
     x = group_rect.right() + 4.0;
 
@@ -162,7 +162,7 @@ pub fn show(
         (true, "Split down (Ctrl+Shift+\\)"),
         (false, "Split right (Ctrl+\\)"),
     ] {
-        let r = Rect::from_center_size(pos2(right - 18.0, nav.center().y), vec2(36.0, 36.0));
+        let r = Rect::from_center_size(pos2(right - 15.0, nav.center().y), vec2(30.0, 30.0));
         if split_button(ui, p, r, vertical, tip) {
             action = Some(HeaderAction::Split(if vertical {
                 Axis::Vertical
@@ -170,12 +170,12 @@ pub fn show(
                 Axis::Horizontal
             }));
         }
-        right -= 38.0;
+        right -= 32.0;
     }
     right -= 2.0;
 
     if !dashboard {
-        let eye = Rect::from_center_size(pos2(right - 18.0, nav.center().y), vec2(36.0, 36.0));
+        let eye = Rect::from_center_size(pos2(right - 15.0, nav.center().y), vec2(30.0, 30.0));
         if icon_button(
             ui,
             p,
@@ -191,26 +191,26 @@ pub fn show(
         ) {
             action = Some(HeaderAction::ToggleHidden);
         }
-        right -= 44.0;
+        right -= 36.0;
 
         // The views, as a segmented control: a pill-shaped well with the chosen
         // view raised out of it. Three states no longer fit one toggle, and a
         // button showing "the next view" makes the user cycle through one they do
         // not want. Laid out from the right, so listed in reverse.
-        let segments = Rect::from_min_size(pos2(right - 153.0, nav.center().y - 18.0), vec2(153.0, 36.0));
-        theme::paint_well(ui.painter(), segments, theme::pill(36.0), p);
-        let mut seg_x = segments.right() - 3.0 - 36.0;
+        let segments = Rect::from_min_size(pos2(right - 134.0, nav.center().y - 15.0), vec2(134.0, 30.0));
+        theme::paint_well(ui.painter(), segments, egui::CornerRadius::same(theme::RADIUS_WELL), p);
+        let mut seg_x = segments.right() - 2.0 - 32.0;
         for (mode, glyph, tip) in [
             (ViewMode::Gallery, Glyph::Image, "Gallery view (⌘4)"),
             (ViewMode::Columns, Glyph::Columns, if cfg!(target_os = "macos") { "Column view (⌘3)" } else { "Column view (Ctrl+Shift+L cycles views)" }),
             (ViewMode::Grid, Glyph::Grid, if cfg!(target_os = "macos") { "Grid view (⌘1)" } else { "Grid view (Ctrl+Shift+L cycles views)" }),
             (ViewMode::List, Glyph::List, if cfg!(target_os = "macos") { "List view (⌘2)" } else { "List view (Ctrl+Shift+L cycles views)" }),
         ] {
-            let r = Rect::from_min_size(pos2(seg_x, segments.top() + 3.0), vec2(36.0, 30.0));
+            let r = Rect::from_min_size(pos2(seg_x, segments.top() + 2.0), vec2(32.0, 26.0));
             if segment(ui, p, r, glyph, h.view == mode, tip) && h.view != mode {
                 action = Some(HeaderAction::SetView(mode));
             }
-            seg_x -= 36.0;
+            seg_x -= 32.0;
         }
         right = segments.left() - 10.0;
     }
@@ -220,8 +220,8 @@ pub fn show(
         // trail says where you are, and a filter is still usable at half size.
         let width = FILTER_WIDTH.min(((right - x) * 0.4).max(FILTER_MIN));
         let field = Rect::from_min_max(
-            pos2(right - width, nav.center().y - 18.0),
-            pos2(right, nav.center().y + 18.0),
+            pos2(right - width, nav.center().y - 15.0),
+            pos2(right, nav.center().y + 15.0),
         );
         if let Some(text) = filter_field(ui, p, group, field, h.filter) {
             action = Some(HeaderAction::SetFilter(text));
@@ -247,14 +247,18 @@ pub fn show(
     }
 
     // --- large title ---
-    if show_title {
+    let bottom = if show_title {
         let row = Rect::from_min_size(
             pos2(full.left(), nav.bottom()),
             vec2(full.width(), TITLE_ROW),
         );
         ui.advance_cursor_after_rect(row);
         draw_title(ui, p, row, h);
-    }
+        row.bottom()
+    } else {
+        nav.bottom()
+    };
+    ui.painter().hline(full.x_range(), bottom - 0.5, egui::Stroke::new(1.0, p.border));
 
     action
 }
@@ -269,7 +273,7 @@ fn draw_title(ui: &Ui, p: &Palette, row: Rect, h: &Header<'_>) {
     let title = h.location.display_name();
     let painter = ui.painter();
 
-    let galley = painter.layout_no_wrap(title, theme::strong(ui.ctx(), 22.0), p.text);
+    let galley = painter.layout_no_wrap(title, theme::strong(ui.ctx(), 19.0), p.text);
     let baseline = pos2(row.left() + 12.0, row.center().y - galley.size().y / 2.0);
     let width = galley.size().x;
     painter.galley(baseline, galley, p.text);
@@ -307,7 +311,7 @@ fn icon_button(
         if enabled { Sense::click() } else { Sense::hover() },
     );
 
-    let corners = egui::CornerRadius::same(11);
+    let corners = egui::CornerRadius::same(RADIUS_CONTROL);
     if active {
         ui.painter().rect_filled(rect, corners, p.selection);
     } else if enabled && response.hovered() {
@@ -336,10 +340,11 @@ fn icon_button(
 /// One segment of the view switcher: raised out of the well when chosen.
 fn segment(ui: &mut Ui, p: &Palette, rect: Rect, glyph: Glyph, chosen: bool, tip: &str) -> bool {
     let response = ui.interact(rect, ui.id().with(("segment", glyph as u8)), Sense::click());
+    let corners = egui::CornerRadius::same(RADIUS_CONTROL);
     if chosen {
-        theme::paint_raised(ui.painter(), rect, theme::pill(rect.height()), p);
+        theme::paint_raised(ui.painter(), rect, corners, p);
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, theme::pill(rect.height()), p.hover);
+        ui.painter().rect_filled(rect, corners, p.hover);
     }
     let colour = if chosen {
         p.accent
@@ -360,7 +365,7 @@ fn split_button(ui: &mut Ui, p: &Palette, rect: Rect, vertical: bool, tip: &str)
         Sense::click(),
     );
     if response.hovered() {
-        ui.painter().rect_filled(rect, egui::CornerRadius::same(11), p.hover);
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(RADIUS_CONTROL), p.hover);
     }
     let colour = if response.hovered() {
         p.text
@@ -461,9 +466,9 @@ fn filter_field(
     let has_focus = ui.memory(|m| m.has_focus(id));
 
     // A pill-shaped well; focused, a soft ring of the accent around it.
-    let corners = theme::pill(rect.height());
+    let corners = egui::CornerRadius::same(theme::RADIUS_WELL);
     if has_focus {
-        ui.painter().rect_filled(rect.expand(4.0), theme::pill(rect.height() + 8.0), theme::with_alpha(p.accent, 20));
+        ui.painter().rect_filled(rect.expand(2.0), egui::CornerRadius::same(theme::RADIUS_WELL + 2), theme::with_alpha(p.accent, 20));
     }
     theme::paint_well(ui.painter(), rect, corners, p);
     if has_focus {

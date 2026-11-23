@@ -467,8 +467,10 @@ pub struct PersistedWorkspace {
 /// applied to every tab when it is restored.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedPrefs {
-    /// `true` for light. Named for the value rather than the enum so the JSON
-    /// stays readable to a human editing it.
+    /// Theme id (`obsidian`, `flux`, `fairy`, `aura`, `gruvbox`, `light`).
+    #[serde(default)]
+    pub theme: Option<String>,
+    /// Legacy light flag, kept so older sessions still load cleanly.
     #[serde(default)]
     pub light_theme: bool,
     #[serde(default)]
@@ -744,6 +746,7 @@ impl Workspace {
             return PersistedPrefs::default();
         };
         let mut prefs = PersistedPrefs {
+            theme: None,
             light_theme: false,
             show_hidden: tab.view.show_hidden,
             grid: tab.view.view == neutron_ui::file_list::ViewMode::Grid,

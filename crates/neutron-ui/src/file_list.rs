@@ -995,7 +995,7 @@ fn header(
     action
 }
 
-const RADIUS_SMALL_F: f32 = 8.0;
+const RADIUS_SMALL_F: f32 = 6.0;
 
 /// The part of `viewport` below the last row, or `None` when the content fills
 /// it.

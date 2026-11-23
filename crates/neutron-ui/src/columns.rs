@@ -52,9 +52,9 @@ const GRIP_INSET: f32 = 4.0;
 const FIT_SAMPLE: usize = 5_000;
 /// Row height. Tighter than the list's, because a column carries no metadata
 /// and a path five folders deep has to fit on one screen.
-const ROW: f32 = 34.0;
+const ROW: f32 = 28.0;
 /// Inset of the row highlight from the column edges.
-const PAD: f32 = 6.0;
+const PAD: f32 = 4.0;
 const ICON_SLOT: f32 = 26.0;
 const ICON_DRAW: f32 = 18.0;
 /// Room kept at the right of a row for the chevron that marks a folder.
@@ -142,13 +142,8 @@ pub fn show(ui: &mut Ui, p: &Palette, columns: &[Column<'_>], info: Option<&Info
     let widths = widths_of(ui.ctx(), columns);
     let total: f32 = widths.iter().sum();
 
-    // The columns sit in a panel pressed into the pane: a well, so the
-    // dividers between them are shifts of tone inside it rather than lines
-    // across the pane.
-    let corners = egui::CornerRadius::same(crate::theme::RADIUS_PANEL);
-    crate::theme::paint_well(ui.painter(), viewport, corners, p);
-    let viewport_clip = viewport.shrink(1.0);
-    ui.set_clip_rect(ui.clip_rect().intersect(viewport_clip));
+    ui.painter().rect_filled(viewport, 0.0, p.card);
+    ui.set_clip_rect(ui.clip_rect().intersect(viewport));
 
     // The deepest column is the one being worked in, so it is brought into
     // view whenever the set of columns changes. Not every frame: the user may
@@ -372,7 +367,7 @@ fn grip(ui: &mut Ui, p: &Palette, column: &Column<'_>, rect: Rect, index: usize,
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
     }
 
-    let colour = if active { p.accent } else { Color32::from_white_alpha(11) };
+    let colour = if active { p.accent } else { p.border };
     ui.painter().vline(
         rect.right() - 0.5,
         rect.y_range(),
@@ -704,7 +699,7 @@ fn draw_entry(
     // The current column's selection looks like the list's: the accent wash
     // and a faint ring of it. A chosen row elsewhere — the way here — is a
     // neutral lift instead, because only one column is the one keys act on.
-    let corners = egui::CornerRadius::same(11);
+    let corners = egui::CornerRadius::same(crate::theme::RADIUS_CONTROL);
     if selected {
         ui.painter().rect_filled(rect, corners, p.selection);
         ui.painter().rect_stroke(

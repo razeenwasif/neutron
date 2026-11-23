@@ -19,7 +19,7 @@
 
 use egui::{Rect, Sense, Ui, UiBuilder, pos2, vec2};
 use neutron_core::layout::{Axis, GroupId, Layout, MIN_RATIO};
-use neutron_ui::theme::{self, GUTTER, Palette, RADIUS_CARD, RADIUS_CONTROL};
+use neutron_ui::theme::{self, GUTTER, Palette, RADIUS_CONTROL};
 
 /// Something the user did to the pane structure itself.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,7 +43,7 @@ pub fn show(
     match layout {
         Layout::Leaf(id) => {
             let is_focused = *id == focused;
-            let card = rect.shrink(GUTTER / 2.0);
+            let card = rect;
             if card.width() <= 1.0 || card.height() <= 1.0 {
                 return;
             }
@@ -94,13 +94,25 @@ pub fn show(
     }
 }
 
-/// Paints a pane card: shadow, translucent fill, glass highlight, and hairline.
+/// Paints a pane surface flush within the unified window, rounding only
+/// outer bottom window corners when exposed.
 fn draw_card(ui: &Ui, rect: Rect, p: &Palette, _focused: bool) {
-    // The same surface in both states. Focus with several panes open is
-    // carried by the active tab, which is small and unambiguous; a ring
-    // around the largest thing on screen read as a selection box.
-    let painter = ui.painter().with_clip_rect(ui.ctx().content_rect());
-    theme::paint_pane(&painter, rect, RADIUS_CARD as f32, p);
+    let screen = ui.ctx().content_rect();
+    let corners = egui::CornerRadius {
+        nw: 0,
+        ne: 0,
+        sw: if rect.left() <= screen.left() + 1.5 && rect.bottom() >= screen.bottom() - 1.5 {
+            theme::RADIUS_WINDOW
+        } else {
+            0
+        },
+        se: if rect.right() >= screen.right() - 1.5 && rect.bottom() >= screen.bottom() - 1.5 {
+            theme::RADIUS_WINDOW
+        } else {
+            0
+        },
+    };
+    ui.painter().rect_filled(rect, corners, p.card);
 }
 
 /// Splits `rect` into two child rects with the gutter between them.
@@ -150,24 +162,24 @@ fn divider(
     // is dragged, and egui keeps a drag attached to the id it began on, so an
     // id built from the position lost the drag after a single frame.
     let id = ui.id().with(("divider", split.0));
-    let response = ui.interact(rect, id, Sense::drag());
+    let hit = match axis {
+        Axis::Horizontal => rect.expand2(vec2(3.0, 0.0)),
+        Axis::Vertical => rect.expand2(vec2(0.0, 3.0)),
+    };
+    let response = ui.interact(hit, id, Sense::drag());
     let active = response.hovered() || response.dragged();
 
-    if active {
-        // A short pill centred in the gutter, not a full-length line: it reads
-        // as a grip rather than as a border between two regions.
-        let pill = match axis {
-            Axis::Horizontal => {
-                let h = (parent.height() * 0.12).clamp(18.0, 48.0);
-                Rect::from_center_size(rect.center(), vec2(3.0, h))
-            }
-            Axis::Vertical => {
-                let w = (parent.width() * 0.12).clamp(18.0, 48.0);
-                Rect::from_center_size(rect.center(), vec2(w, 3.0))
-            }
-        };
-        ui.painter().rect_filled(pill, 1.5, p.accent);
+    let stroke = if active {
+        egui::Stroke::new(2.0, p.accent)
+    } else {
+        egui::Stroke::new(1.0, p.border)
+    };
+    match axis {
+        Axis::Horizontal => { ui.painter().vline(rect.center().x, rect.y_range(), stroke); }
+        Axis::Vertical => { ui.painter().hline(rect.x_range(), rect.center().y, stroke); }
+    }
 
+    if active {
         ui.ctx().set_cursor_icon(match axis {
             Axis::Horizontal => egui::CursorIcon::ResizeHorizontal,
             Axis::Vertical => egui::CursorIcon::ResizeVertical,
@@ -196,7 +208,7 @@ fn divider(
 }
 
 /// Height of a tab strip, in points.
-pub const TAB_STRIP_HEIGHT: f32 = 44.0;
+pub const TAB_STRIP_HEIGHT: f32 = 36.0;
 
 /// Whether more than one pane is open. Only then does the active tab need to
 /// say which pane has focus. Recorded by the app each frame with
@@ -407,7 +419,7 @@ pub fn tab_strip(
         let width = widths[i];
 
         let tab_rect =
-            Rect::from_min_size(pos2(x, rect.top() + 6.0), vec2(width, rect.height() - 12.0));
+            Rect::from_min_size(pos2(x, rect.top() + 5.0), vec2(width, rect.height() - 10.0));
         drawn.push((i, tab_rect));
 
         let response = ui.interact(
@@ -415,35 +427,27 @@ pub fn tab_strip(
             ui.id().with(("tab", group_id.0, i)),
             Sense::click_and_drag(),
         );
-        // A tab on a folder takes files dropped on it, and shows itself when
-        // a drag is held there.
         if let Some(Some(folder)) = folders.get(i) {
-            neutron_ui::drop::offer_tab(ui, tab_rect, folder, tab_rect.height() / 2.0, group_id.0, i);
+            neutron_ui::drop::offer_tab(ui, tab_rect, folder, RADIUS_CONTROL as f32, group_id.0, i);
         }
         let dragging_this = drag == Some(TabDrag { group: group_id, index: i });
 
-        // Tabs are pills; the active one is raised out of the strip. With
-        // several panes open, a small accent dot marks the focused pane's
-        // active tab, so two panes cannot both look current.
-        let pill = theme::pill(tab_rect.height());
+        let corners = egui::CornerRadius::same(RADIUS_CONTROL);
         if is_active {
-            theme::paint_raised(ui.painter(), tab_rect, pill, p);
+            theme::paint_raised(ui.painter(), tab_rect, corners, p);
             if focused && multi_pane(ui) {
                 ui.painter().circle_filled(
-                    pos2(tab_rect.left() + 10.0, tab_rect.center().y),
+                    pos2(tab_rect.left() + 9.0, tab_rect.center().y),
                     2.5,
                     p.accent,
                 );
             }
         } else if response.hovered() {
-            ui.painter().rect_filled(tab_rect, pill, p.hover);
+            ui.painter().rect_filled(tab_rect, corners, p.hover);
         }
 
         if dragging_this {
-            // Ghost the source tab rather than removing it: reflowing the strip
-            // mid-drag moves every other tab out from under the cursor.
-            ui.painter()
-                .rect_filled(tab_rect, theme::pill(tab_rect.height()), p.hover);
+            ui.painter().rect_filled(tab_rect, corners, p.hover);
         }
 
         let (text_colour, text_font) = if is_active {
@@ -534,8 +538,9 @@ pub fn tab_strip(
     );
     let plus = ui.interact(plus_rect, ui.id().with(("newtab", group_id.0)), Sense::click());
     if plus.hovered() {
-        ui.painter().circle_filled(plus_rect.center(), 16.0, p.hover);
+        ui.painter().rect_filled(plus_rect, egui::CornerRadius::same(RADIUS_CONTROL), p.hover);
     }
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, p.border));
     let c = plus_rect.center();
     let stroke = egui::Stroke::new(
         1.3,

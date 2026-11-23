@@ -24,10 +24,10 @@ use neutron_ui::icons::{self, Glyph};
 use neutron_ui::theme::{self, Palette};
 
 /// Width of the strip, including its padding.
-pub const WIDTH: f32 = 76.0;
+pub const WIDTH: f32 = 64.0;
 
 /// Height of one button: glyph, then its label, with room to breathe.
-const ITEM: f32 = 68.0;
+const ITEM: f32 = 58.0;
 
 /// Space between buttons within a group.
 const SPACING: f32 = 2.0;
@@ -226,10 +226,10 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
                 // lifts and its glyph takes the accent; an unavailable verb's
                 // well all but disappears and its glyph and label go faint.
                 let well = egui::Rect::from_center_size(
-                    pos2(rect.center().x, rect.top() + 6.0 + 20.0),
-                    vec2(40.0, 40.0),
+                    pos2(rect.center().x, rect.top() + 4.0 + 18.0),
+                    vec2(36.0, 36.0),
                 );
-                let corners = egui::CornerRadius::same(14);
+                let corners = egui::CornerRadius::same(theme::RADIUS_CONTROL);
                 let hovered = enabled && response.hovered();
                 if hovered {
                     theme::paint_raised(ui.painter(), well, corners, p);
@@ -237,7 +237,7 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
                     ui.painter().rect_filled(
                         well,
                         corners,
-                        egui::Color32::from_white_alpha(if enabled { 10 } else { 5 }),
+                        if enabled { p.inset } else { theme::with_alpha(p.inset, 120) },
                     );
                 }
 
