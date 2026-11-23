@@ -1,12 +1,12 @@
 # Saved servers: FTP, FTPS and SFTP
 
 Neutron browses remote servers as ordinary panes. A server appears in the
-sidebar under **Servers**, opens like a folder, and its files sort, filter and
-preview the way local ones do.
+sidebar under **Servers**, opens like a folder, and its files sort, filter, and
+browse in list, grid, and column views the way local ones do.
 
 ## Adding one
 
-**Connect to a server** in the command palette (`Ctrl+Shift+P`), or **Add a
+**Connect to a server** (`⌘K` on macOS, or via the command palette), or **Add a
 server…** at the bottom of the Servers section.
 
 | | |
@@ -15,8 +15,9 @@ server…** at the bottom of the Servers section.
 | **FTPS** | FTP over TLS (`AUTH TLS`). Encrypted. |
 | **FTP** | Plain FTP. **The password crosses the network in the clear.** Offered because a great many appliances speak nothing else. |
 
-Everything except the password is written to `%APPDATA%\Neutron\sites.json`,
-which you can also edit by hand:
+Everything except the password is written to `sites.json`
+(`~/Library/Application Support/Neutron/sites.json` on macOS, or
+`%APPDATA%\Neutron\sites.json` on Windows), which you can also edit by hand:
 
 ```json
 {
@@ -28,7 +29,8 @@ which you can also edit by hand:
       "host": "nas.local",
       "port": 22,
       "username": "razeen",
-      "path": "/volume1/media"
+      "path": "/volume1/media",
+      "auth": { "method": "key", "path": "~/.ssh/id_ed25519" }
     }
   ]
 }
@@ -36,32 +38,30 @@ which you can also edit by hand:
 
 | Field | | |
 |---|---|---|
-| `id` | required | Lowercase slug, unique. Names the stored password and identifies the site in a saved session, so changing it orphans both — rename the `label` instead. |
+| `id` | required | Lowercase slug, unique. Names the stored credential and identifies the site in a saved session, so changing it orphans both — rename the `label` instead. |
 | `label` | optional | What the sidebar shows. Defaults to the host. |
 | `protocol` | required | `"ftp"`, `"ftps"` or `"sftp"`. |
 | `host` | required | Name or address. |
 | `port` | optional | Defaults to 21 for FTP and FTPS, 22 for SFTP. |
 | `username` | optional | Empty means anonymous, for FTP and FTPS. SFTP requires one — SSH has no anonymous mode. |
 | `path` | optional | Where browsing starts. Defaults to `/`. |
+| `auth` | optional (SFTP) | Omit for password auth, `{ "method": "key", "path": "..." }` for a private key file (with any passphrase in the credential store), or `{ "method": "agent" }` for the running SSH agent (`SSH_AUTH_SOCK`). |
 | `fingerprint` | written by Neutron | The server's SSH host key. See below. |
+| `trusted_cert` | optional (FTPS) | SHA-256 fingerprint of a self-signed FTPS certificate you have chosen to trust. |
 
 **Reload saved servers** in the palette re-reads the file and drops every open
 connection, so an edit takes effect without a restart.
 
-## Passwords
+## Passwords and key passphrases
 
-Passwords are **not** in `sites.json`. They go into Windows Credential Manager
-under `Neutron/Site/<id>`, where they are encrypted under your login rather than
-sitting in a file that ends up in a backup. You can see and remove them in
-Credential Manager like any other stored credential.
+Secrets are **not** stored in `sites.json`. They go into the system credential
+store (macOS Keychain / Windows Credential Manager) under `Neutron/Site/<id>`,
+where they are protected under your login rather than sitting in a config file
+that ends up in backups.
 
-This is not a strong boundary — anything running as you can read one back, which
-is exactly what Neutron does — but it is what every other desktop client gets,
-and it beats plaintext.
-
-A site with no saved password is **not** dialled with an empty one. Some servers
-count that as a failed login attempt, and a file manager should not spend your
-lockout budget guessing.
+A password site with no saved password is **not** dialled with an empty one.
+Some servers count that as a failed login attempt, and a file manager should
+not spend your lockout budget guessing.
 
 ## SSH host keys
 
@@ -83,24 +83,27 @@ Neutron does what OpenSSH does:
 
 ## What works
 
-Browsing, sorting, filtering, and opening files. Opening a file downloads it to
-`%TEMP%\Neutron\<site>\` and hands the copy to whatever normally opens that file
-type — the status bar says **opened a local copy**, because editing it does not
-write back.
+- **Browsing:** List, grid, and column views, sorting, and filtering.
+- **Opening and editing files:** Opening a file downloads it to the temp cache
+  under `Neutron/<site>/` and opens it in its associated app. While Neutron is
+  running, saving changes to that opened file automatically uploads the updated
+  file back to the server and refreshes the folder listing.
+- **Creating, renaming, and deleting:** **New Folder** (`⇧⌘N`), **New File**
+  (`⌥⌘N`), inline **Rename** (`↩`), and permanent **Delete** (`⌘⌫`, after
+  confirmation — recursive folder deletes never follow symbolic links).
+- **Uploading:** Paste (`⌘V`) or drag-and-drop local files and folders into a
+  server pane. Existing names at the destination are refused up front so
+  uploads never overwrite files unexpectedly, and failed or stopped uploads
+  remove partial files.
 
-Downloads show a running byte count and a **Stop** in the status bar. Stopping
-removes the partial file: unlike an interrupted extraction, this one is about to
-be handed to an application, and half a PDF is a crash report rather than a
-document.
+Downloads and uploads show a running byte count and a **Stop** button in the
+status bar. Stopping removes any partial file.
 
-## What does not work yet
+## Limitations
 
-**Uploading, renaming, deleting and creating folders on the server.** Nothing
-here writes to a server. Drag-and-drop into a remote pane does nothing, and the
-usual keys report that they cannot.
-
-There is also no background sync, no resumable transfer, and no key-based SSH
-authentication — passwords only.
+There is no offline sync queue, no resumable transfer, and no server-side search
+or Finder Quick Look on remote items. Writing to a server executes directly over
+the connection (there is no remote Trash).
 
 ## A note on names
 
@@ -113,8 +116,8 @@ the folder still opens.
 
 ## Diagnosing a connection
 
-```powershell
-$env:RUST_LOG = "neutron_remote=debug,neutron_app=debug"; neutron.exe
+```sh
+RUST_LOG=neutron_remote=debug,neutron_app=debug neutron
 ```
 
 The FTP client logs whether the server offered `MLSD` — the machine-readable

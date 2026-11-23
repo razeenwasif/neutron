@@ -21,6 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
 use neutron_core::{EntryList, Namespace, NodeId, SortSpec, sort};
@@ -50,24 +51,26 @@ pub enum Slot {
 
 /// A folder the app wants listed, with the settings it is to be listed with.
 pub struct Want {
-    pub dir: PathBuf,
+    pub dir: NodeId,
     pub sort: SortSpec,
     pub show_hidden: bool,
 }
 
-type Request = (PathBuf, SortSpec, bool);
-type Reply = (PathBuf, SortSpec, bool, Result<EntryList, String>);
+type Request = (NodeId, SortSpec, bool);
+type Reply = (NodeId, SortSpec, bool, Result<EntryList, String>);
 
 pub struct ColumnCache {
     requests: Sender<Request>,
     replies: Receiver<Reply>,
-    slots: HashMap<PathBuf, Slot>,
+    slots: HashMap<NodeId, Slot>,
     /// What is wanted right now, shared so the worker can skip what is not.
-    wanted: Arc<Mutex<HashSet<PathBuf>>>,
+    wanted: Arc<Mutex<HashSet<NodeId>>>,
     /// Folders whose listings arrived since `take_arrived` last asked.
-    arrived: Vec<PathBuf>,
+    arrived: Vec<NodeId>,
     /// The folder sizes' version the listings were last given sizes from.
     sizes_seen: u64,
+    /// Bumped when `sites.json` is reloaded so the worker drops stale connections.
+    sites_version: Arc<AtomicU64>,
 }
 
 impl ColumnCache {
@@ -76,10 +79,12 @@ impl ColumnCache {
         let (done, replies) = crossbeam_channel::unbounded::<Reply>();
         let wanted = Arc::new(Mutex::new(HashSet::new()));
 
+        let sites_version = Arc::new(AtomicU64::new(0));
         let worker_wanted = Arc::clone(&wanted);
+        let worker_sites = Arc::clone(&sites_version);
         std::thread::Builder::new()
             .name("neutron-columns".into())
-            .spawn(move || worker(jobs, done, worker_wanted, ctx))
+            .spawn(move || worker(jobs, done, worker_wanted, worker_sites, ctx))
             .expect("failed to spawn the column loader thread");
 
         Self {
@@ -89,15 +94,16 @@ impl ColumnCache {
             wanted,
             arrived: Vec::new(),
             sizes_seen: 0,
+            sites_version,
         }
     }
 
-    /// Every folder in every listing held.
+    /// Every local folder in every listing held.
     pub fn folders(&self) -> Vec<PathBuf> {
         self.slots
             .iter()
-            .filter_map(|(dir, slot)| match slot {
-                Slot::Ready { list, .. } => Some(
+            .filter_map(|(dir, slot)| match (dir.as_path(), slot) {
+                (Some(dir), Slot::Ready { list, .. }) => Some(
                     (0..list.len()).filter(|&i| list.kind(i).is_container()).map(|i| dir.join(list.name(i))).collect::<Vec<_>>(),
                 ),
                 _ => None,
@@ -107,18 +113,19 @@ impl ColumnCache {
     }
 
     /// The folders whose listings arrived since this was last asked.
-    pub fn take_arrived(&mut self) -> Vec<PathBuf> {
+    pub fn take_arrived(&mut self) -> Vec<NodeId> {
         std::mem::take(&mut self.arrived)
     }
 
-    /// Gives the folders in every listing the sizes found for them, when
-    /// there are new ones — or new listings to give them to.
+    /// Gives the folders in every local listing the sizes found for them,
+    /// when there are new ones — or new listings to give them to.
     pub fn apply_sizes(&mut self, version: u64, fresh: bool, size_of: impl Fn(&Path) -> Option<u64>) {
         if version == self.sizes_seen && !fresh {
             return;
         }
         self.sizes_seen = version;
         for (dir, slot) in &mut self.slots {
+            let Some(dir) = dir.as_path() else { continue };
             let Slot::Ready { list, .. } = slot else { continue };
             for i in 0..list.len() {
                 if list.kind(i).is_container() {
@@ -157,7 +164,7 @@ impl ColumnCache {
     /// Asks for any that are not loaded, forgets any that are no longer shown,
     /// and re-sorts any whose settings changed since they were read.
     pub fn want(&mut self, wanted: &[Want]) {
-        let paths: HashSet<PathBuf> = wanted.iter().map(|w| w.dir.clone()).collect();
+        let paths: HashSet<NodeId> = wanted.iter().map(|w| w.dir.clone()).collect();
         self.slots.retain(|dir, _| paths.contains(dir));
         *self.wanted.lock() = paths;
 
@@ -183,7 +190,7 @@ impl ColumnCache {
         }
     }
 
-    pub fn get(&self, dir: &Path) -> Option<&Slot> {
+    pub fn get(&self, dir: &NodeId) -> Option<&Slot> {
         self.slots.get(dir)
     }
 
@@ -191,29 +198,49 @@ impl ColumnCache {
     pub fn clear(&mut self) {
         self.slots.clear();
     }
+
+    /// Tells the column worker that `sites.json` changed so stale server
+    /// sessions are dropped before the next listing.
+    pub fn reload_sites(&self) {
+        self.sites_version.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn worker(
     jobs: Receiver<Request>,
     done: Sender<Reply>,
-    wanted: Arc<Mutex<HashSet<PathBuf>>>,
+    wanted: Arc<Mutex<HashSet<NodeId>>>,
+    sites_version: Arc<AtomicU64>,
     ctx: egui::Context,
 ) {
-    // The local filesystem only: the column view is offered for folders with
-    // a path, and those never need COM, a server session or the Drive client.
     let fs = neutron_shell::fs::FsNamespace;
+    let mut sessions: Option<crate::remote::Sessions> = None;
+    let mut seen_sites_ver = sites_version.load(Ordering::Relaxed);
 
     while let Ok((dir, sort_spec, show_hidden)) = jobs.recv() {
         if !wanted.lock().contains(&dir) {
             continue;
         }
-        let outcome = fs
-            .enumerate(&NodeId::Path(dir.clone()))
-            .map(|mut list| {
-                sort::apply(&mut list, sort_spec, show_hidden);
-                list
-            })
-            .map_err(|e| e.to_string());
+        let listed = match &dir {
+            NodeId::Path(_) => fs.enumerate(&dir).map_err(|e| e.to_string()),
+            NodeId::Remote { site, path } => {
+                let ver = sites_version.load(Ordering::Relaxed);
+                if ver != seen_sites_ver {
+                    seen_sites_ver = ver;
+                    if let Some(s) = sessions.as_mut() {
+                        s.reload();
+                    }
+                }
+                sessions
+                    .get_or_insert_with(crate::remote::Sessions::load)
+                    .list(site, path)
+            }
+            _ => Err("column view does not list this location".to_owned()),
+        };
+        let outcome = listed.map(|mut list| {
+            sort::apply(&mut list, sort_spec, show_hidden);
+            list
+        });
         if done.send((dir, sort_spec, show_hidden, outcome)).is_err() {
             break;
         }
@@ -243,6 +270,34 @@ pub fn chain(location: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     chain
 }
 
+/// The remote folders shown as columns for `location` on `site`, outermost
+/// first and ending with `location` itself.
+pub fn chain_remote(site: &str, location: &str, root: Option<&str>) -> Vec<NodeId> {
+    let loc = neutron_remote::path::normalize(location);
+    let stop = match root.map(neutron_remote::path::normalize) {
+        Some(r) if loc == r || r == "/" || loc.starts_with(&format!("{r}/")) => r,
+        _ => "/".to_owned(),
+    };
+
+    let mut paths = Vec::new();
+    let mut cur = loc;
+    while paths.len() < MAX_ANCESTORS + 1 {
+        paths.push(cur.clone());
+        if cur == stop {
+            break;
+        }
+        let Some(parent) = neutron_remote::path::parent(&cur) else {
+            break;
+        };
+        cur = parent;
+    }
+    paths.reverse();
+    paths
+        .into_iter()
+        .map(|path| NodeId::remote(site, path))
+        .collect()
+}
+
 /// Whether the tab is on its way to a new folder, so its listing is still the
 /// one it is leaving.
 ///
@@ -258,15 +313,27 @@ pub fn arriving(tab: &Tab) -> bool {
 ///
 /// `None` while the tab is arriving, because its listing is then the folder it
 /// is leaving and an index into it means nothing here.
-pub fn peek(tab: &Tab) -> Option<PathBuf> {
+pub fn peek(tab: &Tab) -> Option<NodeId> {
     if arriving(tab) || tab.selection.len() != 1 {
         return None;
     }
     let idx = tab.selection.iter().next()?;
     tab.list.rank(idx)?;
-    let dir = tab.location().as_path()?;
-    let full = dir.join(tab.list.name(idx));
-    (tab.list.kind(idx).is_container() && !is_package(&full)).then_some(full)
+    if !tab.list.kind(idx).is_container() {
+        return None;
+    }
+    let name = tab.list.name(idx);
+    match tab.location() {
+        NodeId::Path(dir) => {
+            let full = dir.join(name);
+            (!is_package(&full)).then(|| NodeId::Path(full))
+        }
+        NodeId::Remote { site, path } => {
+            let joined = neutron_remote::path::join(path, name).ok()?;
+            Some(NodeId::remote(site.as_ref(), joined))
+        }
+        _ => None,
+    }
 }
 
 /// A folder the Mac presents as a single file — an application bundle.
@@ -343,5 +410,38 @@ mod tests {
         let chain = chain(&deep, None);
         assert_eq!(chain.len(), MAX_ANCESTORS + 1);
         assert_eq!(chain.last(), Some(&deep));
+    }
+
+    fn remote_paths(chain: &[NodeId]) -> Vec<&str> {
+        chain
+            .iter()
+            .map(|n| n.as_remote().expect("remote node").1)
+            .collect()
+    }
+
+    #[test]
+    fn remote_inside_site_root_starts_at_site_root() {
+        let chain = chain_remote("mini", "/Users/me/code/neutron", Some("/Users/me"));
+        assert_eq!(remote_paths(&chain), ["/Users/me", "/Users/me/code", "/Users/me/code/neutron"]);
+    }
+
+    #[test]
+    fn remote_outside_site_root_starts_at_slash() {
+        let chain = chain_remote("mini", "/var/log/nginx", Some("/Users/me"));
+        assert_eq!(remote_paths(&chain), ["/", "/var", "/var/log", "/var/log/nginx"]);
+    }
+
+    #[test]
+    fn remote_with_slash_root_starts_at_slash() {
+        let chain = chain_remote("mini", "/srv/data", Some("/"));
+        assert_eq!(remote_paths(&chain), ["/", "/srv", "/srv/data"]);
+    }
+
+    #[test]
+    fn remote_very_deep_path_keeps_its_deepest_folders() {
+        let deep = format!("/{}", (0..40).map(|i| format!("d{i}")).collect::<Vec<_>>().join("/"));
+        let chain = chain_remote("mini", &deep, None);
+        assert_eq!(chain.len(), MAX_ANCESTORS + 1);
+        assert_eq!(chain.last(), Some(&NodeId::remote("mini", deep)));
     }
 }

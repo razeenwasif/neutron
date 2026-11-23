@@ -33,6 +33,7 @@ use neutron_remote::{Continue, Site, Transport, path};
 #[derive(Debug, Clone)]
 pub enum Op {
     CreateDir { name: String },
+    CreateFile { name: String, contents: Vec<u8> },
     Rename { from: String, to: String },
     /// Names in `dir`, each with whether it is a directory (and not a link).
     Delete { entries: Vec<(String, EntryKind)> },
@@ -52,11 +53,38 @@ pub struct Progress {
 /// **Worker thread only** — it connects to a server.
 pub fn run(site: &Site, dir: &str, op: &Op, progress: &Progress) -> Result<String, String> {
     let mut transport = crate::remote::connect_checked(site)?;
-    let t = transport.as_mut();
+    run_on(transport.as_mut(), dir, op, progress)
+}
+
+/// Uploads a single local file to `remote_path` on its own connection,
+/// overwriting what is there (used to sync an edited local copy back).
+///
+/// **Worker thread only** — it connects to a server.
+pub fn upload_file(site: &Site, remote_path: &str, local_path: &Path) -> Result<(), String> {
+    let mut file = std::fs::File::open(local_path).map_err(|e| e.to_string())?;
+    let mut transport = crate::remote::connect_checked(site)?;
+    transport
+        .upload(remote_path, &mut file, &mut |_| Continue::Yes)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn run_on(t: &mut dyn Transport, dir: &str, op: &Op, progress: &Progress) -> Result<String, String> {
     match op {
         Op::CreateDir { name } => {
             t.create_dir(&join(dir, name)?).map_err(|e| e.to_string())?;
             Ok(format!("Created {name}"))
+        }
+        Op::CreateFile { name, contents } => {
+            let target = join(dir, name)?;
+            let mut cursor = std::io::Cursor::new(contents.as_slice());
+            match t.upload(&target, &mut cursor, &mut |_| Continue::Yes) {
+                Ok(_) => Ok(format!("Created {name}")),
+                Err(e) => {
+                    let _ = t.remove_file(&target);
+                    Err(e.to_string())
+                }
+            }
         }
         Op::Rename { from, to } => {
             t.rename(&join(dir, from)?, &join(dir, to)?).map_err(|e| e.to_string())?;
@@ -317,5 +345,22 @@ mod tests {
     fn counts_read_as_words() {
         assert_eq!(count(1, "file"), "1 file");
         assert_eq!(count(3, "item"), "3 items");
+    }
+
+    #[test]
+    fn creating_a_file_uploads_its_bytes() {
+        let mut fake = Fake::default();
+        let receipt = run_on(
+            &mut fake,
+            "/pub",
+            &Op::CreateFile {
+                name: "notes.txt".into(),
+                contents: b"hello world".to_vec(),
+            },
+            &Progress::default(),
+        )
+        .unwrap();
+        assert_eq!(receipt, "Created notes.txt");
+        assert_eq!(fake.entries["/pub/notes.txt"], (EntryKind::File, b"hello world".to_vec()));
     }
 }

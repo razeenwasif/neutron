@@ -20,11 +20,11 @@
 //! identity that survives the listing being read again.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, TextStyle, Ui, pos2, vec2};
 use neutron_core::entry::EntryKind;
-use neutron_core::{EntryList, SelectMode, Selection};
+use neutron_core::{EntryList, NodeId, SelectMode, Selection};
 
 use crate::file_list::{self, FileListAction, IconSource};
 use crate::icons::{self, Glyph};
@@ -89,7 +89,7 @@ pub enum Role<'a> {
 
 /// One column, ready to draw.
 pub struct Column<'a> {
-    pub dir: &'a Path,
+    pub dir: &'a NodeId,
     pub contents: Contents<'a>,
     pub role: Role<'a>,
     /// Names in this folder that sit on the clipboard as a cut, drawn faded.
@@ -127,7 +127,7 @@ pub enum ColumnAction {
     /// A click in any other column. Go to `dir` and select `entry`, or nothing
     /// for a click on empty space. `double` is a double-click: open it.
     Pick {
-        dir: PathBuf,
+        dir: NodeId,
         entry: Option<(String, EntryKind)>,
         double: bool,
     },
@@ -316,7 +316,7 @@ fn draw_info(ui: &mut Ui, p: &Palette, rect: Rect, info: &Info<'_>) -> Option<Co
 // a column has not been given is shared by every column and kept across
 // launches; a width given to one folder lasts the session.
 
-type Widths = HashMap<PathBuf, f32>;
+type Widths = HashMap<NodeId, f32>;
 
 fn default_width_id() -> egui::Id {
     egui::Id::new("neutron-columns-default-width")
@@ -339,7 +339,7 @@ fn widths_of(ctx: &egui::Context, columns: &[Column<'_>]) -> Vec<f32> {
 
 /// Gives the column showing `dir` a width — or, with `all`, makes it the width
 /// of every column, forgetting any one folder was given.
-fn set_width(ctx: &egui::Context, dir: &Path, width: f32, all: bool) {
+fn set_width(ctx: &egui::Context, dir: &NodeId, width: f32, all: bool) {
     let width = width.clamp(MIN_WIDTH, MAX_WIDTH);
     ctx.data_mut(|d| {
         if all {
@@ -347,7 +347,7 @@ fn set_width(ctx: &egui::Context, dir: &Path, width: f32, all: bool) {
             d.get_temp_mut_or_default::<Widths>(widths_id()).clear();
         } else {
             d.get_temp_mut_or_default::<Widths>(widths_id())
-                .insert(dir.to_path_buf(), width);
+                .insert(dir.clone(), width);
         }
     });
 }
@@ -536,7 +536,7 @@ fn draw_column(ui: &mut Ui, p: &Palette, column: &Column<'_>) -> Option<ColumnAc
             Role::Named { .. } => {
                 if response.clicked() {
                     action = Some(ColumnAction::Pick {
-                        dir: column.dir.to_path_buf(),
+                        dir: column.dir.clone(),
                         entry: None,
                         double: false,
                     });
@@ -684,7 +684,9 @@ fn draw_entry(
     let name = list.name(idx);
     let kind = list.kind(idx);
     if crate::drop::accepts(name, kind) {
-        crate::drop::offer(ui, rect, &column.dir.join(name), 11.0);
+        if let Some(dir) = column.dir.as_path() {
+            crate::drop::offer(ui, rect, &dir.join(name), 11.0);
+        }
     }
 
     let (selected, is_cursor, rename) = match &column.role {
@@ -854,14 +856,16 @@ fn draw_entry(
         }
         Role::Named { .. } => {
             if response.drag_started() {
-                return Some(ColumnAction::DragOut(column.dir.join(name)));
+                if let Some(dir) = column.dir.as_path() {
+                    return Some(ColumnAction::DragOut(dir.join(name)));
+                }
             }
             // A right-click picks the row too: what it is about has to be the
             // selection before any menu can act on it.
             let double = response.double_clicked();
             if double || response.clicked() || response.secondary_clicked() {
                 return Some(ColumnAction::Pick {
-                    dir: column.dir.to_path_buf(),
+                    dir: column.dir.clone(),
                     entry: Some((name.to_owned(), kind)),
                     double,
                 });
@@ -940,14 +944,14 @@ mod tests {
         let selection = Selection::new();
         let columns = [
             Column {
-                dir: Path::new("/project"),
+                dir: &NodeId::path("/project"),
                 contents: Contents::Ready(&parent),
                 role: Role::Named { highlight: Some("src") },
                 cut: None,
                 icons: None,
             },
             Column {
-                dir: Path::new("/project/src"),
+                dir: &NodeId::path("/project/src"),
                 contents: Contents::Ready(&here),
                 role: Role::Current { selection: &selection, rename: None, scroll_to: None },
                 cut: None,
@@ -960,7 +964,7 @@ mod tests {
         assert_eq!(
             action,
             Some(ColumnAction::Pick {
-                dir: PathBuf::from("/project"),
+                dir: NodeId::path("/project"),
                 entry: Some(("docs".to_owned(), EntryKind::Directory)),
                 double: false,
             })
@@ -974,14 +978,14 @@ mod tests {
         let selection = Selection::new();
         let columns = [
             Column {
-                dir: Path::new("/project"),
+                dir: &NodeId::path("/project"),
                 contents: Contents::Ready(&parent),
                 role: Role::Named { highlight: Some("src") },
                 cut: None,
                 icons: None,
             },
             Column {
-                dir: Path::new("/project/src"),
+                dir: &NodeId::path("/project/src"),
                 contents: Contents::Ready(&here),
                 role: Role::Current { selection: &selection, rename: None, scroll_to: None },
                 cut: None,
@@ -1011,7 +1015,7 @@ mod tests {
             names.iter().map(|n| (n.as_str(), EntryKind::Directory)).collect();
         let parent = listing(&entries);
         let columns = [Column {
-            dir: Path::new("/many"),
+            dir: &NodeId::path("/many"),
             contents: Contents::Ready(&parent),
             role: Role::Named { highlight: Some("f100") },
             cut: None,
@@ -1121,7 +1125,7 @@ mod tests {
 
         /// Which folder a plain click at `x` lands in, a second after anything
         /// before it so it cannot be read as part of a double-click.
-        fn folder_at(&mut self, columns: &[Column<'_>], x: f32) -> PathBuf {
+        fn folder_at(&mut self, columns: &[Column<'_>], x: f32) -> NodeId {
             self.time += 1.0;
             let none = egui::Modifiers::NONE;
             let at = pos2(x, ROW / 2.0);
@@ -1137,9 +1141,9 @@ mod tests {
         }
     }
 
-    fn named<'a>(dir: &'a str, list: &'a EntryList) -> Column<'a> {
+    fn named<'a>(dir: &'a NodeId, list: &'a EntryList) -> Column<'a> {
         Column {
-            dir: Path::new(dir),
+            dir,
             contents: Contents::Ready(list),
             role: Role::Named { highlight: None },
             cut: None,
@@ -1150,25 +1154,27 @@ mod tests {
     #[test]
     fn dragging_an_edge_resizes_that_column_alone() {
         let list = listing(&[("entry", EntryKind::File)]);
-        let columns = [named("/a", &list), named("/b", &list), named("/c", &list)];
+        let (a, b, c) = (NodeId::path("/a"), NodeId::path("/b"), NodeId::path("/c"));
+        let columns = [named(&a, &list), named(&b, &list), named(&c, &list)];
         let mut f = Frames::new();
         f.frame(&columns, Vec::new(), egui::Modifiers::NONE);
-        assert_eq!(f.folder_at(&columns, COLUMN_WIDTH + 60.0), PathBuf::from("/b"));
+        assert_eq!(f.folder_at(&columns, COLUMN_WIDTH + 60.0), NodeId::path("/b"));
 
         let edge = COLUMN_WIDTH - 2.0;
         f.drag(&columns, pos2(edge, 200.0), pos2(edge + 100.0, 200.0), egui::Modifiers::NONE);
 
         // The first column now reaches past where the second used to start...
-        assert_eq!(f.folder_at(&columns, COLUMN_WIDTH + 60.0), PathBuf::from("/a"));
+        assert_eq!(f.folder_at(&columns, COLUMN_WIDTH + 60.0), NodeId::path("/a"));
         // ...and the second kept its width, moved along by the difference.
-        assert_eq!(f.folder_at(&columns, COLUMN_WIDTH * 2.0 + 80.0), PathBuf::from("/b"));
-        assert_eq!(f.folder_at(&columns, COLUMN_WIDTH * 2.0 + 120.0), PathBuf::from("/c"));
+        assert_eq!(f.folder_at(&columns, COLUMN_WIDTH * 2.0 + 80.0), NodeId::path("/b"));
+        assert_eq!(f.folder_at(&columns, COLUMN_WIDTH * 2.0 + 120.0), NodeId::path("/c"));
     }
 
     #[test]
     fn option_dragging_an_edge_resizes_every_column() {
         let list = listing(&[("entry", EntryKind::File)]);
-        let columns = [named("/a", &list), named("/b", &list), named("/c", &list)];
+        let (a, b, c) = (NodeId::path("/a"), NodeId::path("/b"), NodeId::path("/c"));
+        let columns = [named(&a, &list), named(&b, &list), named(&c, &list)];
         let mut f = Frames::new();
         f.frame(&columns, Vec::new(), egui::Modifiers::NONE);
 
@@ -1177,9 +1183,9 @@ mod tests {
         let edge = COLUMN_WIDTH * 2.0 - 2.0;
         f.drag(&columns, pos2(edge, 200.0), pos2(398.0, 200.0), egui::Modifiers::ALT);
 
-        assert_eq!(f.folder_at(&columns, 190.0), PathBuf::from("/a"));
-        assert_eq!(f.folder_at(&columns, 215.0), PathBuf::from("/b"));
-        assert_eq!(f.folder_at(&columns, 415.0), PathBuf::from("/c"));
+        assert_eq!(f.folder_at(&columns, 190.0), NodeId::path("/a"));
+        assert_eq!(f.folder_at(&columns, 215.0), NodeId::path("/b"));
+        assert_eq!(f.folder_at(&columns, 415.0), NodeId::path("/c"));
     }
 
     #[test]
@@ -1189,7 +1195,8 @@ mod tests {
             EntryKind::File,
         )]);
         let short = listing(&[("entry", EntryKind::File)]);
-        let columns = [named("/a", &long), named("/b", &short)];
+        let (a, b) = (NodeId::path("/a"), NodeId::path("/b"));
+        let columns = [named(&a, &long), named(&b, &short)];
         let mut f = Frames::new();
         f.frame(&columns, Vec::new(), egui::Modifiers::NONE);
 
@@ -1201,13 +1208,13 @@ mod tests {
             f.press(&columns, edge, false, none);
         }
 
-        assert_eq!(f.folder_at(&columns, COLUMN_WIDTH + 40.0), PathBuf::from("/a"));
+        assert_eq!(f.folder_at(&columns, COLUMN_WIDTH + 40.0), NodeId::path("/a"));
     }
 
     #[test]
     fn a_column_still_loading_reports_nothing() {
         let columns = [Column {
-            dir: Path::new("/slow"),
+            dir: &NodeId::path("/slow"),
             contents: Contents::Loading,
             role: Role::Named { highlight: None },
             cut: None,
@@ -1224,14 +1231,14 @@ mod tests {
         let selection = Selection::new();
         let columns = [
             Column {
-                dir: Path::new("/project"),
+                dir: &NodeId::path("/project"),
                 contents: Contents::Ready(&parent),
                 role: Role::Named { highlight: Some("src") },
                 cut: None,
                 icons: None,
             },
             Column {
-                dir: Path::new("/project/src"),
+                dir: &NodeId::path("/project/src"),
                 contents: Contents::Ready(&here),
                 role: Role::Current { selection: &selection, rename: None, scroll_to: None },
                 cut: None,
@@ -1280,9 +1287,9 @@ mod tests {
         let here = listing(&["a", "b", "c", "d", "e"].map(|n| (n, EntryKind::File)));
         let selection = Selection::new();
         let columns = [
-            Column { dir: Path::new("/p"), contents: Contents::Ready(&parent), role: Role::Named { highlight: Some("src") }, cut: None, icons: None },
+            Column { dir: &NodeId::path("/p"), contents: Contents::Ready(&parent), role: Role::Named { highlight: Some("src") }, cut: None, icons: None },
             Column {
-                dir: Path::new("/p/src"),
+                dir: &NodeId::path("/p/src"),
                 contents: Contents::Ready(&here),
                 role: Role::Current { selection: &selection, rename: None, scroll_to: None },
                 cut: None,
@@ -1318,9 +1325,9 @@ mod tests {
         let here = listing(&[("main.rs", EntryKind::File)]);
         let selection = Selection::new();
         let columns = [
-            Column { dir: Path::new("/p"), contents: Contents::Ready(&parent), role: Role::Named { highlight: Some("src") }, cut: None, icons: None },
+            Column { dir: &NodeId::path("/p"), contents: Contents::Ready(&parent), role: Role::Named { highlight: Some("src") }, cut: None, icons: None },
             Column {
-                dir: Path::new("/p/src"),
+                dir: &NodeId::path("/p/src"),
                 contents: Contents::Ready(&here),
                 role: Role::Current { selection: &selection, rename: None, scroll_to: None },
                 cut: None,
@@ -1339,6 +1346,41 @@ mod tests {
         assert!(
             actions.contains(&Some(ColumnAction::DragOut(PathBuf::from("/p/docs")))),
             "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_click_in_a_remote_column_names_the_remote_node_and_entry() {
+        let parent = listing(&[("docs", EntryKind::Directory), ("src", EntryKind::Directory)]);
+        let here = listing(&[("main.rs", EntryKind::File)]);
+        let selection = Selection::new();
+        let parent_id = NodeId::remote("kagutsuchi", "/Users/razeenwasif");
+        let here_id = NodeId::remote("kagutsuchi", "/Users/razeenwasif/src");
+        let columns = [
+            Column {
+                dir: &parent_id,
+                contents: Contents::Ready(&parent),
+                role: Role::Named { highlight: Some("src") },
+                cut: None,
+                icons: None,
+            },
+            Column {
+                dir: &here_id,
+                contents: Contents::Ready(&here),
+                role: Role::Current { selection: &selection, rename: None, scroll_to: None },
+                cut: None,
+                icons: None,
+            },
+        ];
+
+        let action = run(&columns, click_at(100.0, ROW / 2.0));
+        assert_eq!(
+            action,
+            Some(ColumnAction::Pick {
+                dir: parent_id,
+                entry: Some(("docs".to_owned(), EntryKind::Directory)),
+                double: false,
+            })
         );
     }
 }

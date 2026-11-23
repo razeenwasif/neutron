@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<!-- Neutron Status & Plan — Antigravity artifact (kept in sync with docs/status.html in Neutron) -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neutron Status &amp; Plan</title>
+<style>
+  /* Layout: one reading column under a sticky section bar; cards are Neutron's own
+     soft violet panes on its dark ground, each named in tracked micro-caps. */
+  :root {
+    --ground: #18171d;
+    --ground-deep: #131218;
+    --orb-a: rgba(139, 109, 240, 0.22);
+    --orb-b: rgba(90, 123, 216, 0.16);
+    --card: #221f2b;
+    --card-2: #1b1923;
+    --raise: #2e2a3a;
+    --edge: rgba(255, 255, 255, 0.07);
+    --edge-strong: rgba(255, 255, 255, 0.14);
+    --ink: #ece9f3;
+    --dim: #c3bfcf;
+    --mute: #8f8b9c;
+    --accent: #a78bfa;
+    --accent-wash: rgba(167, 139, 250, 0.16);
+    --on-accent: #17131f;
+    --ok: #8fdcb4; --ok-soft: rgba(143, 220, 180, 0.12);
+    --doing: #a78bfa; --doing-soft: rgba(167, 139, 250, 0.16);
+    --warn: #f0c27a; --warn-soft: rgba(240, 194, 122, 0.12);
+    --crit: #f2848f; --crit-soft: rgba(242, 132, 143, 0.13);
+    --shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 12px 30px -16px rgba(0, 0, 0, 0.7);
+    --well: inset 0 1px 2px rgba(0, 0, 0, 0.5);
+    --key-face: #353144; --key-edge: rgba(255, 255, 255, 0.14); --key-drop: rgba(0, 0, 0, 0.45);
+    --bar-bg: rgba(19, 18, 24, 0.94);
+    --display: "Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+    --body: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --ground: #ede7fa; --ground-deep: #e2daf6;
+      --orb-a: rgba(155, 124, 240, 0.32); --orb-b: rgba(108, 168, 234, 0.24);
+      --card: #fbf9ff; --card-2: #f1ecfb; --raise: #e9e2f8;
+      --edge: rgba(20, 18, 30, 0.08); --edge-strong: rgba(20, 18, 30, 0.16);
+      --ink: #17161c; --dim: #45434f; --mute: #6c6979;
+      --accent: #6a47cc; --accent-wash: rgba(124, 92, 214, 0.12); --on-accent: #ffffff;
+      --ok: #1f7a52; --ok-soft: rgba(31, 122, 82, 0.1); --doing: #6a47cc; --doing-soft: rgba(124, 92, 214, 0.12);
+      --warn: #8a5a0b; --warn-soft: rgba(138, 90, 11, 0.1); --crit: #b0303f; --crit-soft: rgba(176, 48, 63, 0.1);
+      --shadow: 0 1px 2px rgba(40, 20, 80, 0.06), 0 12px 26px -16px rgba(40, 20, 80, 0.25);
+      --well: inset 0 1px 2px rgba(40, 20, 80, 0.12);
+      --key-face: #ffffff; --key-edge: rgba(20, 18, 30, 0.16); --key-drop: rgba(20, 18, 30, 0.13);
+      --bar-bg: rgba(237, 231, 250, 0.94);
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #ede7fa; --ground-deep: #e2daf6;
+    --orb-a: rgba(155, 124, 240, 0.32); --orb-b: rgba(108, 168, 234, 0.24);
+    --card: #fbf9ff; --card-2: #f1ecfb; --raise: #e9e2f8;
+    --edge: rgba(20, 18, 30, 0.08); --edge-strong: rgba(20, 18, 30, 0.16);
+    --ink: #17161c; --dim: #45434f; --mute: #6c6979;
+    --accent: #6a47cc; --accent-wash: rgba(124, 92, 214, 0.12); --on-accent: #ffffff;
+    --ok: #1f7a52; --ok-soft: rgba(31, 122, 82, 0.1); --doing: #6a47cc; --doing-soft: rgba(124, 92, 214, 0.12);
+    --warn: #8a5a0b; --warn-soft: rgba(138, 90, 11, 0.1); --crit: #b0303f; --crit-soft: rgba(176, 48, 63, 0.1);
+    --shadow: 0 1px 2px rgba(40, 20, 80, 0.06), 0 12px 26px -16px rgba(40, 20, 80, 0.25);
+    --well: inset 0 1px 2px rgba(40, 20, 80, 0.12);
+    --key-face: #ffffff; --key-edge: rgba(20, 18, 30, 0.16); --key-drop: rgba(20, 18, 30, 0.13);
+    --bar-bg: rgba(237, 231, 250, 0.94);
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-padding-top: calc(env(safe-area-inset-top, 0px) + 70px); }
+  body {
+    background:
+      radial-gradient(900px 560px at 10% -6%, var(--orb-a), transparent 64%),
+      radial-gradient(800px 640px at 104% 34%, var(--orb-b), transparent 62%),
+      var(--ground-deep);
+    background-attachment: fixed;
+    color: var(--ink);
+    font: 15px/1.6 var(--body);
+    -webkit-font-smoothing: antialiased;
+  }
+  body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 30; background: var(--bar-bg); }
+  .gutter { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  .column { max-width: 1080px; margin: 0 auto; }
+  h1, h2, h3, h4 { margin: 0; text-wrap: balance; }
+  p { margin: 0; }
+  ul, ol { margin: 0; padding: 0; list-style: none; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+  code { font-family: var(--mono); font-size: 0.85em; overflow-wrap: anywhere; }
+  .num { font-variant-numeric: tabular-nums; }
+  .display { font-family: var(--display); font-weight: 600; letter-spacing: -0.02em; }
+  .label { font-size: 10.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--mute); }
+
+  .card { background: var(--card); border: 1px solid var(--edge); border-radius: 18px; box-shadow: var(--shadow); min-width: 0; }
+
+  /* Section bar */
+  .bar { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20; background: var(--bar-bg); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-bottom: 1px solid var(--edge); }
+  .bar-inner { display: flex; align-items: center; gap: 16px; min-height: 56px; }
+  .brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; color: var(--ink); flex: none; }
+  .mark { width: 26px; height: 26px; border-radius: 8px; background: var(--accent); display: grid; place-items: center; color: var(--on-accent); }
+  .brand b { font-family: var(--display); font-weight: 600; font-size: 18px; letter-spacing: -0.01em; }
+  .sections { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; min-width: 0; padding: 6px 2px; }
+  .sections::-webkit-scrollbar { display: none; }
+  .sections a { flex: none; text-decoration: none; color: var(--dim); font-weight: 600; font-size: 13.5px; padding: 6px 13px; border-radius: 999px; }
+  .sections a:hover { color: var(--ink); background: var(--raise); }
+  .sections a[aria-current="true"] { color: var(--ink); background: var(--accent-wash); }
+
+  main { display: grid; gap: 64px; padding-block: 40px 72px; }
+  .part { display: grid; gap: 26px; min-width: 0; grid-template-columns: minmax(0, 1fr); }
+  .part-head { display: grid; gap: 8px; max-width: 70ch; }
+  .part-head h2 { font-size: clamp(26px, 3.6vw, 34px); line-height: 1.1; }
+  .part-head p { color: var(--dim); }
+
+  /* Hero */
+  .hero { display: grid; gap: 14px; }
+  .hero h1 { font-size: clamp(34px, 5.6vw, 52px); line-height: 1.04; }
+  .hero h1 em { font-style: normal; color: var(--accent); }
+  .lede { color: var(--dim); max-width: 66ch; font-size: 16.5px; }
+  .facts { display: flex; flex-wrap: wrap; gap: 6px 20px; color: var(--mute); font-size: 13px; }
+  .facts b { color: var(--dim); font-weight: 600; }
+  .vitals { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-top: 8px; align-items: start; }
+  .vital { padding: 18px; display: grid; gap: 8px; align-content: start; }
+  .vital .head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .vital .big { font-family: var(--display); font-size: 23px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.15; }
+  .vital p { color: var(--dim); font-size: 13px; line-height: 1.45; }
+  .vital .when { font-size: 11.5px; color: var(--mute); }
+  .jobs { display: grid; gap: 4px; font-size: 12.5px; color: var(--dim); }
+  .jobs li { display: flex; justify-content: space-between; gap: 8px; }
+
+  .pill { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 11.5px; font-weight: 700; padding: 2px 9px; border-radius: 999px; }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.ok { color: var(--ok); background: var(--ok-soft); }
+  .pill.crit { color: var(--crit); background: var(--crit-soft); }
+  .pill.warn { color: var(--warn); background: var(--warn-soft); }
+  .pill.info { color: var(--doing); background: var(--doing-soft); }
+
+  /* Plan */
+  .plan-head { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 16px 28px; }
+  .progress { display: grid; gap: 6px; width: 300px; max-width: 100%; }
+  .progress .row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; font-size: 13px; color: var(--dim); }
+  .track { height: 6px; border-radius: 3px; background: var(--card-2); box-shadow: var(--well); overflow: hidden; display: flex; }
+  .track i { display: block; height: 100%; }
+  .p-done { background: var(--ok); }
+  .p-doing { background: var(--doing); }
+  .sync { font-size: 12px; color: var(--mute); }
+  .sizes { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12.5px; color: var(--mute); }
+  .sizes b { color: var(--dim); font-family: var(--mono); font-weight: 500; }
+  #phases { display: grid; gap: 40px; grid-template-columns: minmax(0, 1fr); }
+  .phase { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+  .phase-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; padding-bottom: 8px; border-bottom: 1px solid var(--edge); }
+  .phase-head h3 { font-family: var(--display); font-size: 21px; font-weight: 600; letter-spacing: -0.01em; }
+  .phase-head span { color: var(--mute); font-size: 13.5px; }
+  .phase-head .count { margin-left: auto; font-size: 12.5px; }
+  .steps { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); }
+  .step { display: grid; grid-template-columns: minmax(0, 1fr) 176px; gap: 8px 20px; padding: 18px 20px; }
+  .step.is-next { border-color: var(--accent); box-shadow: var(--shadow), 0 0 0 1px var(--accent); }
+  .step.is-done .title, .step.is-skipped .title { color: var(--dim); }
+  .step.is-skipped .title { text-decoration: line-through; text-decoration-color: var(--mute); }
+  .step-body { display: grid; gap: 8px; min-width: 0; }
+  .title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+  .title { font-size: 16.5px; font-weight: 700; letter-spacing: -0.005em; line-height: 1.35; }
+  .next-tag { font-size: 10.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--on-accent); background: var(--accent); padding: 2px 8px; border-radius: 999px; }
+  .why { color: var(--dim); font-size: 14.5px; max-width: 78ch; }
+  .covers { display: grid; gap: 4px; font-size: 13.5px; color: var(--dim); max-width: 78ch; }
+  .covers li { display: grid; grid-template-columns: 12px minmax(0, 1fr); gap: 6px; }
+  .covers li::before { content: "–"; color: var(--mute); }
+  .done-when { font-size: 13.5px; color: var(--dim); max-width: 78ch; }
+  .done-when b { color: var(--ink); }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .tag { font-family: var(--mono); font-size: 11.5px; color: var(--dim); background: var(--card-2); box-shadow: var(--well); border-radius: 6px; padding: 1px 7px; }
+  .tag.you { font-family: var(--body); font-weight: 700; color: var(--accent); }
+  .tag.hold { font-family: var(--body); font-weight: 700; color: var(--warn); }
+  .ctl { display: grid; gap: 6px; align-content: start; }
+  .state { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 700; padding: 6px 11px; border-radius: 10px; color: var(--mute); background: var(--card-2); box-shadow: var(--well); }
+  .state::before { content: ""; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid currentColor; flex: none; }
+  .state.s-doing { color: var(--doing); background: var(--doing-soft); box-shadow: none; }
+  .state.s-doing::before { background: currentColor; animation: pulse 1.8s ease-in-out infinite; }
+  .state.s-done { color: var(--ok); background: var(--ok-soft); box-shadow: none; }
+  .state.s-done::before { background: currentColor; }
+  .state.s-skipped { box-shadow: none; outline: 1px dashed var(--edge-strong); outline-offset: -1px; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  .ctl label { font-size: 11.5px; color: var(--mute); }
+  .ctl select { font: inherit; font-size: 13px; color: var(--ink); background: var(--raise); border: 1px solid var(--edge); border-radius: 10px; padding: 6px 8px; width: 100%; }
+  .ctl time { font-size: 11.5px; color: var(--mute); }
+  .plan-foot { color: var(--mute); font-size: 12.5px; border-top: 1px solid var(--edge); padding-top: 14px; max-width: 90ch; }
+
+  /* Shipped */
+  .days { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: start; }
+  .day { padding: 18px; display: grid; gap: 12px; }
+  .day h3 { font-family: var(--display); font-size: 19px; font-weight: 600; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .day h3 span { font-family: var(--body); font-size: 12.5px; color: var(--mute); font-weight: 500; }
+  .day ul { display: grid; gap: 7px; }
+  .day li { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 8px; font-size: 13.5px; color: var(--dim); }
+  .day li code { color: var(--mute); font-size: 11.5px; padding-top: 2px; }
+
+  /* Guide */
+  .start { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; counter-reset: s; }
+  .start li { padding: 18px; display: grid; gap: 6px; align-content: start; counter-increment: s; }
+  .start li::before { content: counter(s); font-family: var(--display); font-size: 26px; font-weight: 600; line-height: 1; color: var(--accent); }
+  .start b { font-size: 15px; }
+  .start p { color: var(--dim); font-size: 13.5px; }
+  .gcards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
+  .gcard { padding: 18px 20px; display: grid; gap: 10px; align-content: start; }
+  .gcard h3 { font-family: var(--display); font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
+  .gcard ul { padding-left: 18px; list-style: disc; display: grid; gap: 7px; font-size: 14px; color: var(--dim); }
+  .gcard li::marker { color: var(--accent); }
+  .gcard b { color: var(--ink); font-weight: 650; }
+  .table-card { padding: 6px 0; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { text-align: left; vertical-align: top; padding: 9px 18px; border-bottom: 1px solid var(--edge); }
+  th { font-size: 10.5px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--mute); }
+  tr:last-child td { border-bottom: 0; }
+  td { color: var(--dim); }
+  td:first-child { color: var(--ink); white-space: nowrap; }
+
+  kbd { display: inline-block; font-family: var(--mono); font-size: 11.5px; line-height: 1.4; padding: 1px 6px; color: var(--ink); background: var(--key-face); border: 1px solid var(--key-edge); border-radius: 6px; box-shadow: 0 1.5px 0 var(--key-drop); white-space: nowrap; }
+  .gesture { font-size: 12.5px; font-weight: 700; color: var(--accent); white-space: nowrap; }
+
+  /* Cheatsheet */
+  .cheat-tools { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+  .search { font: 500 14.5px var(--body); color: var(--ink); background: var(--card-2); box-shadow: var(--well); border: 1px solid var(--edge); border-radius: 999px; padding: 9px 16px; width: min(100%, 360px); }
+  .search::placeholder { color: var(--mute); }
+  .count-note { font-size: 13px; color: var(--mute); }
+  .cheat-grid { columns: 2 420px; column-gap: 14px; }
+  .cheat { display: inline-block; width: 100%; break-inside: avoid; margin-bottom: 14px; padding: 14px 0 6px; }
+  .cheat[hidden] { display: none; }
+  .cheat .label { display: block; padding: 0 18px 6px; }
+  .cheat td { padding: 6px 18px; }
+  .cheat td.k { width: 1%; white-space: nowrap; }
+  .cheat td.k kbd + kbd { margin-left: 3px; }
+  .cheat tr[hidden] { display: none; }
+  .cheat tr.lastv td { border-bottom: 0; }
+  .empty { color: var(--mute); font-size: 14px; }
+
+  @media (max-width: 900px) {
+    .vitals { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .days, .gcards { grid-template-columns: minmax(0, 1fr); }
+    .start { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 640px) {
+    main { padding-block: 28px 56px; gap: 52px; }
+    .brand b { display: none; }
+    .vitals, .start { grid-template-columns: minmax(0, 1fr); }
+    .step { grid-template-columns: minmax(0, 1fr); padding: 16px; }
+    .ctl { grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 6px 10px; }
+    .ctl label { display: none; }
+    .ctl time { grid-column: 1 / -1; }
+    td:first-child { white-space: normal; }
+    .cheat td.k { white-space: normal; }
+  }
+  @media (prefers-reduced-motion: reduce) { .state.s-doing::before { animation: none; } }
+  @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+</style>
+</head>
+<body>
+<nav class="bar" aria-label="Sections">
+  <div class="gutter">
+    <div class="column bar-inner">
+      <a class="brand" href="#top"><span class="mark" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.5 6.5 3.5h3l2 3"/><rect x="3" y="6.5" width="14" height="10" rx="2.5"/></svg></span><b>Neutron</b></a>
+      <div class="sections">
+        <a href="#plan" data-spy="plan">Plan</a>
+        <a href="#shipped" data-spy="shipped">Shipped</a>
+        <a href="#guide" data-spy="guide">Guide</a>
+        <a href="#cheatsheet" data-spy="cheatsheet">Cheatsheet</a>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<main class="gutter" id="top">
+  <div class="column" style="display:grid; gap:64px; min-width:0">
+
+  <header class="hero">
+    <span class="label">Neutron file manager · macOS · status, plan and guide</span>
+    <h1 class="display">Neutron Status <em>&amp;</em> Plan</h1>
+    <p class="lede">Where Neutron stands after the Mac push, the order to work through what's left, what shipped since 14 October, and how to use all of it. Work the plan top to bottom: each step's status is saved here and updates as steps land.</p>
+    <div class="facts">
+      <span>master <b><code>5b047b1</code></b> · 17 Oct</span>
+      <span><b class="num">79</b> commits</span>
+      <span><b class="num">28</b> since 14 Oct</span>
+      <span><b class="num">64,380</b> lines of Rust in <b class="num">11</b> crates</span>
+      <span>Page made <b>25 Oct</b></span>
+    </div>
+    <section class="vitals" aria-label="Vitals">
+      <div class="vital card">
+        <span class="label">CI on master</span>
+        <div class="head"><span class="big">Failing</span><span class="pill crit">Red</span></div>
+        <ul class="jobs">
+          <li><span>macOS</span><span class="pill ok">Pass</span></li>
+          <li><span>Minimum Rust</span><span class="pill ok">Pass</span></li>
+          <li><span>Linux</span><span class="pill crit">1 test</span></li>
+          <li><span>Windows</span><span class="pill crit">Build</span></li>
+        </ul>
+        <span class="when">Run on 5b047b1. Red since 14 Oct. See steps 1 and 2.</span>
+      </div>
+      <div class="vital card">
+        <span class="label">Tests</span>
+        <div class="head"><span class="big num">890 pass</span><span class="pill ok">Local</span></div>
+        <p>Plus 11 that open a real window or GPU (drops, spring-loading, terminal, viewer, screenshots), run by hand, all passing on 17 Oct.</p>
+        <span class="when"><code>cargo test --workspace</code></span>
+      </div>
+      <div class="vital card">
+        <span class="label">Finder parity</span>
+        <div class="head"><span class="big">Core done</span><span class="pill ok">Shipped</span></div>
+        <p>All four views, Smart Folders, Get Info, Put Back, tags, batch rename, archives, plus a terminal, agents and a viewer the Finder doesn't have.</p>
+        <span class="when">As of 17 Oct</span>
+      </div>
+      <div class="vital card">
+        <span class="label">Hand checks</span>
+        <div class="head"><span class="big num">10 open</span><span class="pill warn">Untried</span></div>
+        <p>Features only exercised in the test harness, never on the real Mac: a real drag, Put Back, RAR, the window buttons with the sidebar hidden, and more.</p>
+        <span class="when">Steps 4 to 6</span>
+      </div>
+    </section>
+  </header>
+
+  <!-- PLAN -->
+  <section class="part" id="plan" aria-labelledby="plan-h">
+    <div class="plan-head">
+      <div class="part-head">
+        <span class="label">Plan</span>
+        <h2 class="display" id="plan-h">Run order</h2>
+        <p>CI first, then trying what shipped on the real Mac, then polish, housekeeping, and the bigger things that are on hold. The first unfinished step is marked Next.</p>
+      </div>
+      <div class="progress" aria-live="polite">
+        <div class="row"><span id="progress-text">0 of 15 done</span><span class="sync" id="sync">Loading statuses…</span></div>
+        <div class="track"><i class="p-done" id="bar-done" style="width:0%"></i><i class="p-doing" id="bar-doing" style="width:0%"></i></div>
+      </div>
+    </div>
+    <div class="sizes"><span><b>S</b> an hour or two</span><span><b>M</b> about a session</span><span><b>L</b> several sessions</span><span>Sizes are rough estimates.</span></div>
+    <div id="phases"></div>
+    <p class="plan-foot">Built from the repository at 5b047b1, the CI runs on GitHub, and what this session could and couldn't test. Statuses are shared: anyone who can edit this page can change them, and Claude updates them as steps land.</p>
+  </section>
+
+  <!-- SHIPPED -->
+  <section class="part" id="shipped" aria-labelledby="shipped-h">
+    <div class="part-head">
+      <span class="label">Shipped</span>
+      <h2 class="display" id="shipped-h">Since 14 October</h2>
+      <p>Every commit on master from the start of the Mac push, oldest first. Each is pushed to GitHub.</p>
+    </div>
+    <div class="days">
+      <div class="day card">
+        <h3>14 Oct <span>7 commits</span></h3>
+        <ul>
+          <li><code>c315243</code><span>A velvet redesign: dark, soft and rounded throughout</span></li>
+          <li><code>abe70f5</code><span>Previews of files, and a shorter strip above the panes</span></li>
+          <li><code>70587bf</code><span>Copies with progress, Finder keys, Quick Look, eject, fuller menus</span></li>
+          <li><code>59f2d0b</code><span>A menu bar: File, Edit, View, Go and Window</span></li>
+          <li><code>6d4255a</code><span>Browsing inside archives, and the smaller Mac fixes</span></li>
+          <li><code>8630578</code><span>Undo and redo for changes to files</span></li>
+          <li><code>09614ca</code><span>Windows of their own, in one Neutron</span></li>
+        </ul>
+      </div>
+      <div class="day card">
+        <h3>15 Oct <span>11 commits</span></h3>
+        <ul>
+          <li><code>c6cdeb4</code><span>Finder tags: dots, a Tags menu, every file with a tag</span></li>
+          <li><code>495ca4a</code><span>Share and AirDrop</span></li>
+          <li><code>b862916</code><span>Windows after the first come back after a restart</span></li>
+          <li><code>9714fc4</code><span>Notices in the window being worked in</span></li>
+          <li><code>6718d4f</code><span>Undo puts back what a paste replaced</span></li>
+          <li><code>ff64170</code><span>The Kind column in macOS's own words</span></li>
+          <li><code>5cebbe6</code><span>Sort by Date Added and Last Opened, and group the list</span></li>
+          <li><code>abcd3bd</code><span>Tags with names of your own</span></li>
+          <li><code>9cd5c24</code><span>Share and AirDrop from inside an archive</span></li>
+          <li><code>9209cad</code><span>Rename several items at once</span></li>
+          <li><code>cc4ba96</code><span>New File, empty or from a template</span></li>
+        </ul>
+      </div>
+      <div class="day card">
+        <h3>16–17 Oct <span>10 commits</span></h3>
+        <ul>
+          <li><code>9b232c2</code><span>Folder sizes, added up in the background</span></li>
+          <li><code>1e1aca0</code><span>Every row in a column can be clicked</span></li>
+          <li><code>9dda98a</code><span>The first window comes back at the size it was left at</span></li>
+          <li><code>2386f54</code><span>Drag to select and drag out in columns; drop onto folders</span></li>
+          <li><code>2cf9cda</code><span>Wider windows by default</span></li>
+          <li><code>08df4c4</code><span>A terminal, AI agents and a viewer in tabs; spring-loading; a grouped grid</span></li>
+          <li><code>011a541</code><span>Open a kind of file in an app of your choosing</span></li>
+          <li><code>9c07004</code><span>Send a file to a running app rather than starting another</span></li>
+          <li><code>0d8e8b6</code><span>Antigravity instead of the Gemini CLI</span></li>
+          <li><code>5b047b1</code><span>Gallery, Smart Folders, Get Info, Put Back, more archives</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- GUIDE -->
+  <section class="part" id="guide" aria-labelledby="guide-h">
+    <div class="part-head">
+      <span class="label">Guide</span>
+      <h2 class="display" id="guide-h">Using Neutron</h2>
+      <p>Neutron works like the Finder where the Finder has an answer, and goes further with panes, a terminal, agents and a viewer. The keys follow the Finder's.</p>
+    </div>
+    <ol class="start">
+      <li class="card"><b>Install it</b><p><code>cargo xtask install</code> builds a release and puts <code>Neutron.app</code> in <code>~/Applications</code>.</p></li>
+      <li class="card"><b>Go somewhere</b><p>The sidebar, <kbd>⇧⌘G</kbd> for a path, or drop a folder on the Dock icon.</p></li>
+      <li class="card"><b>Pick a view</b><p><kbd>⌘1</kbd> grid, <kbd>⌘2</kbd> list, <kbd>⌘3</kbd> columns, <kbd>⌘4</kbd> gallery. Each tab keeps its own.</p></li>
+      <li class="card"><b>Find anything</b><p><kbd>⌘P</kbd> in this folder, <kbd>⇧⌘F</kbd> across the Mac, <kbd>⇧⌘P</kbd> for every command.</p></li>
+    </ol>
+    <div class="gcards">
+      <div class="gcard card">
+        <h3>Views and layout</h3>
+        <ul>
+          <li><b>Sort and group</b> from View: by name, kind, dates (added and last opened too) or size. Grouping works in the list and the grid.</li>
+          <li><b>Grid tile size</b> is the slider in the grid's footer.</li>
+          <li><b>Gallery</b> shows the current item large over a strip of thumbnails. Left and Right step along it.</li>
+          <li><b>Folder sizes</b>: View › Calculate All Sizes, or Calculate Size on one folder. Sizes show in the list, grid and columns.</li>
+          <li><b>Split</b> with <kbd>⌘\</kbd>; drag tabs between panes. <kbd>⌃⌘S</kbd> and <kbd>⌥⌘T</kbd> hide the sidebar and toolbar.</li>
+        </ul>
+      </div>
+      <div class="gcard card">
+        <h3>Finding</h3>
+        <ul>
+          <li><b>Filter</b> the folder with <kbd>⌘F</kbd>; it clears when you leave.</li>
+          <li><b>Find a file</b> fuzzily under this folder with <kbd>⌘P</kbd>: <code>crgtml</code> finds <code>Cargo.toml</code>.</li>
+          <li><b>Search Everywhere</b> (<kbd>⇧⌘F</kbd>) asks Spotlight, and takes filters: <code>tax kind:pdf date:year tag:Red</code>.</li>
+          <li><b>Smart Folders</b>: File › New Smart Folder… by name or contents, kind, last changed, tag and where. Name one to keep it under Searches in the sidebar.</li>
+        </ul>
+      </div>
+      <div class="gcard card">
+        <h3>Working with files</h3>
+        <ul>
+          <li><b>Rename</b> with <kbd>↩</kbd>; with several selected it opens Rename Items: replace text, add text, or number them.</li>
+          <li><b>New File</b> (<kbd>⌥⌘N</kbd>) makes <code>untitled.txt</code>; templates come from the Templates folder (see below).</li>
+          <li><b>Get Info</b> (<kbd>⌘I</kbd>) is Neutron's own window, with the Finder's a click away.</li>
+          <li><b>Show Original</b> (<kbd>⌘R</kbd>) on an alias or link; <b>Put Back</b> (<kbd>⌘⌫</kbd> in the Trash).</li>
+          <li><b>Undo</b> (<kbd>⌘Z</kbd>) covers copies, moves, renames, new items, Move to Trash and Put Back.</li>
+          <li><b>Tags</b>: right-click › Tags for colours, Edit Tags… for names of your own.</li>
+        </ul>
+      </div>
+      <div class="gcard card">
+        <h3>Drag and drop</h3>
+        <ul>
+          <li><b>Sweep</b> a selection box from empty space, in every view; <kbd>⌘</kbd> adds to it.</li>
+          <li><b>Drag a selected item</b> and the whole selection goes, to Neutron or any app.</li>
+          <li><b>Drop onto</b> a folder row, a tile, a column, a sidebar place, a tab or a folder in the path bar. The Trash trashes.</li>
+          <li><b>Hold</b> a drag on a folder and it springs open; on a tab, the tab shows.</li>
+          <li><span class="gesture">⌥ while dropping</span> copies; another disk copies anyway.</li>
+        </ul>
+      </div>
+      <div class="gcard card">
+        <h3>Terminal and agents</h3>
+        <ul>
+          <li><b>Open in Terminal</b> (<kbd>⌃`</kbd>, right-click, or Go) opens your login shell in a tab, in that folder.</li>
+          <li><b>Ask Claude Code</b> runs Claude Code there, told what was selected, accepting edits; shell commands still ask.</li>
+          <li><b>Ask Antigravity</b> runs <code>agy</code> (from the Gemini app) in accept-edits mode.</li>
+          <li><b>Both agents</b> get Neutron's search as tools: Spotlight name and full-text search, and fuzzy path matching, served by <code>neutron --mcp</code>.</li>
+          <li>Going to a folder from a terminal opens a new tab, so the shell keeps running.</li>
+        </ul>
+      </div>
+      <div class="gcard card">
+        <h3>Viewer, apps and archives</h3>
+        <ul>
+          <li><b>Open in Viewer</b> (<kbd>⌥⌘O</kbd>) reads a PDF, an image, or text and code (coloured for about 40 languages) in a tab, with zoom and find.</li>
+          <li><b>PDFs open in Quark</b> by double-click, through <code>openers.json</code>; a running Quark takes each as a tab.</li>
+          <li><b>Archives</b>: zip, tar, tar.gz, tar.xz, tar.bz2, 7z and RAR open like folders and extract; a plain <code>.gz</code> unpacks beside itself.</li>
+          <li><b>Disk images</b> (<code>.dmg</code>) mount and open their disk.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="part-head" style="margin-top:6px">
+      <h3 class="display" style="font-size:21px">Where Neutron keeps things</h3>
+      <p>All under <code>~/Library/Application Support/Neutron/</code> unless noted. Plain files you can read and edit.</p>
+    </div>
+    <div class="card table-card">
+      <table>
+        <thead><tr><th>File</th><th>What it holds</th></tr></thead>
+        <tbody>
+          <tr><td><code>app.ron</code></td><td>The session: panes, tabs, extra windows, window sizes, and view settings (sort, group, view, tile size, hidden sidebar).</td></tr>
+          <tr><td><code>pins.json</code>, <code>recent.json</code></td><td>Pinned folders in the sidebar, and recent files.</td></tr>
+          <tr><td><code>searches.json</code></td><td>Smart Folders saved to the sidebar.</td></tr>
+          <tr><td><code>openers.json</code></td><td>Apps chosen per extension, e.g. <code>{ "pdf": "/Applications/Quark.app" }</code>.</td></tr>
+          <tr><td><code>trashed.json</code></td><td>Where items Neutron moved to the Trash came from, for Put Back.</td></tr>
+          <tr><td><code>Templates/</code></td><td>Any file here appears under New File from Template.</td></tr>
+          <tr><td><code>~/Library/Caches/Neutron/archives</code></td><td>Files taken out of archives to open, share or drag.</td></tr>
+          <tr><td><code>agy</code>'s MCP list</td><td>Ask Antigravity adds a <code>neutron</code> entry there; check with <code>agy mcp list</code>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- CHEATSHEET -->
+  <section class="part" id="cheatsheet" aria-labelledby="cheat-h">
+    <div class="part-head">
+      <span class="label">Cheatsheet</span>
+      <h2 class="display" id="cheat-h">Keys and gestures</h2>
+      <p>Everything live in the build at 5b047b1. Menu items without a key are listed where they're useful.</p>
+    </div>
+    <div class="cheat-tools">
+      <input class="search" id="cheat-filter" type="search" placeholder="Filter: try “trash” or “⌘R”" aria-label="Filter the cheatsheet" autocomplete="off" spellcheck="false">
+      <span class="count-note" id="cheat-count" aria-live="polite"></span>
+    </div>
+    <p class="empty" id="cheat-empty" hidden>Nothing matches.</p>
+    <div class="cheat-grid" id="cheat-grid"></div>
+  </section>
+
+  </div>
+</main>
+
+<script>
+  // ── The run order ──────────────────────────────────────────────
+  const PHASES = [
+    { title: "Get CI green", sub: "Red on GitHub since 14 Oct", steps: [
+      { id: "ci-linux", size: "S", title: "Run the 7z test only on the Mac",
+        why: "The Linux job fails one test: it makes a 7z with /usr/bin/tar, which on Linux is GNU tar and cannot write 7z. Neutron uses the Mac's bsdtar.",
+        covers: ["Gate a_7z_made_by_bsdtar_is_listed_and_extracted with cfg(target_os = \"macos\")", "Same check for the disk-image and alias tests, which call hdiutil and NSURL"],
+        done: "the Linux job passes", tags: ["neutron-archive"] },
+      { id: "ci-windows", size: "S", title: "Decide what the Windows job is for", you: true,
+        why: "Windows no longer compiles: Get Info, the Spotlight search, the loader and the terminal use Unix-only calls (uid, getpwuid, OsStr::from_bytes). Neutron is now built for the Mac only.",
+        covers: ["Either fence the Mac-only modules behind cfg(unix) with stubs, so Windows still builds", "Or drop the Windows job and the README's Windows claims"],
+        done: "CI is green on every job that stays", tags: ["decision"] },
+      { id: "readme", size: "S", title: "Fix the README's stale lines",
+        why: "It still opens with “a fast file explorer for Windows and macOS”, lists ⌘I as the Finder's window, and stops at ⌘3.",
+        covers: ["Lead with the Mac", "Key table: ⌘4, ⌘R, Neutron's Get Info"],
+        done: "the README matches the build", tags: ["README.md"] },
+    ]},
+    { title: "Try it on the Mac", sub: "Only tested in the harness so far", steps: [
+      { id: "verify-drag", size: "S", title: "A real drag over Neutron",
+        why: "macOS sends no pointer movement during a drag, so Neutron reads the pointer from AppKit and converts it. Tests can't run a real drag.",
+        covers: ["The highlight sits under the pointer on rows, tiles, columns and the sidebar", "Holding on a folder springs it open; on a tab, shows the tab", "Dropping on path-bar folders and tabs, from Neutron and from the Finder"],
+        done: "every drop lands where it lit up", tags: ["hand check"] },
+      { id: "verify-trash", size: "S", title: "Trash, archives and disk images",
+        why: "Put Back needs Full Disk Access, and no test archive could be made for RAR.",
+        covers: ["Put Back without Full Disk Access: the notice and the Settings pane", "Put Back with it, for something the Finder trashed and something Neutron trashed", "Open and extract a real .rar", "A password-protected .dmg falls back to macOS's mounter"],
+        done: "each works or has a bug filed here", tags: ["hand check"] },
+      { id: "verify-window", size: "S", title: "Window chrome, agents and the gallery",
+        why: "The screenshots don't draw the window buttons, and the agents were only started, never used.",
+        covers: ["The red, yellow and green buttons sit clear of the tab strip with the sidebar hidden", "Ask Antigravity from a fresh folder: sign-in, trust prompt, a search through Neutron's tools", "Gallery on a folder of photos; Get Info on a large folder"],
+        done: "nothing overlaps and both agents can search", tags: ["hand check"] },
+    ]},
+    { title: "Polish what's there", sub: "Gaps found while building", steps: [
+      { id: "pdf-text", size: "M", title: "Search and select text in PDFs",
+        why: "The viewer draws pages with Core Graphics, which has no text layer. Quark covers reading, so this matters for quick looks.",
+        covers: ["PDFKit's PDFDocument for find and selection, drawn over the rendered pages"],
+        done: "find steps through matches in a PDF", tags: ["viewer"] },
+      { id: "term-mouse", size: "M", title: "Mouse in the terminal, and Option as Meta",
+        why: "Full-screen programs (vim, htop) get the wheel but no clicks, and Option types special characters rather than acting as Meta.",
+        covers: ["SGR mouse reports for clicks and drags when a program asks", "A setting for Option as Meta"],
+        done: "vim takes a click, and ⌥B moves back a word", tags: ["terminal"] },
+      { id: "code-kind", size: "S", title: "Make kind:code find Rust and TOML",
+        why: "Spotlight has no file type for .rs or .toml, so kind:code misses them.",
+        covers: ["Add an extension fallback to the Code predicate"],
+        done: "kind:code finds main.rs", tags: ["search"] },
+      { id: "agy-context", size: "S", title: "Tell Antigravity what's selected",
+        why: "agy takes no extra instructions, so unlike Claude Code it only knows the folder.",
+        covers: ["An optional first message naming the selection, sent only when something is selected"],
+        done: "Antigravity can name the selected files", tags: ["agents"] },
+    ]},
+    { title: "Housekeeping", sub: "Records that fell behind", steps: [
+      { id: "progress-md", size: "S", title: "Bring PROGRESS.md up to date",
+        why: "It stops before the Mac push: nothing on the terminal, agents, viewer or Finder-parity work.",
+        covers: ["A section per feature group, with what was measured"], done: "PROGRESS.md covers 14–17 Oct", tags: ["docs"] },
+      { id: "perf", size: "M", title: "Measure again on the Mac",
+        why: "docs/perf.md was measured on six NTFS volumes on Windows.",
+        covers: ["Listing and scrolling a 100,000-entry folder", "Idle CPU with terminal tabs and the gallery open", "Cold start"],
+        done: "docs/perf.md has Mac numbers", tags: ["docs/perf.md"] },
+    ]},
+    { title: "Later", sub: "Bigger, and waiting on a decision", steps: [
+      { id: "servers", size: "L", title: "Write to servers",
+        why: "Remote browsing in list, grid and column views plus SFTP writes (new folder, new file, rename, delete, paste/drop upload, and automatic save-back on edit).",
+        covers: ["Uploads via paste and drag-and-drop with collision checks", "Rename, delete, new folder, new file, and save-back on edit"],
+        done: "paste works into a server folder", tags: ["neutron-remote"] },
+      { id: "notarize", size: "M", title: "Sign and notarize, to share it", you: true,
+        why: "The app has an ad-hoc signature, which runs only on this Mac. Anyone else needs a Developer ID signature and notarization.",
+        covers: ["An Apple Developer ID", "Sign and notarize in cargo xtask install"],
+        done: "a downloaded copy opens on another Mac", tags: ["xtask"] },
+      { id: "updates", size: "L", title: "Updates without a rebuild",
+        why: "Every update is cargo xtask install from source.",
+        covers: ["Built releases on GitHub, and a check for a newer one"],
+        done: "Neutron offers its own update", tags: ["release"] },
+    ]},
+  ];
+  const ALL = PHASES.flatMap(p => p.steps);
+  const STORAGE_KEY = "neutron-status-v1";
+  // Baseline step statuses maintained in source (Antigravity updates these as steps land).
+  const DEFAULT_STATUSES = {
+    servers: { state: "done", at: "2026-11-24T00:00:00Z" },
+  };
+  const statuses = {};
+  let canWrite = true;
+  let storageOk = false;
+
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  const LABEL = { todo: "To do", doing: "In progress", done: "Done", skipped: "Skipped" };
+
+  function render() {
+    const host = document.getElementById("phases");
+    host.textContent = "";
+    const firstOpen = ALL.find(s => !["done", "skipped"].includes((statuses[s.id] || {}).state));
+    let n = 0;
+    for (const phase of PHASES) {
+      const sec = el("section", "phase");
+      const head = el("div", "phase-head");
+      head.append(el("h3", null, phase.title), el("span", null, phase.sub));
+      const finished = phase.steps.filter(s => ["done", "skipped"].includes((statuses[s.id] || {}).state)).length;
+      head.append(el("span", "count num", `${finished} of ${phase.steps.length}`));
+      sec.append(head);
+      const list = el("div", "steps");
+      for (const s of phase.steps) {
+        n += 1;
+        const st = (statuses[s.id] || {}).state || "todo";
+        const card = el("article", "step card" + (s === firstOpen ? " is-next" : "") + (st === "done" ? " is-done" : "") + (st === "skipped" ? " is-skipped" : ""));
+        card.id = "step-" + s.id;
+        const body = el("div", "step-body");
+        const row = el("div", "title-row");
+        row.append(el("span", "label num", `Step ${n}`), el("span", "title", s.title));
+        if (s === firstOpen) row.append(el("span", "next-tag", "Next"));
+        body.append(row, el("p", "why", s.why));
+        const ul = el("ul", "covers");
+        for (const c of s.covers) ul.append(el("li", null, c));
+        body.append(ul);
+        const done = el("p", "done-when");
+        done.append(el("b", null, "Done when "), document.createTextNode(s.done + "."));
+        body.append(done);
+        const meta = el("div", "meta");
+        meta.append(el("span", "tag", s.size));
+        if (s.you) meta.append(el("span", "tag you", "Needs you"));
+        if (s.hold) meta.append(el("span", "tag hold", "On hold"));
+        for (const t of s.tags) meta.append(el("span", "tag", t));
+        body.append(meta);
+        const ctl = el("div", "ctl");
+        ctl.append(el("span", "state s-" + st, LABEL[st]));
+        if (canWrite) {
+          const id = "status-" + s.id;
+          const label = el("label", null, "Set status"); label.htmlFor = id;
+          const sel = el("select"); sel.id = id;
+          for (const k of Object.keys(LABEL)) { const o = el("option", null, LABEL[k]); o.value = k; if (k === st) o.selected = true; sel.append(o); }
+          sel.addEventListener("change", () => setStatus(s.id, sel.value, sel));
+          ctl.append(label, sel);
+        }
+        const at = (statuses[s.id] || {}).at;
+        if (at) { const t = el("time", null, "Updated " + new Date(at).toLocaleDateString(undefined, { day: "numeric", month: "short" })); t.dateTime = at; ctl.append(t); }
+        card.append(body, ctl);
+        list.append(card);
+      }
+      sec.append(list);
+      host.append(sec);
+    }
+    const done = ALL.filter(s => ["done", "skipped"].includes((statuses[s.id] || {}).state)).length;
+    const doing = ALL.filter(s => (statuses[s.id] || {}).state === "doing").length;
+    document.getElementById("progress-text").textContent = `${done} of ${ALL.length} done`;
+    document.getElementById("bar-done").style.width = (100 * done / ALL.length) + "%";
+    document.getElementById("bar-doing").style.width = (100 * doing / ALL.length) + "%";
+  }
+
+  function loadStatuses() {
+    for (const k of Object.keys(statuses)) delete statuses[k];
+    for (const [k, v] of Object.entries(DEFAULT_STATUSES)) {
+      if (v && LABEL[v.state]) statuses[k] = { ...v };
+    }
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      storageOk = true;
+      if (raw) {
+        const saved = JSON.parse(raw);
+        for (const [k, v] of Object.entries(saved)) {
+          if (v && LABEL[v.state]) statuses[k] = v;
+        }
+      }
+    } catch (_) {
+      storageOk = false;
+    }
+  }
+
+  function saveStatuses() {
+    if (!storageOk) return;
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(statuses));
+    } catch (_) {
+      storageOk = false;
+    }
+  }
+
+  function setStatus(id, state) {
+    statuses[id] = { state, at: new Date().toISOString() };
+    saveStatuses();
+    render();
+  }
+
+  loadStatuses();
+  render();
+  document.getElementById("sync").textContent = storageOk
+    ? "Statuses saved locally in this browser"
+    : "Statuses editable for this session (source copy lives in docs/status.html)";
+
+  // ── Cheatsheet ─────────────────────────────────────────────────
+  // Each row: keys (array of keycaps, or a gesture string), what it does.
+  const CHEATS = [
+    ["Moving around", [
+      [["↑", "↓"], "Move the cursor; ⇧ extends the selection"],
+      [["←", "→"], "Grid and gallery: the next item. Columns: in and out of folders"],
+      [["⌘↑"], "Enclosing folder"],
+      [["⌘[", "⌘]"], "Back and forward"],
+      [["⌘O"], "Open; ⌘↓ too"],
+      ["type a name", "Jump to it; repeat a letter to cycle"],
+    ]],
+    ["Go", [
+      [["⇧⌘H"], "Home"], [["⇧⌘D"], "Desktop"], [["⇧⌘O"], "Documents"], [["⌥⌘L"], "Downloads"],
+      [["⇧⌘A"], "Applications"], [["⇧⌘R"], "AirDrop"], [["⇧⌘G"], "Go to a folder by path"],
+      [["⌘L"], "Address bar"], [["⌘K"], "Connect to a server"],
+    ]],
+    ["Selecting", [
+      ["Click", "Select one"], ["⌘ Click", "Add or remove one"], ["⇧ Click", "Select the range"],
+      ["Drag on empty space", "Sweep a selection box, in every view; ⌘ adds"],
+      [["⌘A"], "Select everything shown"], [["Esc"], "Clear the selection"],
+    ]],
+    ["Files", [
+      [["↩"], "Rename; with several selected, Rename Items"],
+      [["⌘D"], "Duplicate"],
+      [["⇧⌘N"], "New folder"], [["⌥⌘N"], "New file"],
+      [["⌘C", "⌘X", "⌘V"], "Copy, cut, paste; Finder reads the same clipboard"],
+      [["⌥⌘C"], "Copy the path"],
+      [["⌘Z", "⇧⌘Z"], "Undo and redo"],
+      [["⌘⌫"], "Move to Trash; in the Trash, Put Back"],
+      [["⌥⌘⌫"], "Delete immediately (asks first)"],
+      [["⌘I"], "Get Info"], [["⌘R"], "Show Original of an alias or link; otherwise refresh"],
+      [["Space"], "Quick Look; ⌘Y too"], [["⌥⌘O"], "Open in Viewer"],
+      [["⌘E"], "Eject the disk this folder is on"], [["⌃⌘T"], "Add the folder to the sidebar"],
+    ]],
+    ["Views and windows", [
+      [["⌘1", "⌘2", "⌘3", "⌘4"], "Grid, list, columns, gallery"],
+      [["⇧⌘."], "Show hidden files"],
+      [["⌃⌘S"], "Hide or show the sidebar"], [["⌥⌘T"], "Hide or show the toolbar"],
+      [["⌘\\"], "Split right"],
+      [["⌘N"], "New window"], [["⌘T"], "New tab"], [["⌘W"], "Close the tab"],
+      [["⇧⌘]", "⇧⌘["], "Next and previous tab; ⌃⇥ too"],
+      ["View menu", "Sort By, Group By, Calculate All Sizes, Show Preview"],
+    ]],
+    ["Finding", [
+      [["⌘F"], "Filter this folder"],
+      [["⌘P"], "Find a file under this folder, fuzzily"],
+      [["⇧⌘F"], "Search Everywhere, through Spotlight"],
+      [["⇧⌘P"], "Command palette"],
+      ["kind:", "folder, document, text, pdf, image, movie, music, code, app, archive"],
+      ["date:", "today, week, month, year"],
+      ["tag:", "any tag name, e.g. tag:Red"],
+      ["File menu", "New Smart Folder…"],
+    ]],
+    ["Drag and drop", [
+      ["Drag a selected item", "Drags the whole selection, to Neutron or any app"],
+      ["Drop on a folder", "Rows, tiles, columns, sidebar places, tabs, path-bar folders"],
+      ["Hold on a folder", "It blinks, then opens; on a tab, the tab shows"],
+      ["⌥ while dropping", "Copy instead of move"],
+      ["Drop on the Trash", "Moves to the Trash, undoable"],
+    ]],
+    ["Terminal and agents", [
+      [["⌃`"], "Open a terminal here"],
+      ["Go menu", "Ask Claude Code, Ask Antigravity"],
+      [["⌘C", "⌘V"], "Copy the selection, paste (bracketed when the program asks)"],
+      [["⌥←", "⌥→"], "Back and forward a word"],
+      [["↩"], "Close a terminal whose program has ended"],
+    ]],
+    ["Viewer", [
+      ["Find field", "↩ next match, ⇧↩ previous"],
+      ["+ and −", "Zoom, 25% to 600%"],
+      ["Drag on lines", "Select lines; Copy takes them, or everything"],
+      ["Open in App", "The file's own app; PDFs go to Quark"],
+    ]],
+  ];
+
+  function buildCheats() {
+    const grid = document.getElementById("cheat-grid");
+    for (const [name, rows] of CHEATS) {
+      const card = el("div", "cheat card");
+      card.append(el("span", "label", name));
+      const table = el("table");
+      const tb = el("tbody");
+      for (const [keys, what] of rows) {
+        const tr = el("tr");
+        const k = el("td", "k");
+        if (Array.isArray(keys)) for (const key of keys) k.append(el("kbd", null, key));
+        else k.append(el("span", "gesture", keys));
+        tr.append(k, el("td", null, what));
+        tr.dataset.text = ((Array.isArray(keys) ? keys.join(" ") : keys) + " " + what + " " + name).toLowerCase();
+        tb.append(tr);
+      }
+      table.append(tb);
+      card.append(table);
+      grid.append(card);
+    }
+    filterCheats("");
+  }
+
+  function filterCheats(q) {
+    q = q.trim().toLowerCase();
+    let shown = 0;
+    for (const card of document.querySelectorAll(".cheat")) {
+      let any = false, last = null;
+      for (const tr of card.querySelectorAll("tr")) {
+        const hit = !q || tr.dataset.text.includes(q);
+        tr.hidden = !hit; tr.classList.remove("lastv");
+        if (hit) { any = true; shown += 1; last = tr; }
+      }
+      if (last) last.classList.add("lastv");
+      card.hidden = !any;
+    }
+    document.getElementById("cheat-empty").hidden = shown > 0;
+    document.getElementById("cheat-count").textContent = q ? `${shown} match${shown === 1 ? "" : "es"}` : `${shown} entries`;
+  }
+  buildCheats();
+  document.getElementById("cheat-filter").addEventListener("input", e => filterCheats(e.target.value));
+
+  // ── Section bar follows the reading position ───────────────────
+  const links = [...document.querySelectorAll(".sections a")];
+  const spy = new IntersectionObserver(entries => {
+    for (const e of entries) if (e.isIntersecting) {
+      for (const a of links) a.setAttribute("aria-current", String(a.dataset.spy === e.target.id));
+    }
+  }, { rootMargin: "-40% 0px -55% 0px" });
+  for (const id of ["plan", "shipped", "guide", "cheatsheet"]) { const s = document.getElementById(id); if (s) spy.observe(s); }
+</script>
+</body>
+</html>
