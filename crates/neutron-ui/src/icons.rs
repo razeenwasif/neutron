@@ -34,6 +34,10 @@ pub enum Glyph {
     Home,
     Folder,
     Cloud,
+    ICloud,
+    ProtonDrive,
+    OneDrive,
+    GoogleDrive,
     Drive,
     /// A WSL distribution — drawn as a terminal.
     Terminal,
@@ -94,6 +98,22 @@ pub enum Glyph {
     AirDrop,
 }
 
+/// Picks a cloud-provider icon from its sidebar or dashboard display name.
+pub fn cloud_glyph(name: &str) -> Glyph {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("icloud") {
+        Glyph::ICloud
+    } else if lower.contains("proton") {
+        Glyph::ProtonDrive
+    } else if lower.contains("onedrive") {
+        Glyph::OneDrive
+    } else if lower.contains("google") || lower.contains("gdrive") {
+        Glyph::GoogleDrive
+    } else {
+        Glyph::Cloud
+    }
+}
+
 /// Draws `glyph` centred on `centre`.
 pub fn draw(painter: &Painter, centre: Pos2, glyph: Glyph, colour: Color32) {
     draw_with(painter, centre, glyph, Stroke::new(STROKE_WIDTH, colour));
@@ -104,7 +124,11 @@ fn draw_with(painter: &Painter, centre: Pos2, glyph: Glyph, stroke: Stroke) {
     match glyph {
         Glyph::Home => home(painter, centre, stroke),
         Glyph::Folder => folder(painter, centre, stroke),
-        Glyph::Cloud => cloud(painter, centre, stroke),
+        Glyph::Cloud => outlines::cloud(painter, centre, stroke),
+        Glyph::ICloud => outlines::icloud(painter, centre, stroke),
+        Glyph::ProtonDrive => outlines::proton_drive(painter, centre, stroke),
+        Glyph::OneDrive => outlines::one_drive(painter, centre, stroke),
+        Glyph::GoogleDrive => outlines::google_drive(painter, centre, stroke),
         Glyph::Drive => drive(painter, centre, stroke, colour),
         Glyph::Terminal => terminal(painter, centre, stroke),
         Glyph::Server => server(painter, centre, stroke),
@@ -183,7 +207,12 @@ pub fn draw_scaled(painter: &Painter, centre: Pos2, glyph: Glyph, colour: Color3
 fn is_outline(glyph: Glyph) -> bool {
     matches!(
         glyph,
-        Glyph::Dashboard
+        Glyph::Cloud
+            | Glyph::ICloud
+            | Glyph::ProtonDrive
+            | Glyph::OneDrive
+            | Glyph::GoogleDrive
+            | Glyph::Dashboard
             | Glyph::Desktop
             | Glyph::Download
             | Glyph::Document
@@ -499,20 +528,6 @@ fn home(painter: &Painter, c: Pos2, stroke: Stroke) {
     ));
 }
 
-fn cloud(painter: &Painter, c: Pos2, stroke: Stroke) {
-    // Three overlapping circles clipped by a flat base: drawing the true
-    // outline needs arcs, which epaint has no primitive for, so the shape is
-    // built from circle strokes plus a baseline over the seams.
-    painter.circle_stroke(pos2(c.x - 3.5, c.y + 0.5), 4.0, stroke);
-    painter.circle_stroke(pos2(c.x + 3.0, c.y + 1.0), 3.5, stroke);
-    painter.circle_stroke(pos2(c.x, c.y - 1.5), 4.5, stroke);
-    // Flat bottom, drawn in the surface's own colour would need the background;
-    // instead the base line simply completes the silhouette.
-    painter.line_segment(
-        [pos2(c.x - 3.5, c.y + 4.5), pos2(c.x + 3.0, c.y + 4.5)],
-        stroke,
-    );
-}
 
 fn drive(painter: &Painter, c: Pos2, stroke: Stroke, colour: Color32) {
     // A stack of two platters: the shape people read as "disk" at 16pt.
@@ -861,6 +876,15 @@ mod tests {
         // volume from a directory.
         assert_ne!(for_kind(EntryKind::Drive), for_kind(EntryKind::Directory));
     }
+
+    #[test]
+    fn cloud_names_resolve_to_provider_glyphs() {
+        assert_eq!(cloud_glyph("iCloud Drive"), Glyph::ICloud);
+        assert_eq!(cloud_glyph("ProtonDrive-razeen.wasif@proton.me"), Glyph::ProtonDrive);
+        assert_eq!(cloud_glyph("OneDrive-Personal"), Glyph::OneDrive);
+        assert_eq!(cloud_glyph("GoogleDrive-razeen@gmail.com"), Glyph::GoogleDrive);
+        assert_eq!(cloud_glyph("Nextcloud"), Glyph::Cloud);
+    }
 }
 
 
@@ -1027,6 +1051,103 @@ mod outlines {
             p.add(Shape::line(points, s));
         }
         p.circle_filled(u(c, 12.0, 17.0), 1.2 * k(), s.color);
+    }
+
+    fn push_arc(
+        out: &mut Vec<(f32, f32)>,
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+        start_deg: f32,
+        end_deg: f32,
+        steps: usize,
+    ) {
+        for i in 0..=steps {
+            let a = (start_deg + (end_deg - start_deg) * (i as f32 / steps as f32)).to_radians();
+            out.push((cx + rx * a.cos(), cy + ry * a.sin()));
+        }
+    }
+
+    pub fn cloud(p: &Painter, c: Pos2, s: Stroke) {
+        let mut pts = Vec::with_capacity(48);
+        push_arc(&mut pts, 6.8, 14.5, 3.6, 3.5, 90.0, 262.0, 12);
+        push_arc(&mut pts, 11.4, 11.2, 5.0, 5.2, 185.0, 345.0, 14);
+        push_arc(&mut pts, 17.2, 14.3, 3.8, 3.7, 255.0, 450.0, 12);
+        closed(p, c, &pts, s);
+    }
+
+    pub fn icloud(p: &Painter, c: Pos2, s: Stroke) {
+        // Apple iCloud: asymmetric tall left-center dome, tucked right lobe,
+        // flat pill base, plus a subtle inner curve accent inside the dome.
+        let mut pts = Vec::with_capacity(48);
+        push_arc(&mut pts, 6.4, 14.6, 3.3, 3.2, 90.0, 258.0, 12);
+        push_arc(&mut pts, 10.8, 10.6, 5.1, 5.0, 185.0, 350.0, 14);
+        push_arc(&mut pts, 16.9, 14.1, 3.9, 3.7, 255.0, 450.0, 12);
+        closed(p, c, &pts, s);
+
+        let mut sheen = Vec::with_capacity(12);
+        push_arc(&mut sheen, 10.8, 10.6, 2.8, 2.7, 200.0, 305.0, 8);
+        line(p, c, &sheen, s);
+    }
+
+    pub fn proton_drive(p: &Painter, c: Pos2, s: Stroke) {
+        // Proton Drive: chamfered vault-folder with angled front prism fold.
+        closed(
+            p,
+            c,
+            &[
+                (4.4, 5.8),
+                (9.6, 5.8),
+                (11.6, 8.0),
+                (19.6, 8.0),
+                (20.6, 9.0),
+                (20.6, 17.8),
+                (19.6, 18.8),
+                (4.4, 18.8),
+                (3.4, 17.8),
+                (3.4, 6.8),
+            ],
+            s,
+        );
+        line(p, c, &[(3.4, 11.4), (11.8, 14.2), (20.6, 10.2)], s);
+    }
+
+    pub fn one_drive(p: &Painter, c: Pos2, s: Stroke) {
+        // Microsoft OneDrive: smaller upper-left cloud tucked behind a wider
+        // foreground cloud, separated cleanly without intersecting interior rings.
+        let mut front = Vec::with_capacity(42);
+        push_arc(&mut front, 9.4, 15.0, 3.4, 3.2, 90.0, 255.0, 10);
+        push_arc(&mut front, 13.5, 13.2, 4.3, 3.8, 195.0, 348.0, 12);
+        push_arc(&mut front, 17.6, 15.0, 3.2, 3.2, 260.0, 450.0, 10);
+        closed(p, c, &front, s);
+
+        let mut back = Vec::with_capacity(32);
+        push_arc(&mut back, 9.8, 10.2, 4.3, 4.3, 345.0, 190.0, 14);
+        push_arc(&mut back, 6.2, 13.0, 3.4, 3.4, 258.0, 92.0, 12);
+        line(p, c, &back, s);
+    }
+
+    pub fn google_drive(p: &Painter, c: Pos2, s: Stroke) {
+        // Google Drive: six-sided chamfered ribbon delta with inner triangle
+        // cutout and three clean ribbon fold seams.
+        closed(
+            p,
+            c,
+            &[
+                (9.5, 4.8),
+                (14.5, 4.8),
+                (20.7, 15.6),
+                (18.7, 18.8),
+                (5.3, 18.8),
+                (3.3, 15.6),
+            ],
+            s,
+        );
+        closed(p, c, &[(12.0, 9.2), (15.2, 14.7), (8.8, 14.7)], s);
+        line(p, c, &[(12.0, 9.2), (9.5, 4.8)], s);
+        line(p, c, &[(8.8, 14.7), (6.5, 18.8)], s);
+        line(p, c, &[(15.2, 14.7), (20.1, 14.7)], s);
     }
 
     pub fn atom(p: &Painter, c: Pos2, s: Stroke) {

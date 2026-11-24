@@ -38,7 +38,7 @@ pub mod site;
 pub mod transport;
 
 pub use site::{Auth, Protocol, Site, Sites};
-pub use transport::{Continue, RemoteEntry, RemoteError, Transport};
+pub use transport::{Continue, RemoteEntry, RemoteError, RemoteVolume, Transport};
 
 /// Reads the password saved for a site, if there is one.
 ///

@@ -478,7 +478,7 @@ pub struct NeutronApp {
     /// What the open menu's Neutron-owned rows act on, decided when the menu
     /// was built rather than when a row is chosen: by then the selection may
     /// have moved.
-    pin_target: Option<PathBuf>,
+    pin_target: Option<NodeId>,
     tab_target: Option<NodeId>,
     /// The saved server a sidebar menu was opened on, for its "Edit…" row.
     edit_site_target: Option<String>,
@@ -588,6 +588,10 @@ pub struct NeutronApp {
     remote_edits_checked: Instant,
     remote_edit_tx: crossbeam_channel::Sender<(PathBuf, String, String, Result<String, String>)>,
     remote_edit_rx: crossbeam_channel::Receiver<(PathBuf, String, String, Result<String, String>)>,
+    /// Mounted storage volumes reported by connected SFTP servers.
+    remote_drives: std::collections::HashMap<String, Vec<Place>>,
+    remote_drives_tx: crossbeam_channel::Sender<(String, Vec<Place>)>,
+    remote_drives_rx: crossbeam_channel::Receiver<(String, Vec<Place>)>,
 
     /// Installed plugins, and the command running from one if any.
     plugins: crate::plugins::PluginRuntime,
@@ -846,6 +850,7 @@ impl NeutronApp {
         let (created_tx, created_rx) = crossbeam_channel::unbounded();
         let (changed_tx, changed_rx) = crossbeam_channel::unbounded();
         let (remote_edit_tx, remote_edit_rx) = crossbeam_channel::unbounded();
+        let (remote_drives_tx, remote_drives_rx) = crossbeam_channel::unbounded();
 
         // `Ctrl+V` never reaches the application through egui when the
         // clipboard holds files rather than text, which is the only case that
@@ -970,6 +975,9 @@ impl NeutronApp {
             remote_edits_checked: Instant::now(),
             remote_edit_tx,
             remote_edit_rx,
+            remote_drives: std::collections::HashMap::new(),
+            remote_drives_tx,
+            remote_drives_rx,
             plugins,
             palette,
             archive_job: None,
@@ -1035,6 +1043,9 @@ impl NeutronApp {
             app.restore_windows(cc);
         }
         app.refresh_templates();
+        if !cfg!(test) {
+            app.start_remote_volume_probe();
+        }
         app
     }
 
@@ -2310,6 +2321,9 @@ impl NeutronApp {
             // from the session opened against the old one.
             self.loader.reload_sites();
             self.columns.reload_sites();
+            if !cfg!(test) {
+                self.start_remote_volume_probe();
+            }
 
             match reply.origin {
                 SitesOrigin::Background => {}
@@ -2328,6 +2342,100 @@ impl NeutronApp {
                 SitesOrigin::Dialog(Err(reason)) => self.connect.error = Some(reason),
             }
         }
+    }
+
+    /// Probes SFTP servers in the background for their internal/external SSDs.
+    fn start_remote_volume_probe(&mut self) {
+        let sftp_sites: Vec<neutron_remote::Site> = self
+            .sites
+            .sites
+            .iter()
+            .filter(|s| s.protocol == neutron_remote::Protocol::Sftp)
+            .cloned()
+            .collect();
+        self.remote_drives.retain(|id, _| sftp_sites.iter().any(|s| s.id == *id));
+        if sftp_sites.is_empty() {
+            return;
+        }
+        for site in sftp_sites {
+            let tx = self.remote_drives_tx.clone();
+            let wake = self.ctx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("neutron-vols-{}", site.id))
+                .spawn(move || {
+                    let Ok(mut transport) = crate::remote::connect_checked(&site) else {
+                        return;
+                    };
+                    let Ok(vols) = transport.volumes() else {
+                        return;
+                    };
+                    let places: Vec<Place> = vols
+                        .into_iter()
+                        .map(|v| Place {
+                            name: v.name,
+                            id: NodeId::remote(site.id.as_str(), v.path.as_str()),
+                            kind: neutron_core::places::PlaceKind::Drive,
+                            capacity: Some(neutron_core::places::Capacity {
+                                total: v.total,
+                                free: v.free,
+                            }),
+                        })
+                        .collect();
+                    let _ = tx.send((site.id, places));
+                    wake.request_repaint();
+                });
+        }
+    }
+
+    fn drain_remote_drives(&mut self) {
+        while let Ok((site_id, places)) = self.remote_drives_rx.try_recv() {
+            if places.is_empty() {
+                self.remote_drives.remove(&site_id);
+            } else {
+                self.remote_drives.insert(site_id, places);
+            }
+        }
+    }
+
+    fn remote_drive_groups(&self) -> Vec<(String, Vec<Place>)> {
+        self.sites
+            .sites
+            .iter()
+            .filter_map(|site| {
+                let vols = self.remote_drives.get(&site.id)?;
+                (!vols.is_empty()).then(|| (site.display().to_owned(), vols.clone()))
+            })
+            .collect()
+    }
+
+    fn sidebar_footer_drives(&self) -> std::borrow::Cow<'_, [Place]> {
+        if let Some((site, path)) = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.location().as_remote())
+        {
+            if let Some(vols) = self.remote_drives.get(site) {
+                if !vols.is_empty() {
+                    let norm_path = path.trim_end_matches('/');
+                    let best = vols
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| {
+                            v.id.as_remote().is_some_and(|(_, vp)| {
+                                let vp = vp.trim_end_matches('/');
+                                vp.is_empty()
+                                    || norm_path == vp
+                                    || norm_path.starts_with(&format!("{vp}/"))
+                            })
+                        })
+                        .max_by_key(|(_, v)| v.id.as_remote().map_or(0, |(_, vp)| vp.len()))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    return std::borrow::Cow::Owned(vec![vols[best].clone()]);
+                }
+            }
+        }
+        std::borrow::Cow::Borrowed(&self.drives)
     }
 
     /// Applies navigations a worker asked for once its work was done.
@@ -3494,6 +3602,59 @@ impl NeutronApp {
 
     /// The menu for a list of tagged files: what works on files wherever they
     /// are, and the way to the folder one is in.
+    /// The context menu for a saved server tab, in list or column view.
+    fn remote_menu(&mut self, on_row: bool, at: egui::Pos2) {
+        use neutron_core::MenuItem;
+        fn add(
+            next: &mut u32,
+            label: &str,
+            action: Action,
+            actions: &mut Vec<(u32, Action)>,
+            default: bool,
+        ) -> MenuItem {
+            *next += 1;
+            actions.push((*next, action));
+            MenuItem { id: *next, label: label.to_owned(), enabled: true, default, ..Default::default() }
+        }
+        self.menu_actions.clear();
+        let mut next = MENU_ID_OURS;
+        let mut items = Vec::new();
+        if on_row {
+            if let Some(cursor) = self.workspace.active_tab().and_then(|t| t.selection.cursor()) {
+                items.push(add(&mut next, "Open", Action::Activate(cursor), &mut self.menu_actions, true));
+                items.push(MenuItem::separator());
+            }
+            self.pin_target = self.menu_pin_row().map(|(row, target)| {
+                items.push(row);
+                items.push(MenuItem::separator());
+                target
+            });
+            items.push(add(&mut next, "Rename", Action::BeginRename, &mut self.menu_actions, false));
+            items.push(add(
+                &mut next,
+                "Delete…",
+                Action::Ask(Box::new(Action::DeleteOnServer)),
+                &mut self.menu_actions,
+                false,
+            ));
+            items.push(MenuItem::separator());
+            items.push(add(&mut next, "New Folder", Action::NewFolder, &mut self.menu_actions, false));
+            items.push(add(&mut next, "New File", Action::NewFile(None), &mut self.menu_actions, false));
+            items.push(add(&mut next, "Paste", Action::Paste, &mut self.menu_actions, false));
+        } else {
+            items.push(add(&mut next, "New Folder", Action::NewFolder, &mut self.menu_actions, false));
+            items.push(add(&mut next, "New File", Action::NewFile(None), &mut self.menu_actions, false));
+            items.push(add(&mut next, "Paste", Action::Paste, &mut self.menu_actions, false));
+            self.pin_target = self.menu_pin_row().map(|(row, target)| {
+                items.push(MenuItem::separator());
+                items.push(row);
+                target
+            });
+        }
+        self.menu = Some(neutron_ui::MenuState::new(items, at));
+        self.menu_reply = None;
+    }
+
     fn tag_menu(&mut self, on_row: bool, at: egui::Pos2) {
         use neutron_core::MenuItem;
         fn add(next: &mut u32, label: &str, action: Action, actions: &mut Vec<(u32, Action)>, default: bool) -> MenuItem {
@@ -3749,7 +3910,7 @@ impl NeutronApp {
                 // Off unless one alias is selected, so Command-R falls through
                 // to refreshing the folder.
                 C::ShowOriginal => !(selected.len() == 1 && tab.is_some_and(|t| t.list.is_alias(selected[0]))),
-                C::NewFolder | C::NewFile | C::Paste => dir.is_none() && !on_server,
+                C::NewFolder | C::NewFile | C::Paste | C::AddToSidebar => dir.is_none() && !on_server,
                 C::Terminal | C::AskClaude | C::AskAntigravity => dir.is_none(),
                 C::Back => !tab.is_some_and(|t| t.history.can_go_back()),
                 C::Forward => !tab.is_some_and(|t| t.history.can_go_forward()),
@@ -4153,6 +4314,10 @@ impl NeutronApp {
         }
         if self.in_tag_view() {
             self.tag_menu(idx.is_some(), pos);
+            return;
+        }
+        if self.on_server() {
+            self.remote_menu(idx.is_some(), pos);
             return;
         }
 
@@ -4688,7 +4853,7 @@ struct WindowState {
     menu_reply: Option<crossbeam_channel::Sender<Option<u32>>>,
     menu_actions: Vec<(u32, Action)>,
     pending_menu_actions: std::cell::RefCell<Vec<(u32, Action)>>,
-    pin_target: Option<PathBuf>,
+    pin_target: Option<NodeId>,
     tab_target: Option<NodeId>,
     edit_site_target: Option<String>,
     tab_drag: Option<TabDrag>,
@@ -4844,6 +5009,7 @@ impl NeutronApp {
     fn shared_frame(&mut self, ctx: &egui::Context) {
         self.drain_places();
         self.drain_sites();
+        self.drain_remote_drives();
         while let Ok(state) = self.drive_rx.try_recv() {
             // An answer ends any sign-in in progress; the sign-in's own
             // result is the only thing sent while one runs.
@@ -5803,19 +5969,32 @@ impl NeutronApp {
     /// copy is one more thing that can disagree with `self.pins` after a
     /// toggle.
     fn pinned_places(&self) -> Vec<Place> {
-        self.pins
-            .folders
-            .iter()
-            .map(|path| Place {
-                name: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string_lossy().into_owned()),
-                id: NodeId::Path(path.clone()),
+        let local = self.pins.folders.iter().map(|path| Place {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+            id: NodeId::Path(path.clone()),
+            kind: neutron_core::places::PlaceKind::KnownFolder,
+            capacity: None,
+        });
+        let remote = self.pins.remote.iter().map(|rp| {
+            let name = if rp.path == "/" {
+                self.sites
+                    .get(&rp.site)
+                    .map(|s| format!("{} /", s.display()))
+                    .unwrap_or_else(|| format!("{} /", rp.site))
+            } else {
+                neutron_remote::path::file_name(&rp.path)
+            };
+            Place {
+                name,
+                id: NodeId::remote(rp.site.as_str(), rp.path.as_str()),
                 kind: neutron_core::places::PlaceKind::KnownFolder,
                 capacity: None,
-            })
-            .collect()
+            }
+        });
+        local.chain(remote).collect()
     }
 
     /// What Quick access holds: the known folders, then anything pinned.
@@ -6088,12 +6267,16 @@ impl NeutronApp {
         });
         self.tab_target = Some(id.clone());
 
-        // Only a place with a path can be pinned, for the reason in `pins.rs`:
-        // a pin has to survive a restart, and nothing else here can be reached
-        // from a string on disk without its provider being connected first.
-        self.pin_target = id.as_path().map(Path::to_path_buf);
-        if let Some(dir) = self.pin_target.clone() {
-            let pinned = self.pins.folders.contains(&dir);
+        self.pin_target = match &id {
+            NodeId::Path(_) | NodeId::Remote { .. } => Some(id.clone()),
+            _ => None,
+        };
+        if let Some(target) = self.pin_target.clone() {
+            let pinned = match &target {
+                NodeId::Path(dir) => self.pins.folders.contains(dir),
+                NodeId::Remote { site, path } => self.pins.contains_remote(site, path),
+                _ => false,
+            };
             items.push(neutron_core::MenuItem::separator());
             items.push(neutron_core::MenuItem {
                 id: MENU_ID_PIN,
@@ -6171,24 +6354,46 @@ impl NeutronApp {
     ///
     /// Right-clicking a folder pins that folder; right-clicking anywhere else
     /// pins the one being shown, which is what `Ctrl+Shift+D` does.
-    fn menu_pin_row(&self) -> Option<(neutron_core::MenuItem, PathBuf)> {
+    fn menu_pin_row(&self) -> Option<(neutron_core::MenuItem, NodeId)> {
         let tab = self.workspace.active_tab()?;
-        let dir = tab.location().as_path()?;
-
-        let target = tab
+        let selected_dir = tab
             .selection
             .cursor()
             .filter(|&i| i < tab.list.len())
             .filter(|&i| tab.list.kind(i).is_container())
             .filter(|&i| tab.selection.is_selected(i))
-            .map(|i| dir.join(tab.list.name(i)))
-            .unwrap_or_else(|| dir.to_path_buf());
+            .map(|i| tab.list.name(i));
 
-        let pinned = self.pins.folders.contains(&target);
-        let name = target
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| target.to_string_lossy().into_owned());
+        let (target, pinned, name) = match tab.location() {
+            NodeId::Path(dir) => {
+                let target_path = selected_dir
+                    .map(|name| dir.join(name))
+                    .unwrap_or_else(|| dir.to_path_buf());
+                let pinned = self.pins.folders.contains(&target_path);
+                let name = target_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| target_path.to_string_lossy().into_owned());
+                (NodeId::Path(target_path), pinned, name)
+            }
+            NodeId::Remote { site, path } => {
+                let target_path = match selected_dir {
+                    Some(child) => neutron_remote::path::join(path, child).ok()?,
+                    None => path.to_string(),
+                };
+                let pinned = self.pins.contains_remote(site, &target_path);
+                let name = if target_path == "/" {
+                    self.sites
+                        .get(site)
+                        .map(|s| s.display().to_owned())
+                        .unwrap_or_else(|| "/".to_owned())
+                } else {
+                    neutron_remote::path::file_name(&target_path)
+                };
+                (NodeId::remote(site.as_ref(), target_path), pinned, name)
+            }
+            _ => return None,
+        };
 
         Some((
             neutron_core::MenuItem {
@@ -6202,17 +6407,38 @@ impl NeutronApp {
         ))
     }
 
-    /// Pins or unpins `dir`, and persists it.
+    /// Pins or unpins `target`, and persists it.
     ///
     /// Shared by the keyboard, the palette and the context menu, so all three
     /// give the same answer to the same question.
-    fn apply_pin(&mut self, dir: PathBuf) {
+    fn apply_pin(&mut self, target: NodeId) {
         let mut pins = self.pins.clone();
-        let outcome = pins.toggle(&dir);
-        let name = dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+        let (outcome, name) = match target {
+            NodeId::Path(dir) => {
+                let outcome = pins.toggle(&dir);
+                let name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+                (outcome, name)
+            }
+            NodeId::Remote { site, path } => {
+                let outcome = pins.toggle_remote(&site, &path);
+                let name = if path.as_ref() == "/" {
+                    self.sites
+                        .get(&site)
+                        .map(|s| s.display().to_owned())
+                        .unwrap_or_else(|| "/".to_owned())
+                } else {
+                    neutron_remote::path::file_name(&path)
+                };
+                (outcome, name)
+            }
+            _ => {
+                self.refuse_without_a_path("pin");
+                return;
+            }
+        };
 
         if outcome == crate::pins::Toggled::Full {
             // Refused rather than dropping the oldest: that would lose a pin
@@ -6251,20 +6477,17 @@ impl NeutronApp {
     /// One command for both, because which one applies is a property of where
     /// you are standing rather than something to choose from a menu.
     fn toggle_pin(&mut self) {
-        let Some(dir) = self
+        let Some(target) = self
             .workspace
             .active_tab()
-            .and_then(|t| t.location().as_path())
-            .map(Path::to_path_buf)
+            .map(|t| t.location().clone())
+            .filter(|id| id.as_path().is_some() || id.as_remote().is_some())
         else {
-            // A pin is a path on disk. Nothing without one can be restored
-            // next launch, so the refusal names the place rather than failing
-            // quietly — see `place.rs`.
             self.refuse_without_a_path("pin");
             return;
         };
 
-        self.apply_pin(dir);
+        self.apply_pin(target);
     }
 
     /// Forgets the Google Drive credential.
@@ -6806,6 +7029,11 @@ impl NeutronApp {
     /// what is selected on the left, the keys worth knowing on the right.
     fn pane_footer(&self, ui: &mut egui::Ui, p: &Palette, rect: egui::Rect, tab: &crate::workspace::Tab, actions: &mut Vec<Action>) {
         let painter = ui.painter();
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, p.sidebar);
+        painter.line_segment(
+            [rect.left_top(), rect.right_top()],
+            egui::Stroke::new(1.0, p.border),
+        );
         let font = egui::FontId::proportional(12.0);
         let y = rect.center().y;
 
@@ -8033,7 +8261,8 @@ impl NeutronApp {
                     egui::pos2(body.left(), footer_top),
                     body.max,
                 );
-                match sidebar::footer(ui, p, footer, &self.drives, self.theme_mode) {
+                let footer_drives = self.sidebar_footer_drives();
+                match sidebar::footer(ui, p, footer, &footer_drives, self.theme_mode) {
                     sidebar::FooterAction::Connect => actions.push(Action::OpenConnect),
                     sidebar::FooterAction::ToggleTheme => actions.push(Action::ToggleTheme),
                     sidebar::FooterAction::None => {}
@@ -8184,7 +8413,7 @@ impl NeutronApp {
                             ui,
                             p,
                             "Connect Google Drive",
-                            neutron_ui::icons::Glyph::Cloud,
+                            neutron_ui::icons::Glyph::GoogleDrive,
                         ) {
                             actions.push(Action::ConnectDrive);
                         }
@@ -8197,7 +8426,7 @@ impl NeutronApp {
                             ui,
                             p,
                             "Set up Google Drive",
-                            neutron_ui::icons::Glyph::Cloud,
+                            neutron_ui::icons::Glyph::GoogleDrive,
                             "Drive needs a Google OAuth client of your own. This creates google.json \
                              in Neutron's settings folder for its client_id and client_secret.",
                         ) {
@@ -8213,7 +8442,7 @@ impl NeutronApp {
                             ui,
                             p,
                             "Retry Google Drive",
-                            neutron_ui::icons::Glyph::Cloud,
+                            neutron_ui::icons::Glyph::GoogleDrive,
                             why,
                         ) {
                             actions.push(Action::ConnectDrive);
@@ -8232,6 +8461,15 @@ impl NeutronApp {
                             sidebar::RowHit::Open => actions.push(Action::Navigate(place.id.clone())),
                             sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(place.id.clone(), at)),
                             sidebar::RowHit::None | sidebar::RowHit::Eject => {}
+                    }
+                    if let Some(drives) = self.remote_drives.get(&site.id) {
+                        for drive in drives {
+                            match sidebar::remote_drive_row(ui, p, drive, current) {
+                                sidebar::RowHit::Open => actions.push(Action::Navigate(drive.id.clone())),
+                                sidebar::RowHit::Menu(at) => actions.push(Action::SidebarMenu(drive.id.clone(), at)),
+                                sidebar::RowHit::None | sidebar::RowHit::Eject => {}
+                            }
+                        }
                     }
                 }
                 if let Some(reason) = &self.sites_error {
@@ -8290,7 +8528,7 @@ impl NeutronApp {
                     }
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(14.0);
             });
     }
 
@@ -8580,10 +8818,12 @@ impl NeutronApp {
                 kind: neutron_core::places::PlaceKind::Server,
                 capacity: None,
             }));
+            let remote_groups = self.remote_drive_groups();
             if let Some(hit) = crate::dashboard::show(
                 ui,
                 p,
                 &self.drives,
+                &remote_groups,
                 &self.quick_access(),
                 &self.recent.files,
                 &elsewhere,

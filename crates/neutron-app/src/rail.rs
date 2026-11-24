@@ -24,10 +24,10 @@ use neutron_ui::icons::{self, Glyph};
 use neutron_ui::theme::{self, Palette};
 
 /// Width of the strip, including its padding.
-pub const WIDTH: f32 = 64.0;
+pub const WIDTH: f32 = 60.0;
 
 /// Height of one button: glyph, then its label, with room to breathe.
-const ITEM: f32 = 58.0;
+const ITEM: f32 = 50.0;
 
 /// Space between buttons within a group.
 const SPACING: f32 = 2.0;
@@ -222,44 +222,36 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
                     },
                 );
 
-                // Each verb sits in a soft well. Under the pointer the well
-                // lifts and its glyph takes the accent; an unavailable verb's
-                // well all but disappears and its glyph and label go faint.
+                // Borderless at rest; only hover lifts a soft well behind the glyph.
                 let well = egui::Rect::from_center_size(
-                    pos2(rect.center().x, rect.top() + 4.0 + 18.0),
-                    vec2(36.0, 36.0),
+                    pos2(rect.center().x, rect.top() + 2.0 + 16.0),
+                    vec2(32.0, 32.0),
                 );
                 let corners = egui::CornerRadius::same(theme::RADIUS_CONTROL);
                 let hovered = enabled && response.hovered();
                 if hovered {
-                    theme::paint_raised(ui.painter(), well, corners, p);
-                } else {
-                    ui.painter().rect_filled(
-                        well,
-                        corners,
-                        if enabled { p.inset } else { theme::with_alpha(p.inset, 120) },
-                    );
+                    ui.painter().rect_filled(well, corners, p.hover);
                 }
 
                 let (glyph_colour, text_colour) = if !enabled {
-                    (theme::with_alpha(p.text_faint, 130), theme::with_alpha(p.text_faint, 130))
+                    (theme::with_alpha(p.text_faint, 105), theme::with_alpha(p.text_faint, 105))
                 } else if hovered {
                     (p.accent, p.text)
                 } else {
-                    (p.text_soft(), p.text_soft())
+                    (p.text_soft(), p.text_faint)
                 };
 
                 icons::draw(ui.painter(), well.center(), item.glyph, glyph_colour);
 
                 let galley = ui.painter().layout_no_wrap(
                     item.label.to_owned(),
-                    theme::strong(ui.ctx(), 10.5),
+                    theme::strong(ui.ctx(), 10.0),
                     text_colour,
                 );
                 ui.painter().galley(
                     pos2(
                         (rect.center().x - galley.size().x / 2.0).round(),
-                        well.bottom() + 5.0,
+                        well.bottom() + 4.0,
                     ),
                     galley,
                     text_colour,

@@ -20,6 +20,15 @@ pub enum Continue {
     Stop,
 }
 
+/// A mounted volume reported by a remote host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteVolume {
+    pub name: String,
+    pub path: String,
+    pub total: u64,
+    pub free: u64,
+}
+
 /// One entry in a remote directory.
 ///
 /// Deliberately not [`neutron_core::Entry`]: the conversion needs to happen
@@ -181,6 +190,11 @@ pub trait Transport: Send {
     /// site so the next connection can check it.
     fn new_fingerprint(&self) -> Option<&str> {
         None
+    }
+
+    /// Queries mounted storage volumes on the server, when supported.
+    fn volumes(&mut self) -> Result<Vec<RemoteVolume>, RemoteError> {
+        Ok(Vec::new())
     }
 }
 

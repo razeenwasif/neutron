@@ -152,6 +152,8 @@ impl Sessions {
 /// the dialog may have added a site since, and clobbering it would lose a
 /// server the user just created.
 fn record_host_key(site_id: &str, fingerprint: &str) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut on_disk = match site::load() {
         Ok(sites) => sites,
         Err(e) => {

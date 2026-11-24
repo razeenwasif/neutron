@@ -21,8 +21,10 @@ use neutron_ui::theme::{self, Palette, ThemeMode, micro_caps};
 
 /// Height of a destination row.
 const ROW: f32 = 28.0;
-/// Room the footer needs: the storage card, a gap, the button row.
-const FOOTER_HEIGHT: f32 = 110.0;
+/// Height of an indented remote volume sub-row.
+const SUB_ROW: f32 = 25.0;
+/// Room the footer needs: top hairline, storage summary, gap, and button row.
+const FOOTER_HEIGHT: f32 = 104.0;
 
 /// The wordmark: the app's own icon and its name.
 pub fn brand(ui: &mut Ui, p: &Palette) {
@@ -186,9 +188,11 @@ pub fn drive_row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeI
     } else {
         (egui::FontId::proportional(13.5), p.text_soft())
     };
+    let is_remote_pin = place.kind == PlaceKind::KnownFolder && place.id.as_remote().is_some();
+    let right_reserve = if ejectable || selected || is_remote_pin { 64.0 } else { 48.0 };
     let mut job = egui::text::LayoutJob::simple_singleline(place.name.clone(), font, colour);
     job.wrap = egui::text::TextWrapping {
-        max_width: (rect.width() - 62.0).max(1.0),
+        max_width: (rect.width() - right_reserve).max(1.0),
         max_rows: 1,
         break_anywhere: true,
         overflow_character: Some('…'),
@@ -200,12 +204,28 @@ pub fn drive_row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeI
         colour,
     );
 
+    if is_remote_pin && !selected && !ejectable {
+        icons::draw_scaled(
+            ui.painter(),
+            pos2(rect.right() - 14.0, rect.center().y),
+            Glyph::Server,
+            p.text_faint,
+            0.7,
+        );
+    }
+
     if let Some(cap) = place.capacity {
         let free = neutron_ui::format::size(Some(cap.free));
         let total = neutron_ui::format::size(Some(cap.total));
         response
             .clone()
             .on_hover_text(format!("{free} free of {total}"));
+    } else if let Some((site, path)) = place.id.as_remote() {
+        if place.kind == PlaceKind::KnownFolder {
+            response
+                .clone()
+                .on_hover_text(format!("{site}: {path}"));
+        }
     }
 
     if ejectable {
@@ -230,6 +250,74 @@ pub fn drive_row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeI
     RowHit::of(&response, rect)
 }
 
+/// Compact indented volume row shown beneath a connected server.
+pub fn remote_drive_row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeId>) -> RowHit {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), SUB_ROW), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return RowHit::of(&response, rect);
+    }
+
+    let selected = current == Some(&place.id);
+    let corners = CornerRadius::same(theme::RADIUS_CONTROL);
+
+    if selected {
+        ui.painter().rect_filled(rect, corners, p.selection);
+        ui.painter().rect_stroke(
+            rect,
+            corners,
+            Stroke::new(1.0, theme::with_alpha(p.accent, 51)),
+            egui::StrokeKind::Inside,
+        );
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, corners, p.hover);
+    }
+
+    icons::draw_scaled(
+        ui.painter(),
+        pos2(rect.left() + 31.0, rect.center().y),
+        Glyph::Drive,
+        if selected { p.accent } else { p.text_faint },
+        0.82,
+    );
+
+    let (font, colour) = if selected {
+        (theme::strong(ui.ctx(), 12.5), p.text)
+    } else {
+        (egui::FontId::proportional(12.5), p.text_muted)
+    };
+    let mut job = egui::text::LayoutJob::simple_singleline(place.name.clone(), font, colour);
+    job.wrap = egui::text::TextWrapping {
+        max_width: (rect.width() - 94.0).max(1.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(
+        pos2(rect.left() + 47.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        colour,
+    );
+
+    if let Some(cap) = place.capacity {
+        let free = neutron_ui::format::size(Some(cap.free));
+        let total = neutron_ui::format::size(Some(cap.total));
+        let pct = (cap.used_fraction() * 100.0).round() as u32;
+        ui.painter().text(
+            pos2(rect.right() - 10.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{pct}%"),
+            egui::FontId::proportional(11.0),
+            if selected { p.accent } else { p.text_faint },
+        );
+        response
+            .clone()
+            .on_hover_text(format!("{free} free of {total}"));
+    }
+
+    RowHit::of(&response, rect)
+}
+
 /// The well-known Windows shell roots, by their parsing names.
 fn shell_glyph(place: &Place) -> Glyph {
     match place.id.parsing_name().unwrap_or_default() {
@@ -246,7 +334,7 @@ fn glyph_for(place: &Place) -> Glyph {
     }
     match place.kind {
         PlaceKind::Drive => Glyph::Drive,
-        PlaceKind::Cloud => Glyph::Cloud,
+        PlaceKind::Cloud => icons::cloud_glyph(&place.name),
         PlaceKind::Wsl => Glyph::Terminal,
         PlaceKind::Shell => shell_glyph(place),
         PlaceKind::Server => Glyph::Server,
@@ -278,11 +366,16 @@ pub enum FooterAction {
     ToggleTheme,
 }
 
-/// The storage card and, under it, Connect and the theme switch.
+/// The storage summary and, under it, Connect and the theme switch.
 pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: ThemeMode) -> FooterAction {
     let mut action = FooterAction::None;
 
-    let card = Rect::from_min_size(rect.min, vec2(rect.width(), 76.0));
+    ui.painter().line_segment(
+        [pos2(rect.left() - 10.0, rect.top()), pos2(rect.right() + 10.0, rect.top())],
+        Stroke::new(1.0, p.border),
+    );
+
+    let card = Rect::from_min_size(pos2(rect.left(), rect.top() + 8.0), vec2(rect.width(), 62.0));
     storage_card(ui, p, card, drives);
 
     let buttons = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 28.0), rect.max);
@@ -354,13 +447,10 @@ pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: Them
 /// one figure worth keeping in sight everywhere.
 fn storage_card(ui: &Ui, p: &Palette, rect: Rect, drives: &[Place]) {
     let painter = ui.painter();
-    let corners = CornerRadius::same(theme::RADIUS_WELL);
-    painter.rect_filled(rect, corners, p.inset);
-    painter.rect_stroke(rect, corners, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
 
     let Some((name, cap)) = drives.iter().find_map(|d| d.capacity.map(|c| (d.name.as_str(), c))) else {
         painter.text(
-            pos2(rect.left() + 12.0, rect.center().y),
+            pos2(rect.left() + 8.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             "Scanning volumes…",
             egui::FontId::proportional(11.5),
@@ -374,24 +464,24 @@ fn storage_card(ui: &Ui, p: &Palette, rect: Rect, drives: &[Place]) {
 
     let mut job = egui::text::LayoutJob::simple_singleline(name.to_owned(), theme::strong(ui.ctx(), 12.0), p.text_soft());
     job.wrap = egui::text::TextWrapping {
-        max_width: (rect.width() - 70.0).max(1.0),
+        max_width: (rect.width() - 56.0).max(1.0),
         max_rows: 1,
         break_anywhere: true,
         overflow_character: Some('…'),
     };
     let galley = painter.layout_job(job);
-    painter.galley(pos2(rect.left() + 12.0, rect.top() + 12.0), galley, p.text_soft());
+    painter.galley(pos2(rect.left() + 8.0, rect.top() + 4.0), galley, p.text_soft());
     painter.text(
-        pos2(rect.right() - 12.0, rect.top() + 19.0),
+        pos2(rect.right() - 8.0, rect.top() + 11.0),
         egui::Align2::RIGHT_CENTER,
         format!("{:.0}%", fraction * 100.0),
-        theme::strong(ui.ctx(), 12.0),
+        theme::strong(ui.ctx(), 11.5),
         p.text_muted,
     );
 
     let track = Rect::from_min_max(
-        pos2(rect.left() + 12.0, rect.top() + 34.0),
-        pos2(rect.right() - 12.0, rect.top() + 40.0),
+        pos2(rect.left() + 8.0, rect.top() + 26.0),
+        pos2(rect.right() - 8.0, rect.top() + 30.0),
     );
     painter.rect_filled(track, theme::pill(track.height()), p.inset);
     let fill = Rect::from_min_max(
@@ -403,14 +493,14 @@ fn storage_card(ui: &Ui, p: &Palette, rect: Rect, drives: &[Place]) {
     }
 
     painter.text(
-        pos2(rect.left() + 12.0, rect.bottom() - 15.0),
+        pos2(rect.left() + 8.0, rect.bottom() - 10.0),
         egui::Align2::LEFT_CENTER,
         format!(
             "{} free of {}",
             neutron_ui::format::size(Some(cap.free)),
             neutron_ui::format::size(Some(cap.total))
         ),
-        egui::FontId::proportional(11.5),
+        egui::FontId::proportional(11.0),
         p.text_faint,
     );
 }
@@ -441,7 +531,7 @@ pub fn tag_row(ui: &mut Ui, p: &Palette, name: &str, color: u8, selected: bool) 
     if !ui.is_rect_visible(rect) {
         return RowHit::of(&response, rect);
     }
-    let corners = CornerRadius::same(12);
+    let corners = CornerRadius::same(theme::RADIUS_CONTROL);
     if selected {
         ui.painter().rect_filled(rect, corners, p.selection);
         ui.painter().rect_stroke(
@@ -467,10 +557,16 @@ pub fn action_row_with_hint(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph,
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
 
     if response.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::same(12), p.hover);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(theme::RADIUS_CONTROL), p.hover);
     }
 
-    icons::draw(ui.painter(), pos2(rect.left() + 19.0, rect.center().y), glyph, p.accent);
+    icons::draw(
+        ui.painter(),
+        pos2(rect.left() + 19.0, rect.center().y),
+        glyph,
+        if response.hovered() { p.text } else { p.text_faint },
+    );
     ui.painter().text(
         pos2(rect.left() + 39.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -506,7 +602,11 @@ mod tests {
         assert_eq!(glyph_for(&place("Downloads", PlaceKind::KnownFolder)), Glyph::Download);
         assert_eq!(glyph_for(&place("Research", PlaceKind::KnownFolder)), Glyph::Folder);
         assert_eq!(glyph_for(&place("C:", PlaceKind::Drive)), Glyph::Drive);
-        assert_eq!(glyph_for(&place("OneDrive", PlaceKind::Cloud)), Glyph::Cloud);
+        assert_eq!(glyph_for(&place("OneDrive", PlaceKind::Cloud)), Glyph::OneDrive);
+        assert_eq!(glyph_for(&place("iCloud Drive", PlaceKind::Cloud)), Glyph::ICloud);
+        assert_eq!(glyph_for(&place("ProtonDrive", PlaceKind::Cloud)), Glyph::ProtonDrive);
+        assert_eq!(glyph_for(&place("GoogleDrive", PlaceKind::Cloud)), Glyph::GoogleDrive);
+        assert_eq!(glyph_for(&place("Nextcloud", PlaceKind::Cloud)), Glyph::Cloud);
         assert_eq!(glyph_for(&place("Ubuntu-24.04", PlaceKind::Wsl)), Glyph::Terminal);
         let dashboard = Place { id: NodeId::Home, ..place("Dashboard", PlaceKind::KnownFolder) };
         assert_eq!(glyph_for(&dashboard), Glyph::Dashboard);

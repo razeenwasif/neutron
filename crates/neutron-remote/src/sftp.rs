@@ -37,7 +37,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::hostkey::{self, Decision};
 use crate::path;
 use crate::site::{Auth, Site};
-use crate::transport::{CHUNK, CONNECT_TIMEOUT, Continue, RemoteEntry, RemoteError, Transport};
+use crate::transport::{CHUNK, CONNECT_TIMEOUT, Continue, RemoteEntry, RemoteError, RemoteVolume, Transport};
 
 /// A connected SFTP session, and the runtime driving it.
 pub struct SftpTransport {
@@ -459,11 +459,12 @@ impl Transport for SftpTransport {
         refused: &mut Vec<String>,
     ) -> Result<Vec<RemoteEntry>, RemoteError> {
         let path = path::normalize(path);
+        let dir_path = sftp_dir_path(&path);
         let address = self.address.clone();
 
         let read = self
             .runtime
-            .block_on(self.session.read_dir(path.clone()))
+            .block_on(self.session.read_dir(dir_path))
             .map_err(|e| RemoteError::Server {
                 path: path.clone(),
                 reason: describe(&address, &e),
@@ -644,6 +645,209 @@ impl Transport for SftpTransport {
     fn new_fingerprint(&self) -> Option<&str> {
         self.new_fingerprint.as_deref()
     }
+
+    fn volumes(&mut self) -> Result<Vec<RemoteVolume>, RemoteError> {
+        let posix_cmd = r#"sh -c 'sys=$(uname -s 2>/dev/null); if [ "$sys" = "Darwin" ] || [ "$sys" = "Linux" ]; then df -kP / 2>/dev/null; for v in /Volumes/* /mnt/* /media/*/*; do [ -d "$v" ] && [ ! -L "$v" ] && df -kP "$v" 2>/dev/null; done; fi; true'"#;
+        let stdout = self
+            .exec_command(posix_cmd, std::time::Duration::from_secs(6))
+            .unwrap_or_default();
+        let posix_vols = parse_df_volumes(&stdout);
+        if !posix_vols.is_empty() {
+            return Ok(posix_vols);
+        }
+
+        // Windows OpenSSH hosts default to cmd.exe and report drive letters via PowerShell.
+        let win_cmd = r#"powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_LogicalDisk | Where-Object { $_.Size -gt 0 } | ForEach-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.DeviceID, $_.VolumeName, $_.DriveType, $_.Size, $_.FreeSpace }""#;
+        let win_out = self.exec_command(win_cmd, std::time::Duration::from_secs(10))?;
+        Ok(parse_windows_volumes(&win_out))
+    }
+}
+
+impl SftpTransport {
+    fn exec_command(&mut self, cmd: &str, timeout: std::time::Duration) -> Result<String, RemoteError> {
+        let address = self.address.clone();
+        let timeout_address = self.address.clone();
+        let ssh = &self._ssh;
+        let cmd = cmd.to_owned();
+
+        self.runtime.block_on(async move {
+            tokio::time::timeout(timeout, async move {
+                let mut channel = ssh.channel_open_session().await.map_err(|e| RemoteError::Connect {
+                    address: address.clone(),
+                    reason: e.to_string(),
+                })?;
+                channel.exec(true, cmd.as_bytes()).await.map_err(|e| RemoteError::Connect {
+                    address: address.clone(),
+                    reason: e.to_string(),
+                })?;
+                let mut out = Vec::new();
+                while let Some(msg) = channel.wait().await {
+                    match msg {
+                        russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                        russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                        _ => {}
+                    }
+                }
+                Ok::<String, RemoteError>(String::from_utf8_lossy(&out).into_owned())
+            })
+            .await
+            .map_err(|_| RemoteError::Connect {
+                address: timeout_address,
+                reason: "timed out querying remote host".to_owned(),
+            })?
+        })
+    }
+}
+
+/// Appends `/` to normalized Windows SFTP drive roots like `"/C:"` -> `"/C:/"`
+/// because Windows OpenSSH expects a trailing slash to list a drive's root.
+pub(crate) fn sftp_dir_path(normalized: &str) -> String {
+    let bytes = normalized.as_bytes();
+    if bytes.len() == 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        format!("{normalized}/")
+    } else {
+        normalized.to_owned()
+    }
+}
+
+/// Parses POSIX `df -kP` lines into sorted, deduplicated remote volumes,
+/// skipping OS virtual/recovery mounts.
+pub(crate) fn parse_df_volumes(stdout: &str) -> Vec<RemoteVolume> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("Filesystem") {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let Some(pct_idx) = tokens.iter().position(|t| t.ends_with('%')) else {
+            continue;
+        };
+        if pct_idx < 4 || pct_idx + 1 >= tokens.len() {
+            continue;
+        }
+        let Ok(blocks_1k) = tokens[pct_idx - 3].parse::<u64>() else {
+            continue;
+        };
+        let Ok(avail_1k) = tokens[pct_idx - 1].parse::<u64>() else {
+            continue;
+        };
+        // Rejoin mount path from the original slice so spaces inside volume
+        // names are preserved without collapsing or losing trailing parts.
+        let mount = tokens[pct_idx + 1..].join(" ");
+        if mount.is_empty() || !seen.insert(mount.clone()) {
+            continue;
+        }
+        if mount.starts_with("/System/Volumes")
+            || mount.starts_with("/Volumes/Recovery")
+            || mount.starts_with("/dev")
+            || mount.starts_with("/private")
+            || mount.starts_with("/mnt/wsl")
+        {
+            continue;
+        }
+        if blocks_1k == 0 {
+            continue;
+        }
+
+        let name = if mount == "/" {
+            "Internal SSD".to_owned()
+        } else if let Some(rest) = mount.strip_prefix("/Volumes/") {
+            if rest.is_empty() {
+                continue;
+            }
+            rest.to_owned()
+        } else {
+            mount
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or(&mount)
+                .to_owned()
+        };
+
+        out.push(RemoteVolume {
+            name,
+            path: mount,
+            total: blocks_1k.saturating_mul(1024),
+            free: avail_1k.saturating_mul(1024),
+        });
+    }
+
+    out.sort_by(|a, b| match (a.path == "/", b.path == "/") {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+    out
+}
+
+/// Parses pipe-delimited `Win32_LogicalDisk` lines into sorted remote volumes.
+pub(crate) fn parse_windows_volumes(stdout: &str) -> Vec<RemoteVolume> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split('|').collect();
+        if parts.len() != 5 {
+            continue;
+        }
+        let device = parts[0].trim();
+        let bytes = device.as_bytes();
+        if bytes.len() != 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+            continue;
+        }
+        let upper = device.to_ascii_uppercase();
+        if !seen.insert(upper.clone()) {
+            continue;
+        }
+        let label = parts[1].trim();
+        let dtype = parts[2].trim().parse::<u32>().unwrap_or(0);
+        if dtype == 5 {
+            // Optical / CD-ROM drive
+            continue;
+        }
+        let Ok(total) = parts[3].trim().parse::<u64>() else {
+            continue;
+        };
+        if total == 0 {
+            continue;
+        }
+        let free = parts[4].trim().parse::<u64>().unwrap_or(0);
+
+        let name = if !label.is_empty() {
+            format!("{label} ({upper})")
+        } else if upper == "C:" {
+            "Local Disk (C:)".to_owned()
+        } else if dtype == 2 {
+            format!("External Drive ({upper})")
+        } else {
+            format!("Drive ({upper})")
+        };
+
+        out.push(RemoteVolume {
+            name,
+            path: format!("/{upper}/"),
+            total,
+            free,
+        });
+    }
+
+    out.sort_by(|a, b| match (a.path == "/C:/", b.path == "/C:/") {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.path.cmp(&b.path),
+    });
+    out
 }
 
 /// Turns an SFTP status into something worth reading.
@@ -690,5 +894,58 @@ mod tests {
             matches!(error, crate::transport::RemoteError::Auth { .. }),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn parse_df_volumes_extracts_internal_and_external_ssds_and_skips_recovery() {
+        let sample = "Filesystem     1024-blocks      Used Available Capacity  Mounted on
+/dev/disk3s1s1   239311296  13433660  33790060    29%    /
+Filesystem     1024-blocks      Used Available Capacity  Mounted on
+/dev/disk4s2     234216576 128555520 105661056    55%    /Volumes/MAC-ARCHIVE
+/dev/disk3s3     239311296   1938692  33790060     6%    /Volumes/Recovery
+/dev/disk5s1     100000000  20000000  80000000    20%    /Volumes/My Backup Drive
+";
+        let vols = super::parse_df_volumes(sample);
+        assert_eq!(vols.len(), 3);
+        assert_eq!(vols[0].name, "Internal SSD");
+        assert_eq!(vols[0].path, "/");
+        assert_eq!(vols[0].total, 239311296 * 1024);
+        assert_eq!(vols[0].free, 33790060 * 1024);
+
+        assert_eq!(vols[1].name, "MAC-ARCHIVE");
+        assert_eq!(vols[1].path, "/Volumes/MAC-ARCHIVE");
+
+        assert_eq!(vols[2].name, "My Backup Drive");
+        assert_eq!(vols[2].path, "/Volumes/My Backup Drive");
+    }
+
+    #[test]
+    fn parse_windows_volumes_formats_internal_and_external_drives() {
+        let sample = "D:|FastArchive|3|4000787030016|2100000000000
+C:||3|1999299932160|199216619520
+E:||2|500107862016|310000000000
+F:|Disc|5|700000000|0
+";
+        let vols = super::parse_windows_volumes(sample);
+        assert_eq!(vols.len(), 3);
+        assert_eq!(vols[0].name, "Local Disk (C:)");
+        assert_eq!(vols[0].path, "/C:/");
+        assert_eq!(vols[0].total, 1999299932160);
+        assert_eq!(vols[0].free, 199216619520);
+
+        assert_eq!(vols[1].name, "FastArchive (D:)");
+        assert_eq!(vols[1].path, "/D:/");
+
+        assert_eq!(vols[2].name, "External Drive (E:)");
+        assert_eq!(vols[2].path, "/E:/");
+    }
+
+    #[test]
+    fn sftp_dir_path_appends_slash_only_for_windows_drive_roots() {
+        assert_eq!(super::sftp_dir_path("/C:"), "/C:/");
+        assert_eq!(super::sftp_dir_path("/d:"), "/d:/");
+        assert_eq!(super::sftp_dir_path("/C:/Users"), "/C:/Users");
+        assert_eq!(super::sftp_dir_path("/Users/razeen"), "/Users/razeen");
+        assert_eq!(super::sftp_dir_path("/"), "/");
     }
 }

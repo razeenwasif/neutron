@@ -26,17 +26,44 @@ use serde::{Deserialize, Serialize};
 /// becomes a second file listing to read.
 pub const MAX: usize = 24;
 
+/// A folder on a saved remote server pinned to the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemotePin {
+    pub site: String,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Pins {
     #[serde(default)]
     pub folders: Vec<PathBuf>,
+    #[serde(default)]
+    pub remote: Vec<RemotePin>,
     /// Bumped by every change, so a stale save cannot overwrite a newer one.
     /// See `crate::persist`.
     #[serde(skip)]
     pub revision: u64,
 }
 
+fn normalize_remote_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 impl Pins {
+    pub fn total_len(&self) -> usize {
+        self.folders.len() + self.remote.len()
+    }
+
+    pub fn contains_remote(&self, site: &str, path: &str) -> bool {
+        let norm = normalize_remote_path(path);
+        self.remote.iter().any(|r| r.site == site && normalize_remote_path(&r.path) == norm)
+    }
+
     /// Adds `path`, or removes it if it is already pinned. Returns what
     /// happened, so the caller can say so.
     pub fn toggle(&mut self, path: &Path) -> Toggled {
@@ -45,12 +72,38 @@ impl Pins {
             self.revision += 1;
             return Toggled::Unpinned;
         }
-        if self.folders.len() >= MAX {
+        if self.total_len() >= MAX {
             return Toggled::Full;
         }
         // Newest first: a pin made just now is the one most likely to be
         // wanted next, and the list is read from the top.
         self.folders.insert(0, path.to_path_buf());
+        self.revision += 1;
+        Toggled::Pinned
+    }
+
+    /// Adds or removes a remote folder pin `(site, path)`.
+    pub fn toggle_remote(&mut self, site: &str, path: &str) -> Toggled {
+        let norm = normalize_remote_path(path);
+        if let Some(at) = self
+            .remote
+            .iter()
+            .position(|r| r.site == site && normalize_remote_path(&r.path) == norm)
+        {
+            self.remote.remove(at);
+            self.revision += 1;
+            return Toggled::Unpinned;
+        }
+        if self.total_len() >= MAX {
+            return Toggled::Full;
+        }
+        self.remote.insert(
+            0,
+            RemotePin {
+                site: site.to_owned(),
+                path: norm,
+            },
+        );
         self.revision += 1;
         Toggled::Pinned
     }
@@ -192,5 +245,32 @@ mod tests {
         let text = serde_json::to_string(&pins).expect("serialise");
         let back = parse(&text).expect("parse");
         assert_eq!(back.folders, pins.folders);
+        assert!(back.remote.is_empty());
+    }
+
+    #[test]
+    fn remote_pins_toggle_round_trip_and_share_cap() {
+        let mut pins = parse(r#"{"folders":["/a"]}"#).expect("legacy json without remote");
+        assert!(pins.remote.is_empty());
+
+        assert_eq!(pins.toggle_remote("kagutsuchi", "/Users/razeenwasif/Code/"), Toggled::Pinned);
+        assert!(pins.contains_remote("kagutsuchi", "/Users/razeenwasif/Code"));
+        assert_eq!(pins.toggle_remote("kagutsuchi", "/"), Toggled::Pinned);
+        assert!(pins.contains_remote("kagutsuchi", "/"));
+
+        let text = serde_json::to_string(&pins).expect("serialise");
+        let back = parse(&text).expect("parse");
+        assert_eq!(back.remote, pins.remote);
+
+        assert_eq!(pins.toggle_remote("kagutsuchi", "/Users/razeenwasif/Code"), Toggled::Unpinned);
+        assert!(!pins.contains_remote("kagutsuchi", "/Users/razeenwasif/Code"));
+
+        // Shared cap with local pins.
+        let mut capped = Pins::default();
+        for i in 0..(MAX - 1) {
+            assert_eq!(capped.toggle(&p(&format!("/f{i}"))), Toggled::Pinned);
+        }
+        assert_eq!(capped.toggle_remote("mini", "/srv"), Toggled::Pinned);
+        assert_eq!(capped.toggle_remote("mini", "/data"), Toggled::Full);
     }
 }
