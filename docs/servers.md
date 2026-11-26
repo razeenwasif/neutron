@@ -124,3 +124,23 @@ The FTP client logs whether the server offered `MLSD` — the machine-readable
 listing — and falls back to parsing `LIST` when it does not. `LIST` has no
 specification, so an entry that looks wrong on an unusual server is worth
 reporting with the log line beside it.
+
+## Remote storage & dual-boot hosts
+
+Connected SFTP servers automatically report their internal and external storage
+volumes in the sidebar and on the Dashboard (`<Server> · Storage`):
+
+- **macOS & Linux hosts:** Probed via POSIX `df -kP` across `/`, `/Volumes/*`,
+  `/mnt/*`, `/media/*/*`, and `/run/media/*/*` (skipping system/recovery mounts
+  such as `/System/Volumes`, `/Volumes/Recovery`, `/boot`, `/snap`, and
+  `/run/user`).
+- **Windows hosts:** Enumerated quickly with `fsutil fsinfo drives`, then probed
+  per drive (`fsutil fsinfo drivetype`, `vol`, `fsutil volume diskfree`) under
+  an independent 2-second timeout per drive so an unresponsive removable reader
+  never stalls `C:` or healthy external SSDs.
+- **Pinning & live refresh:** Remote folders can be pinned to the sidebar
+  **Pinned** section (`⌥⌘T` / context menu). Neutron re-probes SFTP storage
+  every 60 seconds in the background and immediately on **Refresh** (`⌘R` /
+  `F5`) from the Dashboard or a remote pane, clearing stale volumes whenever a
+  host goes offline — so a dual-boot machine configured with separate Windows and
+  Linux entries in `sites.json` displays only whichever OS is currently booted.

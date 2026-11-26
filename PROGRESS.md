@@ -694,3 +694,18 @@ instructions named a filesystem tool.
   code but no dependency.
 - Cold start and memory unchanged at ~416ms and ~499 MB private, both of which
   are GPU bring-up and neither of which this touched.
+
+---
+
+### Milestone 9 — Stratus UI Redesign, Lucide Rail Icons & Dual-Boot SFTP Storage (2026-11-26)
+
+1. **Stratus borderless UI (`ThemeMode::Stratus`):**
+   - Made Stratus the default theme across `neutron-ui` and `neutron-app` (`#000000` canvas, `#030304` sidebar, `#0B0B0E` tonal cards, `#111114` hover, `#16161B` neutral active pills, `#7A89FF` accent) and removed chrome borders across the sidebar, header, file list, columns view, quick preview, and dashboard.
+2. **Action rail Lucide icons:**
+   - Replaced custom line-drawn glyphs on the vertical action rail (`Copy`, `Cut`, `Paste`, `Rename`, `Trash`, `Folder`, `Extract`, `Zip`) with pre-rasterised `64×64` anti-aliased RGBA masks generated from Lucide SVGs (`assets/rail/*.rgba`), cached via `TextureOptions::LINEAR` and dynamically theme-tinted.
+3. **Resilient multi-OS SFTP drive discovery & dual-boot support:**
+   - Extended POSIX volume discovery in `crates/neutron-remote/src/sftp.rs` to cover `/run/media/*/*` and filter Linux `/boot`, `/snap`, and `/run/user` mounts.
+   - Replaced blocking Windows WMI/PowerShell enumeration with `fsutil fsinfo drives` + per-drive `fsutil fsinfo drivetype` / `vol` / `fsutil volume diskfree` calls bounded by 2-second per-drive timeouts so stalled card readers cannot hide `C:` or external drives.
+   - Added automatic 60-second background and `Cmd+R`/`F5` manual re-probing in `crates/neutron-app/src/app.rs`, clearing offline OS drives cleanly when a dual-boot host switches between Windows and Linux.
+4. **Verification:**
+   - Workspace test suite passes with **904 passed, 0 failed, 11 ignored** (`cargo test --workspace`), including new Linux `df` and Windows `fsutil` parser unit tests.

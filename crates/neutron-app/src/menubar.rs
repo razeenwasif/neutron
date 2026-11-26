@@ -77,6 +77,7 @@ pub enum Cmd {
     SplitDown,
     AddressBar,
     ToggleTheme,
+    ThemeStratus,
     ThemeObsidian,
     ThemeFlux,
     ThemeFairy,
@@ -116,7 +117,7 @@ impl Cmd {
         Cmd::AsColumns, Cmd::AsGallery, Cmd::SortName, Cmd::SortKind, Cmd::SortModified, Cmd::SortCreated,
         Cmd::SortSize, Cmd::SortAdded, Cmd::SortOpened, Cmd::GroupNone, Cmd::GroupKind, Cmd::GroupModified,
         Cmd::GroupAdded, Cmd::GroupOpened, Cmd::GroupSize, Cmd::ShowPreview, Cmd::ShowHidden, Cmd::AllSizes, Cmd::ToggleSidebar, Cmd::ToggleToolbar, Cmd::SplitRight, Cmd::SplitDown,
-        Cmd::AddressBar, Cmd::ToggleTheme, Cmd::ThemeObsidian, Cmd::ThemeFlux, Cmd::ThemeFairy, Cmd::ThemeAura, Cmd::ThemeGruvbox, Cmd::ThemeLight, Cmd::Back, Cmd::Forward, Cmd::Enclosing,
+        Cmd::AddressBar, Cmd::ToggleTheme, Cmd::ThemeStratus, Cmd::ThemeObsidian, Cmd::ThemeFlux, Cmd::ThemeFairy, Cmd::ThemeAura, Cmd::ThemeGruvbox, Cmd::ThemeLight, Cmd::Back, Cmd::Forward, Cmd::Enclosing,
         Cmd::Dashboard, Cmd::Home, Cmd::Desktop, Cmd::Documents, Cmd::Downloads,
         Cmd::Applications, Cmd::Trash, Cmd::GoToFolder, Cmd::Connect, Cmd::AirDrop,
         Cmd::Terminal, Cmd::AskClaude, Cmd::AskAntigravity, Cmd::NextTab, Cmd::PreviousTab, Cmd::NextPane,
@@ -247,6 +248,7 @@ pub fn menus() -> Vec<Menu> {
         Entry::Submenu {
             title: "Theme".into(),
             entries: vec![
+                item(Cmd::ThemeStratus, "Stratus", None),
                 item(Cmd::ThemeObsidian, "Obsidian", None),
                 item(Cmd::ThemeFlux, "Flux", None),
                 item(Cmd::ThemeFairy, "Fairy", None),

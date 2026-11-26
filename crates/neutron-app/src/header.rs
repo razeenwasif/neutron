@@ -125,7 +125,6 @@ pub fn show(
     // so "Alt+↑" reached the screen as "Alt+ □".
     // Back, forward and up share a well: one control for moving about.
     let group_rect = Rect::from_min_size(pos2(nav.left() + 6.0, nav.center().y - 15.0), vec2(96.0, 30.0));
-    theme::paint_well(ui.painter(), group_rect, egui::CornerRadius::same(theme::RADIUS_WELL), p);
     let mut x = group_rect.left() + 3.0;
     for (glyph, enabled, act, tip) in [
         (
@@ -247,18 +246,14 @@ pub fn show(
     }
 
     // --- large title ---
-    let bottom = if show_title {
+    if show_title {
         let row = Rect::from_min_size(
             pos2(full.left(), nav.bottom()),
             vec2(full.width(), TITLE_ROW),
         );
         ui.advance_cursor_after_rect(row);
         draw_title(ui, p, row, h);
-        row.bottom()
-    } else {
-        nav.bottom()
-    };
-    ui.painter().hline(full.x_range(), bottom - 0.5, egui::Stroke::new(1.0, p.border));
+    }
 
     action
 }
@@ -400,13 +395,7 @@ fn address_field(
     let id = address_id(group);
     let mut text = current.to_owned();
 
-    ui.painter().rect(
-        rect,
-        RADIUS_CONTROL as f32,
-        p.inset,
-        egui::Stroke::new(1.0, p.accent),
-        egui::StrokeKind::Inside,
-    );
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(theme::RADIUS_WELL), p.card_hover);
 
     let text_rect = Rect::from_min_max(
         pos2(rect.left() + 10.0, rect.top()),
@@ -465,20 +454,10 @@ fn filter_field(
     let mut text = current.to_owned();
     let has_focus = ui.memory(|m| m.has_focus(id));
 
-    // A pill-shaped well; focused, a soft ring of the accent around it.
+    // Stratus BorderlessSearchField: tonal fill with zero borders.
     let corners = egui::CornerRadius::same(theme::RADIUS_WELL);
-    if has_focus {
-        ui.painter().rect_filled(rect.expand(2.0), egui::CornerRadius::same(theme::RADIUS_WELL + 2), theme::with_alpha(p.accent, 20));
-    }
-    theme::paint_well(ui.painter(), rect, corners, p);
-    if has_focus {
-        ui.painter().rect_stroke(
-            rect,
-            corners,
-            egui::Stroke::new(1.0, theme::with_alpha(p.accent, 56)),
-            egui::StrokeKind::Inside,
-        );
-    }
+    ui.painter()
+        .rect_filled(rect, corners, if has_focus { p.raised } else { p.card_hover });
     icons::draw(
         ui.painter(),
         pos2(rect.left() + 18.0, rect.center().y),

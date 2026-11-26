@@ -647,7 +647,7 @@ impl Transport for SftpTransport {
     }
 
     fn volumes(&mut self) -> Result<Vec<RemoteVolume>, RemoteError> {
-        let posix_cmd = r#"sh -c 'sys=$(uname -s 2>/dev/null); if [ "$sys" = "Darwin" ] || [ "$sys" = "Linux" ]; then df -kP / 2>/dev/null; for v in /Volumes/* /mnt/* /media/*/*; do [ -d "$v" ] && [ ! -L "$v" ] && df -kP "$v" 2>/dev/null; done; fi; true'"#;
+        let posix_cmd = r#"sh -c 'sys=$(uname -s 2>/dev/null); if [ "$sys" = "Darwin" ] || [ "$sys" = "Linux" ]; then df -kP / 2>/dev/null; for v in /Volumes/* /mnt/* /media/*/* /run/media/*/*; do [ -d "$v" ] && [ ! -L "$v" ] && df -kP "$v" 2>/dev/null; done; fi; true'"#;
         let stdout = self
             .exec_command(posix_cmd, std::time::Duration::from_secs(6))
             .unwrap_or_default();
@@ -656,10 +656,29 @@ impl Transport for SftpTransport {
             return Ok(posix_vols);
         }
 
-        // Windows OpenSSH hosts default to cmd.exe and report drive letters via PowerShell.
-        let win_cmd = r#"powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_LogicalDisk | Where-Object { $_.Size -gt 0 } | ForEach-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.DeviceID, $_.VolumeName, $_.DriveType, $_.Size, $_.FreeSpace }""#;
-        let win_out = self.exec_command(win_cmd, std::time::Duration::from_secs(10))?;
-        Ok(parse_windows_volumes(&win_out))
+        // Windows OpenSSH hosts default to cmd.exe. Enumerate drive letters
+        // quickly first and query each drive independently with a short
+        // timeout so an unresponsive removable reader never stalls healthy SSDs.
+        let drives_out = self
+            .exec_command("fsutil fsinfo drives", std::time::Duration::from_secs(4))
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for letter in parse_fsutil_drives(&drives_out).into_iter().take(12) {
+            let cmd = format!(
+                "fsutil fsinfo drivetype {letter}: & vol {letter}: & fsutil volume diskfree {letter}:"
+            );
+            if let Ok(drive_out) = self.exec_command(&cmd, std::time::Duration::from_secs(2)) {
+                if let Some(vol) = parse_fsutil_volume(letter, &drive_out) {
+                    out.push(vol);
+                }
+            }
+        }
+        out.sort_by(|a, b| match (a.path == "/C:/", b.path == "/C:/") {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+        Ok(out)
     }
 }
 
@@ -680,6 +699,7 @@ impl SftpTransport {
                     address: address.clone(),
                     reason: e.to_string(),
                 })?;
+                let _ = channel.eof().await;
                 let mut out = Vec::new();
                 while let Some(msg) = channel.wait().await {
                     match msg {
@@ -749,6 +769,10 @@ pub(crate) fn parse_df_volumes(stdout: &str) -> Vec<RemoteVolume> {
             || mount.starts_with("/dev")
             || mount.starts_with("/private")
             || mount.starts_with("/mnt/wsl")
+            || mount == "/boot"
+            || mount.starts_with("/boot/")
+            || mount.starts_with("/snap/")
+            || mount.starts_with("/run/user/")
         {
             continue;
         }
@@ -787,7 +811,99 @@ pub(crate) fn parse_df_volumes(stdout: &str) -> Vec<RemoteVolume> {
     out
 }
 
+/// Extracts sorted unique drive letters from `fsutil fsinfo drives` output.
+pub(crate) fn parse_fsutil_drives(stdout: &str) -> Vec<char> {
+    let mut seen = std::collections::BTreeSet::new();
+    for token in stdout.split(|c: char| c.is_whitespace() || c == '\0') {
+        let trimmed = token.trim_end_matches(['\\', '/']);
+        let bytes = trimmed.as_bytes();
+        if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            seen.insert((bytes[0] as char).to_ascii_uppercase());
+        }
+    }
+    seen.into_iter().collect()
+}
+
+fn parse_fsutil_bytes(line: &str) -> Option<u64> {
+    let (_, rhs) = line.split_once(':')?;
+    let num_token = rhs.split_whitespace().next()?;
+    let digits: String = num_token.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// Parses combined `fsutil fsinfo drivetype <X>: & vol <X>: & fsutil volume diskfree <X>:`
+/// output for one Windows drive letter.
+pub(crate) fn parse_fsutil_volume(letter: char, stdout: &str) -> Option<RemoteVolume> {
+    let letter = letter.to_ascii_uppercase();
+    let drive_prefix = format!("{}:", letter.to_ascii_lowercase());
+    let mut is_removable = false;
+    let mut label = String::new();
+    let mut total = 0u64;
+    let mut free = 0u64;
+
+    for raw_line in stdout.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with(&drive_prefix) {
+            if lower.contains("cd-rom")
+                || lower.contains("no such root")
+                || lower.contains("unknown drive")
+            {
+                return None;
+            }
+            if lower.contains("removable") {
+                is_removable = true;
+            }
+            continue;
+        }
+        if trimmed.starts_with("Volume in drive ") {
+            if let Some((_, rest)) = trimmed.split_once(" is ") {
+                label = rest.trim().to_owned();
+            }
+            continue;
+        }
+        if lower.starts_with("total bytes") || lower.starts_with("total # of bytes") {
+            if let Some(bytes) = parse_fsutil_bytes(trimmed) {
+                total = bytes;
+            }
+        } else if lower.starts_with("total free bytes") || lower.starts_with("total # of free bytes")
+        {
+            if let Some(bytes) = parse_fsutil_bytes(trimmed) {
+                free = bytes;
+            }
+        }
+    }
+
+    if total == 0 {
+        return None;
+    }
+
+    let name = if !label.is_empty() {
+        format!("{label} ({letter}:)")
+    } else if letter == 'C' {
+        "Internal SSD (C:)".to_owned()
+    } else if is_removable {
+        format!("External Drive ({letter}:)")
+    } else {
+        format!("Local Disk ({letter}:)")
+    };
+
+    Some(RemoteVolume {
+        name,
+        path: format!("/{letter}:/"),
+        total,
+        free,
+    })
+}
+
 /// Parses pipe-delimited `Win32_LogicalDisk` lines into sorted remote volumes.
+#[cfg(test)]
 pub(crate) fn parse_windows_volumes(stdout: &str) -> Vec<RemoteVolume> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -938,6 +1054,64 @@ F:|Disc|5|700000000|0
 
         assert_eq!(vols[2].name, "External Drive (E:)");
         assert_eq!(vols[2].path, "/E:/");
+    }
+
+    #[test]
+    fn parse_df_volumes_handles_linux_run_media_and_skips_boot() {
+        let sample = "Filesystem     1024-blocks      Used Available Capacity  Mounted on
+/dev/nvme0n1p2  1920000000 500000000 1320000000    28%    /
+/dev/nvme0n1p1     1048576     100000    948576    10%    /boot/efi
+/dev/nvme1n1p1  3900000000 1000000000 2700000000   28%    /run/media/razeen/SamsungSSD
+/dev/sda1       1950000000  200000000 1650000000   11%    /mnt/games
+";
+        let vols = super::parse_df_volumes(sample);
+        assert_eq!(vols.len(), 3);
+        assert_eq!(vols[0].name, "Internal SSD");
+        assert_eq!(vols[0].path, "/");
+        assert_eq!(vols[1].name, "games");
+        assert_eq!(vols[1].path, "/mnt/games");
+        assert_eq!(vols[2].name, "SamsungSSD");
+        assert_eq!(vols[2].path, "/run/media/razeen/SamsungSSD");
+    }
+
+    #[test]
+    fn parse_fsutil_drives_and_volumes_handle_fixed_removable_and_optical() {
+        let drives = "Drives: C:\\ D:\\ E:\\ F:\\ H:\\\0";
+        assert_eq!(super::parse_fsutil_drives(drives), vec!['C', 'D', 'E', 'F', 'H']);
+
+        let c_out = "C: - Fixed Drive
+ Volume in drive C has no label.
+ Volume Serial Number is 7601-4BDE
+Total free bytes                :   182,314,106,880 (169.8 GB)
+Total bytes                     : 1,999,299,932,160 (  1.8 TB)
+";
+        let c_vol = super::parse_fsutil_volume('C', c_out).expect("C: should parse");
+        assert_eq!(c_vol.name, "Internal SSD (C:)");
+        assert_eq!(c_vol.path, "/C:/");
+        assert_eq!(c_vol.total, 1_999_299_932_160);
+        assert_eq!(c_vol.free, 182_314_106_880);
+
+        let d_out = "D: - Fixed Drive
+ Volume in drive D is FastArchive
+Total free bytes                : 2,100,000,000,000 (1.9 TB)
+Total bytes                     : 4,000,787,030,016 (3.6 TB)
+";
+        let d_vol = super::parse_fsutil_volume('D', d_out).expect("D: should parse");
+        assert_eq!(d_vol.name, "FastArchive (D:)");
+        assert_eq!(d_vol.path, "/D:/");
+
+        let e_out = "E: - Removable Drive
+ Volume in drive E has no label.
+Total free bytes                : 310,000,000,000 (288.7 GB)
+Total bytes                     : 500,107,862,016 (465.7 GB)
+";
+        let e_vol = super::parse_fsutil_volume('E', e_out).expect("E: should parse");
+        assert_eq!(e_vol.name, "External Drive (E:)");
+
+        let f_out = "F: - CD-ROM Drive
+The device is not ready.
+";
+        assert!(super::parse_fsutil_volume('F', f_out).is_none());
     }
 
     #[test]

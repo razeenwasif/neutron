@@ -592,6 +592,7 @@ pub struct NeutronApp {
     remote_drives: std::collections::HashMap<String, Vec<Place>>,
     remote_drives_tx: crossbeam_channel::Sender<(String, Vec<Place>)>,
     remote_drives_rx: crossbeam_channel::Receiver<(String, Vec<Place>)>,
+    last_remote_probe: Instant,
 
     /// Installed plugins, and the command running from one if any.
     plugins: crate::plugins::PluginRuntime,
@@ -978,6 +979,7 @@ impl NeutronApp {
             remote_drives: std::collections::HashMap::new(),
             remote_drives_tx,
             remote_drives_rx,
+            last_remote_probe: Instant::now(),
             plugins,
             palette,
             archive_job: None,
@@ -1237,6 +1239,15 @@ impl NeutronApp {
                 // The other columns are not the tab's listing, so a refresh
                 // of the tab alone would leave them as they were.
                 self.columns.clear();
+                if !cfg!(test) {
+                    let probe_needed = self.workspace.active_tab().is_some_and(|t| {
+                        let loc = t.location();
+                        *loc == NodeId::Home || loc.as_remote().is_some()
+                    });
+                    if probe_needed {
+                        self.start_remote_volume_probe();
+                    }
+                }
             }
 
             Action::Activate(idx) => self.activate(idx),
@@ -2346,6 +2357,7 @@ impl NeutronApp {
 
     /// Probes SFTP servers in the background for their internal/external SSDs.
     fn start_remote_volume_probe(&mut self) {
+        self.last_remote_probe = Instant::now();
         let sftp_sites: Vec<neutron_remote::Site> = self
             .sites
             .sites
@@ -2363,24 +2375,23 @@ impl NeutronApp {
             let _ = std::thread::Builder::new()
                 .name(format!("neutron-vols-{}", site.id))
                 .spawn(move || {
-                    let Ok(mut transport) = crate::remote::connect_checked(&site) else {
-                        return;
+                    let places: Vec<Place> = match crate::remote::connect_checked(&site)
+                        .and_then(|mut transport| transport.volumes().map_err(|e| e.to_string()))
+                    {
+                        Ok(vols) => vols
+                            .into_iter()
+                            .map(|v| Place {
+                                name: v.name,
+                                id: NodeId::remote(site.id.as_str(), v.path.as_str()),
+                                kind: neutron_core::places::PlaceKind::Drive,
+                                capacity: Some(neutron_core::places::Capacity {
+                                    total: v.total,
+                                    free: v.free,
+                                }),
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
                     };
-                    let Ok(vols) = transport.volumes() else {
-                        return;
-                    };
-                    let places: Vec<Place> = vols
-                        .into_iter()
-                        .map(|v| Place {
-                            name: v.name,
-                            id: NodeId::remote(site.id.as_str(), v.path.as_str()),
-                            kind: neutron_core::places::PlaceKind::Drive,
-                            capacity: Some(neutron_core::places::Capacity {
-                                total: v.total,
-                                free: v.free,
-                            }),
-                        })
-                        .collect();
                     let _ = tx.send((site.id, places));
                     wake.request_repaint();
                 });
@@ -3847,6 +3858,7 @@ impl NeutronApp {
             C::SplitDown => Action::Split(Axis::Vertical),
             C::AddressBar | C::GoToFolder => Action::ToggleAddress,
             C::ToggleTheme => Action::ToggleTheme,
+            C::ThemeStratus => Action::SetTheme(ThemeMode::Stratus),
             C::ThemeObsidian => Action::SetTheme(ThemeMode::Obsidian),
             C::ThemeFlux => Action::SetTheme(ThemeMode::Flux),
             C::ThemeFairy => Action::SetTheme(ThemeMode::Fairy),
@@ -3957,6 +3969,7 @@ impl NeutronApp {
             checked.insert(C::AllSizes.tag());
         }
         checked.insert(match self.theme_mode {
+            ThemeMode::Stratus => C::ThemeStratus,
             ThemeMode::Obsidian => C::ThemeObsidian,
             ThemeMode::Flux => C::ThemeFlux,
             ThemeMode::Fairy => C::ThemeFairy,
@@ -5010,6 +5023,12 @@ impl NeutronApp {
         self.drain_places();
         self.drain_sites();
         self.drain_remote_drives();
+        if !cfg!(test)
+            && self.last_remote_probe.elapsed() >= std::time::Duration::from_secs(60)
+            && self.sites.sites.iter().any(|s| s.protocol == neutron_remote::Protocol::Sftp)
+        {
+            self.start_remote_volume_probe();
+        }
         while let Ok(state) = self.drive_rx.try_recv() {
             // An answer ends any sign-in in progress; the sign-in's own
             // result is the only thing sent while one runs.
@@ -6819,6 +6838,7 @@ impl NeutronApp {
             C::ColumnView => Some(Action::SetView(file_list::ViewMode::Columns)),
             C::TogglePreview => Some(Action::TogglePreview),
             C::ToggleTheme => Some(Action::ToggleTheme),
+            C::ThemeStratus => Some(Action::SetTheme(ThemeMode::Stratus)),
             C::ThemeObsidian => Some(Action::SetTheme(ThemeMode::Obsidian)),
             C::ThemeFlux => Some(Action::SetTheme(ThemeMode::Flux)),
             C::ThemeFairy => Some(Action::SetTheme(ThemeMode::Fairy)),
@@ -7029,11 +7049,7 @@ impl NeutronApp {
     /// what is selected on the left, the keys worth knowing on the right.
     fn pane_footer(&self, ui: &mut egui::Ui, p: &Palette, rect: egui::Rect, tab: &crate::workspace::Tab, actions: &mut Vec<Action>) {
         let painter = ui.painter();
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, p.sidebar);
-        painter.line_segment(
-            [rect.left_top(), rect.right_top()],
-            egui::Stroke::new(1.0, p.border),
-        );
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, p.card);
         let font = egui::FontId::proportional(12.0);
         let y = rect.center().y;
 
@@ -7122,7 +7138,7 @@ impl NeutronApp {
             let cap = painter.layout_no_wrap(key.to_string(), theme::strong(ui.ctx(), 11.0), p.text_muted);
             let size = cap.size() + egui::vec2(14.0, 4.0);
             let cap_rect = egui::Rect::from_min_size(pos(x - size.x, y - size.y / 2.0), size);
-            painter.rect_filled(cap_rect, egui::CornerRadius::same(7), p.elevated);
+            painter.rect_filled(cap_rect, egui::CornerRadius::same(6), p.inset);
             painter.galley(pos(cap_rect.left() + 7.0, y - cap.size().y / 2.0), cap, p.text_muted);
             x = cap_rect.left() - if label.is_empty() { 4.0 } else { 14.0 };
         }
@@ -8216,7 +8232,7 @@ impl NeutronApp {
 
         egui::Panel::left(self.window_id("sidebar"))
             .show_separator_line(false)
-            .default_size(220.0)
+            .default_size(224.0)
             .size_range(egui::Rangef::new(180.0, 400.0))
             .frame(
                 theme::bare_card()
@@ -9879,20 +9895,9 @@ fn paint_chrome_panel(ui: &egui::Ui, inner: egui::Margin, edge: ChromeEdge, p: &
             0
         },
     };
+    let _ = edge;
     let painter = ui.painter().with_clip_rect(screen);
     painter.rect_filled(rect, corners, p.sidebar);
-    let stroke = egui::Stroke::new(1.0, p.border);
-    match edge {
-        ChromeEdge::Left => {
-            painter.vline(rect.left() + 0.5, rect.y_range(), stroke);
-        }
-        ChromeEdge::Right => {
-            painter.vline(rect.right() - 0.5, rect.y_range(), stroke);
-        }
-        ChromeEdge::Bottom => {
-            painter.hline(rect.x_range(), rect.bottom() - 0.5, stroke);
-        }
-    }
 }
 
 

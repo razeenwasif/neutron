@@ -876,7 +876,6 @@ fn text_body(ui: &mut egui::Ui, p: &neutron_ui::Palette, text: &str, truncated: 
     // Pressed into the pane, as every well is.
     egui::Frame::new()
         .fill(p.inset)
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(9)))
         .corner_radius(egui::CornerRadius::same(neutron_ui::theme::RADIUS_WELL))
         .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {

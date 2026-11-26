@@ -13,6 +13,7 @@ use egui::{Color32, CornerRadius, Stroke, Visuals, pos2};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeMode {
     #[default]
+    Stratus,
     Obsidian,
     Flux,
     Fairy,
@@ -23,6 +24,7 @@ pub enum ThemeMode {
 
 impl ThemeMode {
     pub const ALL: &'static [ThemeMode] = &[
+        ThemeMode::Stratus,
         ThemeMode::Obsidian,
         ThemeMode::Flux,
         ThemeMode::Fairy,
@@ -33,6 +35,7 @@ impl ThemeMode {
 
     pub const fn name(self) -> &'static str {
         match self {
+            ThemeMode::Stratus => "Stratus",
             ThemeMode::Obsidian => "Obsidian",
             ThemeMode::Flux => "Flux",
             ThemeMode::Fairy => "Fairy",
@@ -44,6 +47,7 @@ impl ThemeMode {
 
     pub const fn id(self) -> &'static str {
         match self {
+            ThemeMode::Stratus => "stratus",
             ThemeMode::Obsidian => "obsidian",
             ThemeMode::Flux => "flux",
             ThemeMode::Fairy => "fairy",
@@ -55,7 +59,8 @@ impl ThemeMode {
 
     pub fn from_id(id: &str) -> Option<Self> {
         match id {
-            "obsidian" | "dark" => Some(ThemeMode::Obsidian),
+            "stratus" | "dark" => Some(ThemeMode::Stratus),
+            "obsidian" => Some(ThemeMode::Obsidian),
             "flux" => Some(ThemeMode::Flux),
             "fairy" => Some(ThemeMode::Fairy),
             "aura" | "aura-dark" => Some(ThemeMode::Aura),
@@ -67,12 +72,13 @@ impl ThemeMode {
 
     pub const fn next(self) -> Self {
         match self {
+            ThemeMode::Stratus => ThemeMode::Obsidian,
             ThemeMode::Obsidian => ThemeMode::Flux,
             ThemeMode::Flux => ThemeMode::Fairy,
             ThemeMode::Fairy => ThemeMode::Aura,
             ThemeMode::Aura => ThemeMode::Gruvbox,
             ThemeMode::Gruvbox => ThemeMode::Light,
-            ThemeMode::Light => ThemeMode::Obsidian,
+            ThemeMode::Light => ThemeMode::Stratus,
         }
     }
 
@@ -165,8 +171,69 @@ pub struct Tints {
 }
 
 impl Palette {
-    /// Default dark theme: Fairy/Flux Obsidian base (#08080a-#121318) with
-    /// Proton Aura Violet accent (#a277ff).
+    /// Pitch-black Stratus T3 design tokens: #000000 main canvas, #030304 sidebar,
+    /// zero borders, pure typographic hierarchy and subtle tonal elevation.
+    pub const STRATUS: Palette = Palette {
+        ground: Color32::from_rgb(0x00, 0x00, 0x00),
+        ground_deep: Color32::from_rgb(0x00, 0x00, 0x00),
+        sidebar: Color32::from_rgb(0x03, 0x03, 0x04),
+
+        card: Color32::from_rgb(0x00, 0x00, 0x00),
+        card_top: Color32::from_rgb(0x00, 0x00, 0x00),
+        card_hover: Color32::from_rgb(0x11, 0x11, 0x14),
+        raised: Color32::from_rgb(0x16, 0x16, 0x1B),
+        elevated: Color32::from_rgb(0x0B, 0x0B, 0x0F),
+        inset: Color32::from_rgb(0x0B, 0x0B, 0x0E),
+
+        shadow: Color32::from_black_alpha(170),
+
+        orbs: [
+            Orb {
+                x: 0.20,
+                y: -0.10,
+                radius: 0.90,
+                colour: Color32::from_rgba_unmultiplied_const(0x7A, 0x89, 0xFF, 16),
+            },
+            Orb {
+                x: 0.88,
+                y: 0.12,
+                radius: 0.70,
+                colour: Color32::from_rgba_unmultiplied_const(0x4B, 0xC3, 0xF7, 12),
+            },
+        ],
+
+        border: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
+        border_strong: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
+
+        text: Color32::from_rgb(0xF4, 0xF4, 0xF6),
+        text_muted: Color32::from_rgb(0x8E, 0x8E, 0x99),
+        text_faint: Color32::from_rgb(0x6E, 0x6E, 0x77),
+
+        icon: Color32::from_rgb(0x8E, 0x8E, 0x99),
+
+        accent: Color32::from_rgb(0x7A, 0x89, 0xFF),
+        accent_hover: Color32::from_rgb(0x95, 0xA2, 0xFF),
+        accent_pressed: Color32::from_rgb(0x60, 0x70, 0xF0),
+
+        selection: Color32::from_rgb(0x16, 0x16, 0x1B),
+        hover: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 16),
+
+        success: Color32::from_rgb(0x34, 0xD3, 0x99),
+        warning: Color32::from_rgb(0xFB, 0xBF, 0x24),
+        danger: Color32::from_rgb(0xF8, 0x71, 0x71),
+        cloud: Color32::from_rgb(0x4B, 0xC3, 0xF7),
+
+        tints: Tints {
+            folder: Color32::from_rgb(0xFB, 0xBF, 0x24),
+            code: Color32::from_rgb(0x34, 0xD3, 0x99),
+            document: Color32::from_rgb(0x4B, 0xC3, 0xF7),
+            image: Color32::from_rgb(0xA7, 0x8B, 0xFA),
+            archive: Color32::from_rgb(0xE8, 0x82, 0x55),
+            plain: Color32::from_rgb(0x8E, 0x8E, 0x99),
+        },
+    };
+
+    /// Neutral obsidian dark theme with Proton Aura Violet accent (#a277ff).
     pub const OBSIDIAN: Palette = Palette {
         ground: Color32::from_rgb(0x08, 0x08, 0x0A),
         ground_deep: Color32::from_rgb(0x05, 0x05, 0x07),
@@ -196,8 +263,8 @@ impl Palette {
             },
         ],
 
-        border: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 18),
-        border_strong: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 32),
+        border: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
+        border_strong: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
 
         text: Color32::from_rgb(0xEC, 0xEE, 0xF4),
         text_muted: Color32::from_rgb(0x9D, 0xA2, 0xB0),
@@ -260,8 +327,8 @@ impl Palette {
             },
         ],
 
-        border: Color32::from_rgba_unmultiplied_const(0x96, 0xA0, 0xDC, 34),
-        border_strong: Color32::from_rgba_unmultiplied_const(0xB4, 0xBE, 0xFF, 52),
+        border: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
+        border_strong: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
 
         text: Color32::from_rgb(0xF0, 0xF0, 0xF4),
         text_muted: Color32::from_rgb(0xA0, 0xA4, 0xB8),
@@ -321,8 +388,8 @@ impl Palette {
             },
         ],
 
-        border: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 19),
-        border_strong: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 34),
+        border: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
+        border_strong: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
 
         text: Color32::from_rgb(0xEC, 0xEE, 0xF4),
         text_muted: Color32::from_rgb(0x9D, 0xA2, 0xB0),
@@ -382,8 +449,8 @@ impl Palette {
             },
         ],
 
-        border: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 18),
-        border_strong: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 33),
+        border: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
+        border_strong: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
 
         text: Color32::from_rgb(0xED, 0xEC, 0xEE),
         text_muted: Color32::from_rgb(0x9E, 0x9A, 0xB0),
@@ -443,8 +510,8 @@ impl Palette {
             },
         ],
 
-        border: Color32::from_rgba_unmultiplied_const(0xEB, 0xDB, 0xB2, 22),
-        border_strong: Color32::from_rgba_unmultiplied_const(0xEB, 0xDB, 0xB2, 40),
+        border: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
+        border_strong: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
 
         text: Color32::from_rgb(0xEB, 0xDB, 0xB2),
         text_muted: Color32::from_rgb(0xBD, 0xAE, 0x93),
@@ -504,8 +571,8 @@ impl Palette {
             },
         ],
 
-        border: Color32::from_rgb(0xE2, 0xE4, 0xEC),
-        border_strong: Color32::from_rgb(0xD0, 0xD3, 0xDF),
+        border: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
+        border_strong: Color32::from_rgba_unmultiplied_const(0, 0, 0, 0),
 
         text: Color32::from_rgb(0x16, 0x16, 0x1D),
         text_muted: Color32::from_rgb(0x5F, 0x61, 0x70),
@@ -541,6 +608,7 @@ impl Palette {
 
     pub const fn for_mode(mode: ThemeMode) -> Palette {
         match mode {
+            ThemeMode::Stratus => Palette::STRATUS,
             ThemeMode::Obsidian => Palette::OBSIDIAN,
             ThemeMode::Flux => Palette::FLUX,
             ThemeMode::Fairy => Palette::FAIRY,
@@ -629,12 +697,6 @@ pub fn paint_pane(painter: &egui::Painter, rect: egui::Rect, radius: f32, p: &Pa
     let corners = CornerRadius::same(radius.round().clamp(0.0, 255.0) as u8);
     painter.add(card_shadow(p).as_shape(rect, corners));
     painter.rect_filled(rect, corners, p.elevated);
-    painter.rect_stroke(rect, corners, Stroke::new(1.0, p.border_strong), egui::StrokeKind::Inside);
-    let inner = CornerRadius::same(corners.nw.saturating_sub(1));
-    let dark = p.ground.r() < 128;
-    if dark {
-        paint_top_edge(painter, rect.shrink(1.0), inner, Color32::from_rgba_unmultiplied(255, 255, 255, 28));
-    }
 }
 
 /// Corner radius of the window itself (matches Proton `--r-win: 13px`).
@@ -645,46 +707,17 @@ pub const RADIUS_WINDOW: u8 = 13;
 pub fn paint_ground(painter: &egui::Painter, rect: egui::Rect, p: &Palette) {
     let corners = CornerRadius::same(RADIUS_WINDOW);
     painter.rect_filled(rect, corners, p.ground);
-    painter.rect_stroke(rect, corners, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
 }
 
 /// A recessed well: the filter field, view switcher, capacity bar track.
 pub fn paint_well(painter: &egui::Painter, rect: egui::Rect, corners: CornerRadius, p: &Palette) {
     painter.rect_filled(rect, corners, p.inset);
-    painter.rect_stroke(
-        rect,
-        corners,
-        Stroke::new(1.0, p.border),
-        egui::StrokeKind::Inside,
-    );
-}
-
-fn paint_top_edge(painter: &egui::Painter, rect: egui::Rect, corners: CornerRadius, colour: Color32) {
-    let depth = (corners.nw.max(corners.ne) as f32).max(4.0) * 0.8;
-    let band = egui::Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + depth));
-    painter
-        .with_clip_rect(band.intersect(painter.clip_rect()))
-        .rect_stroke(rect, corners, Stroke::new(1.0, colour), egui::StrokeKind::Inside);
 }
 
 /// A control lifted off the surface — the chosen segment, the active tab, a
 /// rail button under the pointer: `p.raised` with a hairline edge and top specular.
 pub fn paint_raised(painter: &egui::Painter, rect: egui::Rect, corners: CornerRadius, p: &Palette) {
-    let dark = p.ground.r() < 128;
-    painter.add(
-        egui::epaint::Shadow {
-            offset: [0, 1],
-            blur: 4,
-            spread: 0,
-            color: Color32::from_black_alpha(if dark { 80 } else { 18 }),
-        }
-        .as_shape(rect, corners),
-    );
     painter.rect_filled(rect, corners, p.raised);
-    painter.rect_stroke(rect, corners, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
-    if dark {
-        paint_top_edge(painter, rect.shrink(1.0), corners, Color32::from_rgba_unmultiplied(255, 255, 255, 22));
-    }
 }
 
 pub fn with_alpha(colour: Color32, alpha: u8) -> Color32 {
@@ -841,7 +874,7 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
         ctx.set_visuals_of(egui::Theme::Light, build_visuals(ThemeMode::Light));
         ctx.set_theme(egui::ThemePreference::Dark);
     } else {
-        ctx.set_visuals_of(egui::Theme::Dark, build_visuals(ThemeMode::Obsidian));
+        ctx.set_visuals_of(egui::Theme::Dark, build_visuals(ThemeMode::Stratus));
         ctx.set_visuals_of(egui::Theme::Light, build_visuals(ThemeMode::Light));
         ctx.set_theme(egui::ThemePreference::Light);
     }
@@ -1027,6 +1060,13 @@ mod tests {
     #[test]
     fn a_card_still_reads_as_a_panel_against_the_ground() {
         for (theme, p) in themes() {
+            if theme == "Stratus" {
+                // Stratus integrates its main canvas cleanly into pitch-black ground (#000000)
+                // and distinguishes cards/overlays tonally via inset and elevated surfaces.
+                assert!(contrast(p.elevated, p.card) >= 1.05, "Stratus: elevated too close to card");
+                assert!(contrast(p.raised, p.card) >= 1.12, "Stratus: raised too close to card");
+                continue;
+            }
             for (where_, backdrop, card) in [
                 ("deep ground", p.ground_deep, p.card_worst_case()),
                 ("lit ground", p.ground, p.card_over(p.ground)),
@@ -1042,7 +1082,7 @@ mod tests {
 
     #[test]
     fn dark_is_the_default_theme() {
-        assert_eq!(ThemeMode::default(), ThemeMode::Obsidian);
+        assert_eq!(ThemeMode::default(), ThemeMode::Stratus);
         assert!(ThemeMode::default().is_dark());
     }
 
@@ -1051,12 +1091,12 @@ mod tests {
         for &mode in ThemeMode::ALL {
             assert_eq!(ThemeMode::from_id(mode.id()), Some(mode));
         }
-        assert_eq!(ThemeMode::from_id("dark"), Some(ThemeMode::Obsidian));
-        let mut cur = ThemeMode::Obsidian;
+        assert_eq!(ThemeMode::from_id("dark"), Some(ThemeMode::Stratus));
+        let mut cur = ThemeMode::Stratus;
         for _ in 0..ThemeMode::ALL.len() {
             cur = cur.next();
         }
-        assert_eq!(cur, ThemeMode::Obsidian);
+        assert_eq!(cur, ThemeMode::Stratus);
     }
 
     #[test]

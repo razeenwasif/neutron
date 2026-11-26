@@ -367,20 +367,19 @@ fn grip(ui: &mut Ui, p: &Palette, column: &Column<'_>, rect: Rect, index: usize,
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
     }
 
-    let colour = if active { p.accent } else { p.border };
-    ui.painter().vline(
-        rect.right() - 0.5,
-        rect.y_range(),
-        Stroke::new(if active { 1.5 } else { 1.0 }, colour),
-    );
-    // A small handle at the foot of the edge, as the Finder draws one, so a
-    // hairline reads as something that can be taken hold of.
-    let foot = pos2(rect.right() - 0.5, rect.bottom() - 18.0);
-    for dx in [-2.0, 2.0] {
-        ui.painter().line_segment(
-            [pos2(foot.x + dx, foot.y - 5.0), pos2(foot.x + dx, foot.y + 5.0)],
-            Stroke::new(1.0, if active { p.accent } else { p.text_faint }),
+    if active {
+        ui.painter().vline(
+            rect.right() - 0.5,
+            rect.y_range(),
+            Stroke::new(1.5, p.accent),
         );
+        let foot = pos2(rect.right() - 0.5, rect.bottom() - 18.0);
+        for dx in [-2.0, 2.0] {
+            ui.painter().line_segment(
+                [pos2(foot.x + dx, foot.y - 5.0), pos2(foot.x + dx, foot.y + 5.0)],
+                Stroke::new(1.0, p.accent),
+            );
+        }
     }
 
     let all = ui.input(|i| i.modifiers.alt);
@@ -699,27 +698,13 @@ fn draw_entry(
     // The current column's selection looks like the list's: the accent wash
     // and a faint ring of it. A chosen row elsewhere — the way here — is a
     // neutral lift instead, because only one column is the one keys act on.
-    let corners = egui::CornerRadius::same(crate::theme::RADIUS_CONTROL);
+    let corners = egui::CornerRadius::same(crate::theme::RADIUS_WELL);
     if selected {
         ui.painter().rect_filled(rect, corners, p.selection);
-        ui.painter().rect_stroke(
-            rect,
-            corners,
-            Stroke::new(1.0, crate::theme::with_alpha(p.accent, 60)),
-            egui::StrokeKind::Inside,
-        );
     } else if chosen {
-        ui.painter().rect_filled(rect, corners, Color32::from_white_alpha(14));
-    } else if response.hovered() {
-        ui.painter().rect_filled(rect, corners, p.hover);
-    }
-    if is_cursor && !selected {
-        ui.painter().rect_stroke(
-            rect,
-            corners,
-            Stroke::new(1.5, crate::theme::with_alpha(p.accent, 128)),
-            egui::StrokeKind::Inside,
-        );
+        ui.painter().rect_filled(rect, corners, p.card_hover);
+    } else if response.hovered() || is_cursor {
+        ui.painter().rect_filled(rect, corners, p.card_hover);
     }
 
     let faded = list.is_hidden(idx) || column.cut.is_some_and(|names| names.contains(name));

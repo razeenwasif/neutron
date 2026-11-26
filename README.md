@@ -16,9 +16,11 @@ view; a preview pane; listings that update themselves; zip and tar archives;
 plugins as separate processes; FTP, FTPS and SFTP servers; Google Drive over the
 API; and one status line that says when any of it fails.
 
-Redesigned throughout: light by default, opaque cards on a still ground, a fixed
-action rail, Neutron's own window frame, and a dashboard to open on. See
-[Design](#design).
+Redesigned throughout: Stratus pitch-black borderless surfaces by default (with
+six additional built-in themes), crisp Lucide-based action rail icons, remote
+SFTP drive discovery across macOS, Linux, and Windows (including dual-boot
+hosts), remote folder sidebar pinning, Neutron's own window frame, and a
+live dashboard. See [Design](#design) and [`docs/servers.md`](docs/servers.md).
 
 A 100k-entry folder opens in 52ms and scrolls at 0.21ms per frame.
 
@@ -252,7 +254,7 @@ crates/
   neutron-remote/   FTP, FTPS and SFTP clients
   neutron-indexer/  elevated helper process                (bin: neutron-indexer)
 xtask/              project tasks: install, uninstall, where
-assets/             app icon (SVG source, .ico, raw RGBA)
+assets/             app icon (SVG source, .ico, raw RGBA) and rail/ Lucide RGBA masks
 scripts/            benchmark directory generator
 .github/workflows/  CI: Windows, Linux, and the stated minimum Rust
 docs/perf.md        measured performance baseline
@@ -730,16 +732,14 @@ neutron --bench <path> [runs]      headless enumerate + sort timing
 
 ## Design
 
-**Cards on a still ground.** A near-white ground with a soft overhead wash and
-two static colour washes far off-centre, so the window is tinted rather than
-flat. On it, the sidebar, the action rail and each pane are opaque white cards
-with a hairline border, a large radius and a shadow you have to look for.
-Depth comes from elevation and from that hairline, not from ruled lines through
-the content.
+**Borderless tonal surfaces.** The default **Stratus** theme pairs a pitch-black
+(`#000000`) main canvas with a near-black (`#030304`) sidebar and subtle `#0B0B0E`
+/ `#111114` tonal cards — removing visible chrome borders and divider lines in
+favour of typographic contrast, generous radii, and soft elevation steps.
 
-**Light is the default**; dark is `Ctrl+D`, and it is the same design with the
-values inverted rather than a second look — opaque cards, a still ground, one
-accent.
+**Stratus is the default**; cycle through seven built-in palettes (**Stratus**,
+**Obsidian**, **Midnight**, **Graphite**, **Catppuccin**, **Gruvbox**, and
+**Light**) via `Ctrl+D` (`⌘D`), **View › Theme**, or the command palette.
 
 **Nothing moves.** The ground used to drift: two colour fields on 41- and
 57-second loops, there to give translucent glass something to refract. Both
@@ -777,7 +777,8 @@ have to pick one pane and ignore the other — every control it held was really 
 control on the focused pane wearing a costume.
 
 **The rail is the exception to keyboard-first.** A fixed strip of verbs beside
-the sidebar: copy, cut, paste, rename, delete, new folder, extract, zip. Every
+the sidebar: copy, cut, paste, rename, delete, new folder, extract, zip,
+rendered with pre-rasterised `64×64` anti-aliased Lucide RGBA icon masks. Every
 one already has a keystroke and a palette entry, and the pitch above lists
 "mouse-centric" as *Explorer's* problem — but a palette only helps someone who
 already knows the command exists, and a visible row of verbs is how you find out

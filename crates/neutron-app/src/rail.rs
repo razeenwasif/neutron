@@ -20,14 +20,13 @@
 //! the palette. The rail scrolls when the window is short.
 
 use egui::{Rect, Sense, Ui, pos2, vec2};
-use neutron_ui::icons::{self, Glyph};
 use neutron_ui::theme::{self, Palette};
 
 /// Width of the strip, including its padding.
 pub const WIDTH: f32 = 60.0;
 
 /// Height of one button: glyph, then its label, with room to breathe.
-const ITEM: f32 = 50.0;
+const ITEM: f32 = 52.0;
 
 /// Space between buttons within a group.
 const SPACING: f32 = 2.0;
@@ -112,7 +111,6 @@ impl RailAction {
 /// One row: glyph, label, the action it sends, and whether it needs a
 /// selection.
 struct Item {
-    glyph: Glyph,
     label: &'static str,
     action: RailAction,
     hint: &'static str,
@@ -129,13 +127,11 @@ const GAP: Option<Item> = None;
 fn items() -> Vec<Option<Item>> {
     vec![
         Some(Item {
-            glyph: Glyph::Copy,
             label: "Copy",
             action: RailAction::Copy,
             hint: "Copy to clipboard (Ctrl+C)",
         }),
         Some(Item {
-            glyph: Glyph::Cut,
             label: "Cut",
             action: RailAction::Cut,
             hint: "Cut to clipboard (Ctrl+X)",
@@ -144,20 +140,17 @@ fn items() -> Vec<Option<Item>> {
         // the shell on a worker thread, and asking it every frame to grey out a
         // button would be a COM call in the paint path.
         Some(Item {
-            glyph: Glyph::Paste,
             label: "Paste",
             action: RailAction::Paste,
             hint: "Paste here (Ctrl+V)",
         }),
         GAP,
         Some(Item {
-            glyph: Glyph::Rename,
             label: "Rename",
             action: RailAction::Rename,
             hint: "Rename this file (F2)",
         }),
         Some(Item {
-            glyph: Glyph::Trash,
             label: if cfg!(target_os = "macos") { "Trash" } else { "Delete" },
             action: RailAction::Delete,
             hint: if cfg!(target_os = "macos") {
@@ -167,25 +160,42 @@ fn items() -> Vec<Option<Item>> {
             },
         }),
         Some(Item {
-            glyph: Glyph::NewFolder,
             label: "Folder",
             action: RailAction::NewFolder,
             hint: "New folder (Ctrl+Shift+N)",
         }),
         GAP,
         Some(Item {
-            glyph: Glyph::Extract,
             label: "Extract",
             action: RailAction::Extract,
             hint: "Extract this archive",
         }),
         Some(Item {
-            glyph: Glyph::Compress,
             label: "Zip",
             action: RailAction::Compress,
             hint: "Compress to a zip",
         }),
     ]
+}
+
+fn icon_texture(ctx: &egui::Context, action: RailAction) -> egui::TextureHandle {
+    let (key, bytes): (&'static str, &'static [u8]) = match action {
+        RailAction::Copy => ("neutron-rail-copy", include_bytes!("../../../assets/rail/copy.rgba")),
+        RailAction::Cut => ("neutron-rail-cut", include_bytes!("../../../assets/rail/cut.rgba")),
+        RailAction::Paste => ("neutron-rail-paste", include_bytes!("../../../assets/rail/paste.rgba")),
+        RailAction::Rename => ("neutron-rail-rename", include_bytes!("../../../assets/rail/rename.rgba")),
+        RailAction::Delete => ("neutron-rail-trash", include_bytes!("../../../assets/rail/trash.rgba")),
+        RailAction::NewFolder => ("neutron-rail-new-folder", include_bytes!("../../../assets/rail/new_folder.rgba")),
+        RailAction::Extract => ("neutron-rail-extract", include_bytes!("../../../assets/rail/extract.rgba")),
+        RailAction::Compress => ("neutron-rail-compress", include_bytes!("../../../assets/rail/compress.rgba")),
+    };
+    let id = egui::Id::new(key);
+    ctx.data(|d| d.get_temp(id)).unwrap_or_else(|| {
+        let image = egui::ColorImage::from_rgba_unmultiplied([64, 64], bytes);
+        let tex = ctx.load_texture(key, image, egui::TextureOptions::LINEAR);
+        ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+        tex
+    })
 }
 
 /// Draws the rail and returns whatever was clicked.
@@ -222,26 +232,39 @@ pub fn show(ui: &mut Ui, p: &Palette, state: &RailState) -> Option<RailAction> {
                     },
                 );
 
-                // Borderless at rest; only hover lifts a soft well behind the glyph.
+                // Borderless at rest; only hover lifts a soft well behind the icon.
                 let well = egui::Rect::from_center_size(
-                    pos2(rect.center().x, rect.top() + 2.0 + 16.0),
-                    vec2(32.0, 32.0),
+                    pos2(rect.center().x, rect.top() + 19.0),
+                    vec2(34.0, 34.0),
                 );
-                let corners = egui::CornerRadius::same(theme::RADIUS_CONTROL);
+                let corners = egui::CornerRadius::same(8);
                 let hovered = enabled && response.hovered();
                 if hovered {
-                    ui.painter().rect_filled(well, corners, p.hover);
+                    let well_fill = if item.action == RailAction::Delete {
+                        theme::with_alpha(p.danger, 26)
+                    } else {
+                        p.card_hover
+                    };
+                    ui.painter().rect_filled(well, corners, well_fill);
                 }
 
                 let (glyph_colour, text_colour) = if !enabled {
-                    (theme::with_alpha(p.text_faint, 105), theme::with_alpha(p.text_faint, 105))
+                    (theme::with_alpha(p.text_faint, 95), theme::with_alpha(p.text_faint, 95))
                 } else if hovered {
-                    (p.accent, p.text)
+                    let accent = if item.action == RailAction::Delete { p.danger } else { p.accent };
+                    (accent, p.text)
                 } else {
                     (p.text_soft(), p.text_faint)
                 };
 
-                icons::draw(ui.painter(), well.center(), item.glyph, glyph_colour);
+                let tex = icon_texture(ui.ctx(), item.action);
+                let icon_rect = Rect::from_center_size(well.center(), vec2(18.0, 18.0));
+                ui.painter().image(
+                    tex.id(),
+                    icon_rect,
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    glyph_colour,
+                );
 
                 let galley = ui.painter().layout_no_wrap(
                     item.label.to_owned(),

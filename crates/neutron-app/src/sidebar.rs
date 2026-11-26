@@ -13,7 +13,7 @@
 //! * **The place you are in is a soft pill.** An accent wash, a faint ring of
 //!   the accent and a dot at the end — no bar down the side, no hard edge.
 
-use egui::{Color32, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Color32, CornerRadius, Rect, Sense, Ui, pos2, vec2};
 use neutron_core::NodeId;
 use neutron_core::places::{Place, PlaceKind};
 use neutron_ui::icons::{self, Glyph};
@@ -28,9 +28,12 @@ const FOOTER_HEIGHT: f32 = 104.0;
 
 /// The wordmark: the app's own icon and its name.
 pub fn brand(ui: &mut Ui, p: &Palette) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(9), p.card_hover);
 
-    let mark = Rect::from_min_size(pos2(rect.left() + 6.0, rect.center().y - 16.0), vec2(32.0, 32.0));
+    let tile = Rect::from_min_size(pos2(rect.left() + 9.0, rect.center().y - 13.0), vec2(26.0, 26.0));
+    ui.painter().rect_filled(tile, CornerRadius::same(theme::RADIUS_CONTROL), p.raised);
+    let mark = tile.shrink(3.0);
     let texture: egui::TextureHandle = ui
         .ctx()
         .data(|data| data.get_temp(egui::Id::new("neutron-brand-icon")))
@@ -48,11 +51,18 @@ pub fn brand(ui: &mut Ui, p: &Palette) {
         .image(texture.id(), mark, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
 
     ui.painter().text(
-        pos2(mark.right() + 11.0, rect.center().y),
+        pos2(tile.right() + 10.0, rect.center().y - 6.5),
         egui::Align2::LEFT_CENTER,
         "Neutron",
-        theme::strong(ui.ctx(), 16.0),
+        theme::strong(ui.ctx(), 13.0),
         p.text,
+    );
+    ui.painter().text(
+        pos2(tile.right() + 10.0, rect.center().y + 7.0),
+        egui::Align2::LEFT_CENTER,
+        "files & servers",
+        egui::FontId::proportional(10.5),
+        p.text_faint,
     );
 }
 
@@ -61,38 +71,27 @@ pub fn brand(ui: &mut Ui, p: &Palette) {
 pub fn find_pill(ui: &mut Ui, p: &Palette) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
     let corners = CornerRadius::same(theme::RADIUS_WELL);
-    theme::paint_well(ui.painter(), rect, corners, p);
-    if response.hovered() {
-        ui.painter().rect_filled(rect, corners, p.hover);
-    }
+    ui.painter()
+        .rect_filled(rect, corners, if response.hovered() { p.card_hover } else { p.inset });
 
-    icons::draw(ui.painter(), pos2(rect.left() + 20.0, rect.center().y), Glyph::Search, p.text_faint);
+    icons::draw(ui.painter(), pos2(rect.left() + 17.0, rect.center().y), Glyph::Search, p.text_faint);
     ui.painter().text(
-        pos2(rect.left() + 36.0, rect.center().y),
+        pos2(rect.left() + 33.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        "Find anything",
-        egui::FontId::proportional(13.0),
+        "Jump to file…",
+        egui::FontId::proportional(12.0),
         if response.hovered() { p.text_muted } else { p.text_faint },
     );
-    key_cap(ui, p, pos2(rect.right() - 10.0, rect.center().y), if cfg!(target_os = "macos") { "⌘P" } else { "Ctrl+P" });
-
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Find anything"));
-    response.clicked()
-}
-
-/// A key cap, right-aligned on `right_centre`. Shared with the pane footer.
-pub fn key_cap(ui: &Ui, p: &Palette, right_centre: egui::Pos2, label: &str) {
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), theme::strong(ui.ctx(), 11.0), p.text_muted);
-    let size = galley.size() + vec2(14.0, 4.0);
-    let cap = Rect::from_min_size(pos2(right_centre.x - size.x, right_centre.y - size.y / 2.0), size);
-    ui.painter().rect_filled(cap, CornerRadius::same(8), p.elevated);
-    ui.painter().galley(
-        pos2(cap.left() + 7.0, cap.center().y - galley.size().y / 2.0),
-        galley,
-        p.text_muted,
+    ui.painter().text(
+        pos2(rect.right() - 10.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        if cfg!(target_os = "macos") { "⌘P" } else { "Ctrl+P" },
+        egui::FontId::monospace(10.0),
+        p.text_faint,
     );
+
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Jump to file"));
+    response.clicked()
 }
 
 /// A group label: small spaced capitals in the faint tone.
@@ -154,23 +153,17 @@ pub fn drive_row(ui: &mut Ui, p: &Palette, place: &Place, current: Option<&NodeI
     }
 
     let selected = current == Some(&place.id);
-    let corners = CornerRadius::same(theme::RADIUS_CONTROL);
+    let corners = CornerRadius::same(theme::RADIUS_WELL);
 
     if selected {
         ui.painter().rect_filled(rect, corners, p.selection);
-        ui.painter().rect_stroke(
-            rect,
-            corners,
-            Stroke::new(1.0, theme::with_alpha(p.accent, 51)),
-            egui::StrokeKind::Inside,
-        );
-        // The eject button takes the dot's place on a disk that has one.
+        // Stratus-style crisp 5px dot beside active item.
         if !ejectable {
             ui.painter()
-                .circle_filled(pos2(rect.right() - 14.0, rect.center().y), 3.0, p.accent);
+                .circle_filled(pos2(rect.right() - 13.0, rect.center().y), 2.5, p.accent);
         }
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, corners, p.hover);
+        ui.painter().rect_filled(rect, corners, p.card_hover);
     }
 
     // The Trash borrows the action rail's glyph, which is drawn larger.
@@ -258,25 +251,19 @@ pub fn remote_drive_row(ui: &mut Ui, p: &Palette, place: &Place, current: Option
     }
 
     let selected = current == Some(&place.id);
-    let corners = CornerRadius::same(theme::RADIUS_CONTROL);
+    let corners = CornerRadius::same(theme::RADIUS_WELL);
 
     if selected {
         ui.painter().rect_filled(rect, corners, p.selection);
-        ui.painter().rect_stroke(
-            rect,
-            corners,
-            Stroke::new(1.0, theme::with_alpha(p.accent, 51)),
-            egui::StrokeKind::Inside,
-        );
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, corners, p.hover);
+        ui.painter().rect_filled(rect, corners, p.card_hover);
     }
 
     icons::draw_scaled(
         ui.painter(),
         pos2(rect.left() + 31.0, rect.center().y),
         Glyph::Drive,
-        if selected { p.accent } else { p.text_faint },
+        if selected { p.cloud } else { p.text_faint },
         0.82,
     );
 
@@ -370,12 +357,7 @@ pub enum FooterAction {
 pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: ThemeMode) -> FooterAction {
     let mut action = FooterAction::None;
 
-    ui.painter().line_segment(
-        [pos2(rect.left() - 10.0, rect.top()), pos2(rect.right() + 10.0, rect.top())],
-        Stroke::new(1.0, p.border),
-    );
-
-    let card = Rect::from_min_size(pos2(rect.left(), rect.top() + 8.0), vec2(rect.width(), 62.0));
+    let card = Rect::from_min_size(pos2(rect.left(), rect.top() + 4.0), vec2(rect.width(), 64.0));
     storage_card(ui, p, card, drives);
 
     let buttons = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 28.0), rect.max);
@@ -388,11 +370,13 @@ pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: Them
     let toggle = Rect::from_min_size(pos2(buttons.right() - toggle_w, buttons.top()), vec2(toggle_w, 28.0));
     let connect = Rect::from_min_max(buttons.min, pos2(toggle.left() - 6.0, buttons.bottom()));
 
-    let btn_corners = CornerRadius::same(theme::RADIUS_CONTROL);
+    let btn_corners = CornerRadius::same(theme::RADIUS_WELL);
     let response = ui.interact(connect, ui.id().with("sidebar-connect"), Sense::click());
-    if response.hovered() {
-        ui.painter().rect_filled(connect, btn_corners, p.hover);
-    }
+    ui.painter().rect_filled(
+        connect,
+        btn_corners,
+        if response.hovered() { p.card_hover } else { p.inset },
+    );
     let label = ui.painter().layout_no_wrap(
         "Connect".to_owned(),
         egui::FontId::proportional(12.0),
@@ -417,9 +401,8 @@ pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: Them
     ui.painter().rect_filled(
         toggle,
         btn_corners,
-        if response.hovered() { p.hover } else { p.inset },
+        if response.hovered() { p.card_hover } else { p.inset },
     );
-    ui.painter().rect_stroke(toggle, btn_corners, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
     ui.painter().circle_filled(pos2(toggle.left() + 11.0, toggle.center().y), 3.5, p.accent);
     let tgalley = ui.painter().layout_no_wrap(
         mode.name().to_owned(),
@@ -447,6 +430,7 @@ pub fn footer(ui: &mut Ui, p: &Palette, rect: Rect, drives: &[Place], mode: Them
 /// one figure worth keeping in sight everywhere.
 fn storage_card(ui: &Ui, p: &Palette, rect: Rect, drives: &[Place]) {
     let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(9), p.inset);
 
     let Some((name, cap)) = drives.iter().find_map(|d| d.capacity.map(|c| (d.name.as_str(), c))) else {
         painter.text(
@@ -483,7 +467,7 @@ fn storage_card(ui: &Ui, p: &Palette, rect: Rect, drives: &[Place]) {
         pos2(rect.left() + 8.0, rect.top() + 26.0),
         pos2(rect.right() - 8.0, rect.top() + 30.0),
     );
-    painter.rect_filled(track, theme::pill(track.height()), p.inset);
+    painter.rect_filled(track, theme::pill(track.height()), p.raised);
     let fill = Rect::from_min_max(
         track.min,
         pos2(track.left() + track.width() * fraction as f32, track.bottom()),
@@ -531,17 +515,11 @@ pub fn tag_row(ui: &mut Ui, p: &Palette, name: &str, color: u8, selected: bool) 
     if !ui.is_rect_visible(rect) {
         return RowHit::of(&response, rect);
     }
-    let corners = CornerRadius::same(theme::RADIUS_CONTROL);
+    let corners = CornerRadius::same(theme::RADIUS_WELL);
     if selected {
         ui.painter().rect_filled(rect, corners, p.selection);
-        ui.painter().rect_stroke(
-            rect,
-            corners,
-            Stroke::new(1.0, theme::with_alpha(p.accent, 51)),
-            egui::StrokeKind::Inside,
-        );
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, corners, p.hover);
+        ui.painter().rect_filled(rect, corners, p.card_hover);
     }
     ui.painter().circle_filled(pos2(rect.left() + 19.0, rect.center().y), 5.5, neutron_ui::tags::color(color));
     let (font, colour) = if selected {
@@ -558,7 +536,7 @@ pub fn action_row_with_hint(ui: &mut Ui, p: &Palette, label: &str, glyph: Glyph,
 
     if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(theme::RADIUS_CONTROL), p.hover);
+            .rect_filled(rect, CornerRadius::same(theme::RADIUS_WELL), p.card_hover);
     }
 
     icons::draw(

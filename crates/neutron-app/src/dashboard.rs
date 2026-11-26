@@ -102,9 +102,9 @@ fn body(
     recent: &[crate::recent::Visit],
     elsewhere: &[Place],
 ) -> Option<Chosen> {
-    ui.add_space(20.0);
+    ui.add_space(28.0);
     greeting(ui, p);
-    ui.add_space(22.0);
+    ui.add_space(24.0);
 
     let mut chosen = None;
     if let Some(volume) = volumes.iter().find(|v| v.capacity.is_some()) {
@@ -154,19 +154,19 @@ fn greeting(ui: &mut Ui, p: &Palette) {
         12..=17 => "Good afternoon",
         _ => "Good evening",
     };
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 68.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::hover());
     ui.painter().text(
-        pos2(rect.left() + 4.0, rect.top() + 22.0),
+        pos2(rect.left() + 4.0, rect.top() + 18.0),
         egui::Align2::LEFT_CENTER,
         hello,
-        theme::strong(ui.ctx(), 30.0),
+        theme::strong(ui.ctx(), 28.0),
         p.text,
     );
     ui.painter().text(
-        pos2(rect.left() + 4.0, rect.top() + 52.0),
+        pos2(rect.left() + 4.0, rect.top() + 47.0),
         egui::Align2::LEFT_CENTER,
         "Everything on this Mac, and everywhere you have connected.",
-        egui::FontId::proportional(14.0),
+        egui::FontId::proportional(13.0),
         p.text_muted,
     );
 }
@@ -216,7 +216,7 @@ fn storage_card(ui: &mut Ui, p: &Palette, volume: &Place) -> Option<NodeId> {
     if track.width() > 60.0 {
         let used = cap.total.saturating_sub(cap.free);
         let fraction = if cap.total > 0 { used as f32 / cap.total as f32 } else { 0.0 };
-        painter.rect_filled(track, theme::pill(track.height()), p.inset);
+        painter.rect_filled(track, theme::pill(track.height()), p.raised);
         let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * fraction, track.bottom()));
         if fill.width() > 2.0 {
             painter.rect_filled(fill, theme::pill(track.height()), p.accent);
@@ -268,8 +268,8 @@ fn remote_storage_card(ui: &mut Ui, p: &Palette, volume: &Place, width: f32) -> 
 
     let painter = ui.painter();
     let plate = Rect::from_min_size(pos2(rect.left() + 16.0, rect.top() + 14.0), vec2(32.0, 32.0));
-    painter.rect_filled(plate, egui::CornerRadius::same(theme::RADIUS_WELL), p.inset);
-    icons::draw_scaled(painter, plate.center(), Glyph::Drive, p.text_soft(), 0.9);
+    painter.rect_filled(plate, egui::CornerRadius::same(theme::RADIUS_WELL), p.raised);
+    icons::draw_scaled(painter, plate.center(), Glyph::Drive, p.cloud, 0.9);
 
     let text_left = plate.right() + 12.0;
     let name_galley = painter.layout_no_wrap(
@@ -306,7 +306,7 @@ fn remote_storage_card(ui: &mut Ui, p: &Palette, volume: &Place, width: f32) -> 
             pos2(rect.left() + 16.0, rect.bottom() - 17.0),
             pos2(rect.right() - 16.0, rect.bottom() - 12.0),
         );
-        painter.rect_filled(track, theme::pill(track.height()), p.inset);
+        painter.rect_filled(track, theme::pill(track.height()), p.raised);
         let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * fraction, track.bottom()));
         if fill.width() > 1.0 {
             painter.rect_filled(fill, theme::pill(track.height()), p.accent);
@@ -413,13 +413,7 @@ fn recent_card(ui: &mut Ui, p: &Palette, visit: &crate::recent::Visit, width: f3
 fn card(ui: &Ui, p: &Palette, rect: Rect, hovered: bool) {
     let corners = egui::CornerRadius::same(theme::RADIUS_PANEL);
     ui.painter()
-        .rect_filled(rect, corners, if hovered { p.hover } else { p.card });
-    ui.painter().rect_stroke(
-        rect,
-        corners,
-        egui::Stroke::new(1.0, if hovered { p.border_strong } else { p.border }),
-        egui::StrokeKind::Inside,
-    );
+        .rect_filled(rect, corners, if hovered { p.card_hover } else { p.inset });
 }
 
 /// Quick destinations, as a grid of tiles at most `max_columns` across.
@@ -472,9 +466,9 @@ fn tile(ui: &mut Ui, p: &Palette, place: &Place, width: f32) -> bool {
     let plate = Rect::from_min_size(pos2(rect.left() + 14.0, rect.center().y - 19.0), vec2(38.0, 38.0));
     let folder_like = matches!(place.kind, PlaceKind::KnownFolder);
     let (plate_fill, glyph_colour) = if folder_like {
-        (theme::with_alpha(p.tints.folder, 28), p.tints.folder)
+        (theme::with_alpha(p.tints.folder, 24), p.tints.folder)
     } else {
-        (p.inset, p.text_soft())
+        (p.raised, p.text_soft())
     };
     ui.painter().rect_filled(plate, egui::CornerRadius::same(theme::RADIUS_WELL), plate_fill);
     icons::draw(ui.painter(), plate.center(), glyph_for(place), glyph_colour);
@@ -510,7 +504,7 @@ fn tile(ui: &mut Ui, p: &Palette, place: &Place, width: f32) -> bool {
                 pos2(text_left, rect.center().y + 6.0),
                 pos2(rect.right() - 14.0, rect.center().y + 11.0),
             );
-            ui.painter().rect_filled(track, theme::pill(5.0), p.inset);
+            ui.painter().rect_filled(track, theme::pill(5.0), p.raised);
             let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * fraction, track.bottom()));
             if fill.width() > 1.0 {
                 ui.painter().rect_filled(fill, theme::pill(5.0), theme::with_alpha(p.accent, 220));

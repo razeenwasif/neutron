@@ -1268,13 +1268,7 @@ fn draw_row(
     // reads as chosen without a hard mark down its side.
     if selected {
         ui.painter()
-            .rect_filled(rect, RADIUS_CONTROL as f32, p.selection);
-        ui.painter().rect_stroke(
-            rect,
-            RADIUS_CONTROL as f32,
-            Stroke::new(1.0, theme::with_alpha(p.accent, 56)),
-            egui::StrokeKind::Inside,
-        );
+            .rect_filled(rect, theme::RADIUS_WELL as f32, p.selection);
     } else if response.hovered() {
         ui.painter().rect_filled(rect, RADIUS_CONTROL as f32, p.hover);
     }
@@ -1282,12 +1276,8 @@ fn draw_row(
     // Focus ring on the keyboard cursor, so it stays findable when it is not
     // part of the selection.
     if is_cursor && !selected {
-        ui.painter().rect_stroke(
-            rect,
-            RADIUS_CONTROL as f32,
-            Stroke::new(1.5, theme::with_alpha(p.accent, 128)),
-            egui::StrokeKind::Inside,
-        );
+        ui.painter()
+            .rect_filled(rect, theme::RADIUS_WELL as f32, p.card_hover);
     }
 
     let kind = list.kind(idx);
@@ -1750,12 +1740,7 @@ fn draw_tile(
         ui.painter().rect_filled(rect, corners, p.hover);
     }
     if is_cursor && !selected {
-        ui.painter().rect_stroke(
-            rect,
-            corners,
-            Stroke::new(1.5, theme::with_alpha(p.accent, 128)),
-            egui::StrokeKind::Inside,
-        );
+        ui.painter().rect_filled(rect, corners, p.card_hover);
     }
 
     let kind = list.kind(idx);
