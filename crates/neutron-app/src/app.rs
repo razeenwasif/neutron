@@ -177,8 +177,40 @@ enum Action {
     ReloadSites,
     /// Stop the download that is running.
     CancelDownload,
-    /// Stop the running server write.
-    CancelRemoteJob,
+    /// Stop the running server transfer by job id.
+    CancelRemoteJob(u64),
+    /// Download selected server items directly into the local Downloads folder.
+    DownloadRemoteToDownloads,
+    /// Compute recursive directory sizes on an SFTP server.
+    CalculateRemoteSizes(String, Vec<String>),
+    /// Copy the focused repo's Git branch name to the clipboard.
+    CopyGitBranch,
+    /// Open a terminal tab running `ntr status` / `git status` for the current repo.
+    RunNtrStatus,
+    /// Open a terminal tab inspecting the latest Neutrino CI run for the current repo.
+    InspectNtrCi,
+    /// Open interactive Storage Lens for a local or remote drive/folder.
+    OpenStorageLens(NodeId),
+    /// Close Storage Lens overlay.
+    CloseStorageLens,
+    /// Drill into a folder inside Storage Lens.
+    DrillStorageLens(NodeId, String),
+    /// Go up one level inside Storage Lens.
+    UpStorageLens,
+    /// Rescan current location inside Storage Lens.
+    RescanStorageLens,
+    /// Move a local folder/file to Trash from Storage Lens.
+    TrashFromStorageLens(PathBuf),
+    /// Toggle side-by-side directory diff in split panes.
+    ToggleComparePanes,
+    /// Sync missing and newer items from `src` pane's active tab to `dst` pane's active tab.
+    SyncPaneToOther { src: GroupId, dst: GroupId },
+    /// Open saved workspace layouts manager.
+    OpenLayouts,
+    CloseLayouts,
+    SaveLayout(String),
+    ApplyLayout(String),
+    DeleteLayout(String),
     /// Delete the selection from a server, once confirmed. See `ask`.
     DeleteOnServer,
     /// Open the connect dialog on this saved server.
@@ -376,12 +408,25 @@ struct Subject {
     names: Vec<String>,
 }
 
-/// A write to a server, running on its own connection.
+/// Remote files copied or cut from a server for download, same-server move/copy,
+/// or cross-server transfer.
+#[derive(Clone)]
+struct RemoteClipboard {
+    site_id: String,
+    dir: String,
+    entries: Vec<(String, neutron_core::EntryKind)>,
+    cut: bool,
+}
+
+/// A remote read/write/transfer job, running on its own worker with a pooled SSH handle.
 struct RemoteJob {
+    id: u64,
     /// "Uploading 3 items to files.example.com", for the status bar.
     label: String,
     /// The tab to re-read when it finishes.
     tab: TabId,
+    /// Optional source tab to refresh too (after a cross-pane Cut).
+    extra_refresh_tab: Option<TabId>,
     progress: std::sync::Arc<crate::remote_ops::Progress>,
     done: crossbeam_channel::Receiver<Result<String, String>>,
     /// A folder just created, to open in its rename box once it is listed.
@@ -581,8 +626,11 @@ pub struct NeutronApp {
     connect: crate::connect::ConnectDialog,
     /// A remote file being fetched so it can be opened.
     download: Option<DownloadJob>,
-    /// The write to a server in progress, if any. See `crate::remote_ops`.
-    remote_job: Option<RemoteJob>,
+    /// Active remote transfer/write queue. See `crate::remote_ops`.
+    remote_jobs: Vec<RemoteJob>,
+    next_remote_job: u64,
+    /// Remote selection clipboard (Copy/Cut off a server).
+    remote_clipboard: Option<RemoteClipboard>,
     /// Opened server files watched so local edits sync back on save.
     remote_edits: Vec<WatchedRemoteEdit>,
     remote_edits_checked: Instant,
@@ -592,7 +640,22 @@ pub struct NeutronApp {
     remote_drives: std::collections::HashMap<String, Vec<Place>>,
     remote_drives_tx: crossbeam_channel::Sender<(String, Vec<Place>)>,
     remote_drives_rx: crossbeam_channel::Receiver<(String, Vec<Place>)>,
+    probing_sites: std::collections::HashSet<String>,
     last_remote_probe: Instant,
+    remote_search_gen: u64,
+    remote_search_site: Option<String>,
+    remote_search_tx: crossbeam_channel::Sender<(u64, String, String, Result<Vec<neutron_remote::RemoteSearchHit>, String>)>,
+    remote_search_rx: crossbeam_channel::Receiver<(u64, String, String, Result<Vec<neutron_remote::RemoteSearchHit>, String>)>,
+    remote_sizes: std::collections::HashMap<(String, String), u64>,
+    remote_sizes_pending: std::collections::HashSet<(String, String)>,
+    remote_sizes_version: u64,
+    remote_sizes_tx: crossbeam_channel::Sender<(String, String, Option<u64>)>,
+    remote_sizes_rx: crossbeam_channel::Receiver<(String, String, Option<u64>)>,
+    vcs: crate::vcs::VcsService,
+    storage_lens: crate::storage_lens::StorageLens,
+    compare_panes: bool,
+    layouts: crate::layouts::Layouts,
+    layout_dialog: crate::layouts::LayoutDialog,
 
     /// Installed plugins, and the command running from one if any.
     plugins: crate::plugins::PluginRuntime,
@@ -852,6 +915,8 @@ impl NeutronApp {
         let (changed_tx, changed_rx) = crossbeam_channel::unbounded();
         let (remote_edit_tx, remote_edit_rx) = crossbeam_channel::unbounded();
         let (remote_drives_tx, remote_drives_rx) = crossbeam_channel::unbounded();
+        let (remote_search_tx, remote_search_rx) = crossbeam_channel::unbounded();
+        let (remote_sizes_tx, remote_sizes_rx) = crossbeam_channel::unbounded();
 
         // `Ctrl+V` never reaches the application through egui when the
         // clipboard holds files rather than text, which is the only case that
@@ -971,7 +1036,9 @@ impl NeutronApp {
             sites_error,
             connect: crate::connect::ConnectDialog::default(),
             download: None,
-            remote_job: None,
+            remote_jobs: Vec::new(),
+            next_remote_job: 1,
+            remote_clipboard: None,
             remote_edits: Vec::new(),
             remote_edits_checked: Instant::now(),
             remote_edit_tx,
@@ -979,7 +1046,18 @@ impl NeutronApp {
             remote_drives: std::collections::HashMap::new(),
             remote_drives_tx,
             remote_drives_rx,
+            probing_sites: std::collections::HashSet::new(),
             last_remote_probe: Instant::now(),
+            remote_search_gen: 0,
+            remote_search_site: None,
+            remote_search_tx,
+            remote_search_rx,
+            remote_sizes: std::collections::HashMap::new(),
+            remote_sizes_pending: std::collections::HashSet::new(),
+            remote_sizes_version: 0,
+            remote_sizes_tx,
+            remote_sizes_rx,
+            vcs: crate::vcs::VcsService::spawn(cc.egui_ctx.clone()),
             plugins,
             palette,
             archive_job: None,
@@ -1040,6 +1118,10 @@ impl NeutronApp {
             menu_reply: None,
             menu_tx,
             menu_rx,
+            storage_lens: crate::storage_lens::StorageLens::default(),
+            compare_panes: false,
+            layouts: crate::layouts::load(),
+            layout_dialog: crate::layouts::LayoutDialog::default(),
         };
         if restore_windows {
             app.restore_windows(cc);
@@ -1234,6 +1316,9 @@ impl NeutronApp {
             }
             Action::Refresh => {
                 if let Some(tab) = active {
+                    if let Some(loc) = self.workspace.tabs.get(&tab).map(|t| t.location().clone()) {
+                        self.vcs.invalidate(&loc);
+                    }
                     self.refresh_in_place(tab);
                 }
                 // The other columns are not the tab's listing, so a refresh
@@ -1457,9 +1542,105 @@ impl NeutronApp {
                     job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            Action::CancelRemoteJob => {
-                if let Some(job) = self.remote_job.as_ref() {
+            Action::CancelRemoteJob(id) => {
+                if let Some(job) = self.remote_jobs.iter().find(|j| j.id == id) {
                     job.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Action::DownloadRemoteToDownloads => self.download_remote_to_downloads(),
+            Action::CalculateRemoteSizes(site_id, dirs) => self.request_remote_sizes(&site_id, dirs),
+            Action::CopyGitBranch => self.copy_git_branch(ctx),
+            Action::RunNtrStatus => self.run_ntr_terminal(false),
+            Action::InspectNtrCi => self.run_ntr_terminal(true),
+            Action::OpenStorageLens(node) => {
+                let label = node.display_name();
+                self.storage_lens.open(node, label, &self.sites.sites, ctx);
+            }
+            Action::CloseStorageLens => self.storage_lens.close(),
+            Action::DrillStorageLens(node, label) => {
+                self.storage_lens.open(node, label, &self.sites.sites, ctx);
+            }
+            Action::UpStorageLens => {
+                if let Some((parent, label)) = self.storage_lens.parent_root() {
+                    self.storage_lens.open(parent, label, &self.sites.sites, ctx);
+                }
+            }
+            Action::RescanStorageLens => self.storage_lens.rescan(&self.sites.sites, ctx),
+            Action::TrashFromStorageLens(path) => {
+                let target = [path.clone()];
+                match neutron_shell::fileops::trash(&target) {
+                    Ok(_) => {
+                        self.notices.info(format!(
+                            "Moved {} to Trash",
+                            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+                        ));
+                        self.storage_lens.rescan(&self.sites.sites, ctx);
+                    }
+                    Err(e) => self.notices.error(format!("Could not move to Trash: {e}")),
+                }
+            }
+            Action::ToggleComparePanes => {
+                if self.compare_panes {
+                    self.compare_panes = false;
+                } else {
+                    if self.compare_pair().is_none() {
+                        self.workspace.split(Axis::Horizontal);
+                        self.notices.info("Compare mode on — open another folder in the second pane");
+                    }
+                    self.compare_panes = true;
+                }
+            }
+            Action::SyncPaneToOther { src, dst } => self.sync_pane_to_other(src, dst, ctx),
+            Action::OpenLayouts => {
+                self.layout_dialog.open = true;
+                self.layout_dialog.focus_input = true;
+            }
+            Action::CloseLayouts => self.layout_dialog.open = false,
+            Action::SaveLayout(name) => {
+                let saved = self.workspace.persist();
+                self.layouts.upsert(name.clone(), saved);
+                let snapshot = self.layouts.clone();
+                let notices = self.notice_tx.clone();
+                let wake = self.ctx.clone();
+                self.sta.submit(move || {
+                    if let Err(e) = crate::layouts::save(&snapshot) {
+                        report(&notices, format!("Could not save layouts: {e}"));
+                    }
+                    wake.request_repaint();
+                });
+                self.notices.info(format!("Saved layout “{name}”"));
+            }
+            Action::ApplyLayout(name) => {
+                if let Some(entry) = self.layouts.get(&name).cloned()
+                    && let Some(ws) = Workspace::restore(&entry.workspace)
+                {
+                    self.layout_dialog.open = false;
+                    self.compare_panes = false;
+                    self.workspace = ws;
+                    let tabs: Vec<(TabId, NodeId)> = self
+                        .workspace
+                        .tabs
+                        .values()
+                        .map(|t| (t.id, t.location().clone()))
+                        .collect();
+                    for (tab, location) in tabs {
+                        self.reload(tab, location);
+                    }
+                    self.notices.info(format!("Switched to layout “{name}”"));
+                }
+            }
+            Action::DeleteLayout(name) => {
+                if self.layouts.remove(&name) {
+                    let snapshot = self.layouts.clone();
+                    let notices = self.notice_tx.clone();
+                    let wake = self.ctx.clone();
+                    self.sta.submit(move || {
+                        if let Err(e) = crate::layouts::save(&snapshot) {
+                            report(&notices, format!("Could not save layouts: {e}"));
+                        }
+                        wake.request_repaint();
+                    });
+                    self.notices.info(format!("Deleted layout “{name}”"));
                 }
             }
             Action::ReloadPlugins => {
@@ -1482,8 +1663,10 @@ impl NeutronApp {
                 }
             }
 
+            Action::Clip { cut } if self.on_server() => self.remote_clip(cut),
             Action::Clip { cut: false } if self.in_archive() => self.copy_out_of_archive(),
             Action::Clip { cut: false } if self.in_tag_view() => {
+                self.remote_clipboard = None;
                 if let Some(paths) = self.chosen_paths() {
                     let notices = self.notice_tx.clone();
                     self.sta.submit(move || {
@@ -1495,10 +1678,16 @@ impl NeutronApp {
             }
             Action::Clip { cut } => {
                 if !self.refuse_without_a_path(if cut { "cut from" } else { "copy from" }) {
+                    self.remote_clipboard = None;
                     self.clip_selection(cut);
                 }
             }
             Action::Paste if self.on_server() => self.remote_paste(),
+            Action::Paste if !self.on_server() && self.remote_clipboard.is_some() => {
+                if !self.refuse_without_a_path("paste into") {
+                    self.paste_remote_to_local();
+                }
+            }
             Action::Paste => {
                 if !self.refuse_without_a_path("paste into") {
                     self.paste();
@@ -1558,10 +1747,14 @@ impl NeutronApp {
                     let mut folders = self.shown_folders(|_| true);
                     folders.extend(self.columns.folders());
                     self.sizer.request(folders);
+                    self.request_remote_sizes_for_visible_tabs();
                 } else {
                     // Forgotten, and each listing read again so its folders
                     // lose the sizes they were given.
                     self.sizer.clear();
+                    self.remote_sizes.clear();
+                    self.remote_sizes_pending.clear();
+                    self.remote_sizes_version = self.remote_sizes_version.wrapping_add(1);
                     let tabs: Vec<TabId> = self.workspace.tabs.keys().copied().collect();
                     for tab in tabs {
                         self.refresh_in_place(tab);
@@ -1970,7 +2163,10 @@ impl NeutronApp {
                 self.finder.toggle(mode);
                 self.refresh_finder();
             }
-            Action::CloseFinder => self.finder.close(),
+            Action::CloseFinder => {
+                self.remote_search_site = None;
+                self.finder.close();
+            }
             Action::SetFinderNeedle(text) => {
                 self.finder.needle = text;
                 // Reset rather than clamp: the previous highlight referred to a
@@ -2370,6 +2566,9 @@ impl NeutronApp {
             return;
         }
         for site in sftp_sites {
+            if !self.probing_sites.insert(site.id.clone()) {
+                continue;
+            }
             let tx = self.remote_drives_tx.clone();
             let wake = self.ctx.clone();
             let _ = std::thread::Builder::new()
@@ -2400,6 +2599,7 @@ impl NeutronApp {
 
     fn drain_remote_drives(&mut self) {
         while let Ok((site_id, places)) = self.remote_drives_rx.try_recv() {
+            self.probing_sites.remove(&site_id);
             if places.is_empty() {
                 self.remote_drives.remove(&site_id);
             } else {
@@ -2782,28 +2982,106 @@ impl NeutronApp {
 
     /// Gives this window's folders the sizes added up since they last looked.
     fn apply_folder_sizes(&mut self) {
-        let version = self.sizer.version();
+        let version = self.sizer.version().wrapping_add(self.remote_sizes_version);
         for (id, tab) in self.workspace.tabs.iter_mut() {
             if self.sizes_seen.get(id) == Some(&version) {
                 continue;
             }
             self.sizes_seen.insert(*id, version);
-            let Some(dir) = tab.location().as_path().map(Path::to_path_buf) else { continue };
             let mut changed = false;
-            for i in 0..tab.list.len() {
-                if !tab.list.kind(i).is_container() {
-                    continue;
+            if let Some(dir) = tab.location().as_path().map(Path::to_path_buf) {
+                for i in 0..tab.list.len() {
+                    if !tab.list.kind(i).is_container() {
+                        continue;
+                    }
+                    if let Some(size) = self.sizer.get(&dir.join(tab.list.name(i)))
+                        && !(tab.list.size_known(i) && tab.list.size(i) == size)
+                    {
+                        tab.list.set_folder_size(i, size);
+                        changed = true;
+                    }
                 }
-                if let Some(size) = self.sizer.get(&dir.join(tab.list.name(i)))
-                    && !(tab.list.size_known(i) && tab.list.size(i) == size)
-                {
-                    tab.list.set_folder_size(i, size);
-                    changed = true;
+            } else if let Some((site, dir)) = tab
+                .location()
+                .as_remote()
+                .map(|(s, d)| (s.to_owned(), d.to_owned()))
+            {
+                for i in 0..tab.list.len() {
+                    if !tab.list.kind(i).is_container() {
+                        continue;
+                    }
+                    if let Ok(full) = neutron_remote::path::join(&dir, tab.list.name(i))
+                        && let Some(&size) = self.remote_sizes.get(&(site.clone(), full))
+                        && !(tab.list.size_known(i) && tab.list.size(i) == size)
+                    {
+                        tab.list.set_folder_size(i, size);
+                        changed = true;
+                    }
                 }
+            } else {
+                continue;
             }
             let by_size = tab.view.sort.column == SortColumn::Size || tab.view.sort.group == neutron_core::GroupBy::Size;
             if changed && by_size {
                 neutron_core::sort::sort(&mut tab.list, tab.view.sort);
+            }
+        }
+    }
+
+    fn request_remote_sizes(&mut self, site_id: &str, dirs: Vec<String>) {
+        let Some(site) = self.sites.get(site_id).cloned() else {
+            return;
+        };
+        if site.protocol != neutron_remote::Protocol::Sftp {
+            return;
+        }
+        for dir in dirs {
+            let norm = neutron_remote::path::normalize(&dir);
+            let key = (site_id.to_owned(), norm.clone());
+            if self.remote_sizes.contains_key(&key) || !self.remote_sizes_pending.insert(key.clone()) {
+                continue;
+            }
+            let site_clone = site.clone();
+            let site_key = site_id.to_owned();
+            let tx = self.remote_sizes_tx.clone();
+            let wake = self.ctx.clone();
+            let _ = std::thread::Builder::new()
+                .name("neutron-remote-size".into())
+                .spawn(move || {
+                    let size = crate::remote::connect_checked(&site_clone)
+                        .ok()
+                        .and_then(|mut t| t.dir_size(&norm).ok());
+                    let _ = tx.send((site_key, norm, size));
+                    wake.request_repaint();
+                });
+        }
+    }
+
+    fn request_remote_sizes_for_visible_tabs(&mut self) {
+        let requests: Vec<(String, Vec<String>)> = self
+            .workspace
+            .tabs
+            .values()
+            .filter_map(|t| {
+                let (site, dir) = t.location().as_remote()?;
+                let dirs: Vec<String> = (0..t.list.len())
+                    .filter(|&i| t.list.kind(i).is_container())
+                    .filter_map(|i| neutron_remote::path::join(dir, t.list.name(i)).ok())
+                    .collect();
+                (!dirs.is_empty()).then(|| (site.to_owned(), dirs))
+            })
+            .collect();
+        for (site_id, dirs) in requests {
+            self.request_remote_sizes(&site_id, dirs);
+        }
+    }
+
+    fn pump_remote_sizes(&mut self) {
+        while let Ok((site_id, dir, size)) = self.remote_sizes_rx.try_recv() {
+            self.remote_sizes_pending.remove(&(site_id.clone(), dir.clone()));
+            if let Some(size) = size {
+                self.remote_sizes.insert((site_id, dir), size);
+                self.remote_sizes_version = self.remote_sizes_version.wrapping_add(1);
             }
         }
     }
@@ -3446,6 +3724,15 @@ impl NeutronApp {
             rows.push(MenuItem::separator());
             rows.push(row("Ask Claude Code", Action::AskAgent(crate::agent::Agent::Claude), &mut actions));
             rows.push(row("Ask Antigravity", Action::AskAgent(crate::agent::Agent::Antigravity), &mut actions));
+            if let Some(vcs) = self.vcs.peek(tab.location()) {
+                if vcs.branch.is_some() {
+                    rows.push(row("Copy Git Branch", Action::CopyGitBranch, &mut actions));
+                }
+                if vcs.ntr.is_some() {
+                    rows.push(row("Run Neutrino Status", Action::RunNtrStatus, &mut actions));
+                    rows.push(row("Inspect Neutrino CI", Action::InspectNtrCi, &mut actions));
+                }
+            }
             rows.push(MenuItem::separator());
             let views = [
                 ("List", file_list::ViewMode::List),
@@ -3640,6 +3927,16 @@ impl NeutronApp {
                 items.push(MenuItem::separator());
                 target
             });
+            items.push(add(&mut next, "Copy", Action::Clip { cut: false }, &mut self.menu_actions, false));
+            items.push(add(&mut next, "Cut", Action::Clip { cut: true }, &mut self.menu_actions, false));
+            items.push(add(
+                &mut next,
+                "Download to Downloads",
+                Action::DownloadRemoteToDownloads,
+                &mut self.menu_actions,
+                false,
+            ));
+            items.push(MenuItem::separator());
             items.push(add(&mut next, "Rename", Action::BeginRename, &mut self.menu_actions, false));
             items.push(add(
                 &mut next,
@@ -3648,10 +3945,32 @@ impl NeutronApp {
                 &mut self.menu_actions,
                 false,
             ));
+            if let Some((site_id, dir, rfolders)) = self.workspace.active_tab().and_then(|t| {
+                let (s, d) = t.location().as_remote()?;
+                let dirs: Vec<String> = visible_selection(t)
+                    .into_iter()
+                    .filter(|&i| t.list.kind(i).is_container())
+                    .filter_map(|i| neutron_remote::path::join(d, t.list.name(i)).ok())
+                    .collect();
+                (!dirs.is_empty()).then(|| (s.to_owned(), d.to_owned(), dirs))
+            }) {
+                let _ = dir;
+                items.push(add(
+                    &mut next,
+                    "Calculate Size",
+                    Action::CalculateRemoteSizes(site_id, rfolders),
+                    &mut self.menu_actions,
+                    false,
+                ));
+            }
             items.push(MenuItem::separator());
             items.push(add(&mut next, "New Folder", Action::NewFolder, &mut self.menu_actions, false));
             items.push(add(&mut next, "New File", Action::NewFile(None), &mut self.menu_actions, false));
             items.push(add(&mut next, "Paste", Action::Paste, &mut self.menu_actions, false));
+            items.push(MenuItem::separator());
+            items.push(add(&mut next, "Open in Terminal", Action::OpenTerminal, &mut self.menu_actions, false));
+            items.push(add(&mut next, "Ask Claude Code", Action::AskAgent(crate::agent::Agent::Claude), &mut self.menu_actions, false));
+            items.push(add(&mut next, "Ask Antigravity", Action::AskAgent(crate::agent::Agent::Antigravity), &mut self.menu_actions, false));
         } else {
             items.push(add(&mut next, "New Folder", Action::NewFolder, &mut self.menu_actions, false));
             items.push(add(&mut next, "New File", Action::NewFile(None), &mut self.menu_actions, false));
@@ -3661,6 +3980,10 @@ impl NeutronApp {
                 items.push(row);
                 target
             });
+            items.push(MenuItem::separator());
+            items.push(add(&mut next, "Open in Terminal", Action::OpenTerminal, &mut self.menu_actions, false));
+            items.push(add(&mut next, "Ask Claude Code", Action::AskAgent(crate::agent::Agent::Claude), &mut self.menu_actions, false));
+            items.push(add(&mut next, "Ask Antigravity", Action::AskAgent(crate::agent::Agent::Antigravity), &mut self.menu_actions, false));
         }
         self.menu = Some(neutron_ui::MenuState::new(items, at));
         self.menu_reply = None;
@@ -3782,6 +4105,8 @@ impl NeutronApp {
             || self.tag_editor.is_some()
             || self.batch_rename.is_some()
             || self.search_dialog.is_some()
+            || self.storage_lens.is_open()
+            || self.layout_dialog.open
     }
 
     /// What a menu bar item does, now.
@@ -3923,7 +4248,7 @@ impl NeutronApp {
                 // to refreshing the folder.
                 C::ShowOriginal => !(selected.len() == 1 && tab.is_some_and(|t| t.list.is_alias(selected[0]))),
                 C::NewFolder | C::NewFile | C::Paste | C::AddToSidebar => dir.is_none() && !on_server,
-                C::Terminal | C::AskClaude | C::AskAntigravity => dir.is_none(),
+                C::Terminal | C::AskClaude | C::AskAntigravity => dir.is_none() && !on_server,
                 C::Back => !tab.is_some_and(|t| t.history.can_go_back()),
                 C::Forward => !tab.is_some_and(|t| t.history.can_go_forward()),
                 C::Eject => !ejectable,
@@ -4879,6 +5204,7 @@ struct WindowState {
     pending_rename: Option<(TabId, String)>,
     tag_editor: Option<TagEditor>,
     batch_rename: Option<BatchRenameDialog>,
+    compare_panes: bool,
 }
 
 /// The Rename Items dialog: the folder, each item's name and whether it is a
@@ -4955,6 +5281,7 @@ impl WindowState {
             pending_rename: None,
             tag_editor: None,
             batch_rename: None,
+            compare_panes: false,
         }
     }
 }
@@ -5044,6 +5371,33 @@ impl NeutronApp {
         self.pump_download();
         self.pump_remote_job();
         self.pump_remote_edits();
+        self.pump_remote_search();
+        self.pump_remote_sizes();
+        if self.storage_lens.pump() {
+            ctx.request_repaint();
+        }
+        if self.storage_lens.is_loading() {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+        self.vcs.pump();
+        let vcs_targets: Vec<(NodeId, Option<neutron_remote::Site>)> = self
+            .workspaces()
+            .flat_map(|w| {
+                w.groups
+                    .values()
+                    .filter_map(move |g| g.active_tab().and_then(|t| w.tabs.get(&t)))
+            })
+            .map(|tab| {
+                let site = tab
+                    .location()
+                    .as_remote()
+                    .and_then(|(s, _)| self.sites.get(s).cloned());
+                (tab.location().clone(), site)
+            })
+            .collect();
+        for (loc, site) in vcs_targets {
+            self.vcs.request_if_needed(&loc, site.as_ref());
+        }
         self.drain_notices(ctx);
         self.sync_watchers(ctx);
         self.pump_columns();
@@ -5199,6 +5553,8 @@ impl NeutronApp {
         // overlay's own keys win while it is open.
         self.finder_overlay(ui, &p, &mut actions);
         self.connect_overlay(ui, &p, &mut actions);
+        self.storage_lens_overlay(&ctx, &p, &mut actions);
+        self.layout_dialog_overlay(&ctx, &p, &mut actions);
 
         // Last of all: a question is answered before anything underneath it is
         // touched, and its scrim has to cover the overlays too.
@@ -5348,6 +5704,7 @@ impl NeutronApp {
         swap(&mut self.pending_rename, &mut window.pending_rename);
         swap(&mut self.tag_editor, &mut window.tag_editor);
         swap(&mut self.batch_rename, &mut window.batch_rename);
+        swap(&mut self.compare_panes, &mut window.compare_panes);
     }
 
     /// An id for one of a window's own panels. The first window keeps the
@@ -5467,6 +5824,7 @@ impl NeutronApp {
         // Set when a remote folder arrives, and applied after the loop — `tab`
         // borrows `self.workspace` mutably for the whole body.
         let mut cleared_remote_note = false;
+        let mut pending_remote_size_batches: Vec<(String, Vec<String>)> = Vec::new();
 
         let tabs = &self.workspace.tabs;
         let mine = take_mine(&mut self.mail.loads, |(tab, ..)| tabs.contains_key(tab));
@@ -5489,14 +5847,26 @@ impl NeutronApp {
                     };
                     tab.list = loaded.list;
                     self.sizes_seen.remove(&tab_id);
-                    if self.all_sizes
-                        && let Some(dir) = tab.location().as_path()
-                    {
-                        let folders = (0..tab.list.len())
-                            .filter(|&i| tab.list.kind(i).is_container())
-                            .map(|i| dir.join(tab.list.name(i)))
-                            .collect();
-                        self.sizer.request(folders);
+                    if self.all_sizes {
+                        if let Some(dir) = tab.location().as_path() {
+                            let folders = (0..tab.list.len())
+                                .filter(|&i| tab.list.kind(i).is_container())
+                                .map(|i| dir.join(tab.list.name(i)))
+                                .collect();
+                            self.sizer.request(folders);
+                        } else if let Some((site, dir)) = tab
+                            .location()
+                            .as_remote()
+                            .map(|(s, d)| (s.to_owned(), d.to_owned()))
+                        {
+                            let rfolders: Vec<String> = (0..tab.list.len())
+                                .filter(|&i| tab.list.kind(i).is_container())
+                                .filter_map(|i| neutron_remote::path::join(&dir, tab.list.name(i)).ok())
+                                .collect();
+                            if !rfolders.is_empty() {
+                                pending_remote_size_batches.push((site, rfolders));
+                            }
+                        }
                     }
                     // The loader sorts and hides, but it never sees the filter
                     // field — a refresh keeps the filter text, so without this
@@ -5531,6 +5901,9 @@ impl NeutronApp {
             // A folder that opened is its own proof, so "Connecting…" goes.
             // An error stays: it has still not been acknowledged.
             self.notices.dismiss_info();
+        }
+        for (site, rfolders) in pending_remote_size_batches {
+            self.request_remote_sizes(&site, rfolders);
         }
 
         // Title tracks the focused tab, so the taskbar entry is identifiable
@@ -5768,6 +6141,9 @@ impl NeutronApp {
                 actions.push(Action::CycleTab(if shift { -1 } else { 1 }));
             }
 
+            if i.modifiers.command && alt && !shift && !i.modifiers.ctrl && i.key_pressed(egui::Key::D) {
+                actions.push(Action::ToggleComparePanes);
+            }
             if mac && !(shift || alt || i.modifiers.ctrl) {
                 bindings.extend([
                     (egui::Key::A, Action::SelectAll),
@@ -6635,12 +7011,62 @@ impl NeutronApp {
 
         match self.finder.mode {
             crate::finder::Mode::Commands => {
+                self.remote_search_site = None;
                 let matched = crate::finder::match_commands(&self.palette, &self.finder.needle);
                 let status = format!("{} of {} commands", matched.len(), self.palette.len());
                 self.finder.set_command_rows(matched, status);
             }
 
             crate::finder::Mode::Files => {
+                if let Some((site_id, remote_dir)) = self
+                    .workspace
+                    .active_tab()
+                    .and_then(|t| t.location().as_remote())
+                    .map(|(s, p)| (s.to_owned(), p.to_owned()))
+                {
+                    let Some(site) = self.sites.get(&site_id).cloned() else {
+                        self.remote_search_site = None;
+                        self.finder.set_rows(Vec::new(), "Unknown remote server".into());
+                        return;
+                    };
+                    if site.protocol != neutron_remote::Protocol::Sftp {
+                        self.remote_search_site = None;
+                        self.finder.set_rows(
+                            Vec::new(),
+                            "Server-side search is supported on SFTP servers only".into(),
+                        );
+                        return;
+                    }
+                    self.remote_search_site = Some(site_id.clone());
+                    let needle = self.finder.needle.trim().to_owned();
+                    if needle.is_empty() {
+                        self.finder.set_rows(
+                            Vec::new(),
+                            format!("Type to search {}…", site.display()),
+                        );
+                        return;
+                    }
+                    self.remote_search_gen = self.remote_search_gen.wrapping_add(1);
+                    let search_gen = self.remote_search_gen;
+                    self.finder.set_rows(
+                        Vec::new(),
+                        format!("Searching {}…", site.display()),
+                    );
+                    let tx = self.remote_search_tx.clone();
+                    let wake = self.ctx.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("neutron-remote-search".into())
+                        .spawn(move || {
+                            let res = crate::remote::connect_checked(&site).and_then(|mut t| {
+                                t.search(&remote_dir, &needle, 120).map_err(|e| e.to_string())
+                            });
+                            let _ = tx.send((search_gen, site_id, needle, res));
+                            wake.request_repaint();
+                        });
+                    return;
+                }
+
+                self.remote_search_site = None;
                 let Some(scope) = self
                     .workspace
                     .active_tab()
@@ -6669,6 +7095,7 @@ impl NeutronApp {
             }
 
             crate::finder::Mode::Everything => {
+                self.remote_search_site = None;
                 match self.index.state() {
                     IndexState::Ready(_) => self.index.search(&self.finder.needle),
                     IndexState::Unavailable(why) => {
@@ -6773,6 +7200,19 @@ impl NeutronApp {
 
         self.finder.close();
 
+        if let Some(site_id) = self.remote_search_site.take() {
+            let target = if row.is_dir {
+                neutron_remote::path::join(&row.secondary, &row.primary)
+                    .unwrap_or_else(|_| row.secondary.clone())
+            } else {
+                row.secondary.clone()
+            };
+            if let Some(tab) = self.workspace.active_tab_id() {
+                self.navigate(tab, NodeId::remote(site_id, target));
+            }
+            return;
+        }
+
         // A folder result opens the folder itself; a file result opens the
         // folder containing it, since there is nowhere else to put the user.
         let target = if row.is_dir {
@@ -6782,6 +7222,50 @@ impl NeutronApp {
         };
         if let Some(tab) = self.workspace.active_tab_id() {
             self.navigate(tab, NodeId::Path(target));
+        }
+    }
+
+    fn pump_remote_search(&mut self) {
+        while let Ok((search_gen, site_id, needle, outcome)) = self.remote_search_rx.try_recv() {
+            if search_gen != self.remote_search_gen || !self.finder.open {
+                continue;
+            }
+            self.remote_search_site = Some(site_id);
+            match outcome {
+                Ok(hits) => {
+                    let mut matcher = neutron_fuzzy::FuzzyMatcher::new();
+                    let count = hits.len();
+                    let rows: Vec<crate::finder::Row> = hits
+                        .into_iter()
+                        .map(|hit| {
+                            let primary = neutron_remote::path::file_name(&hit.path);
+                            let secondary = neutron_remote::path::parent(&hit.path)
+                                .unwrap_or_else(|| "/".to_owned());
+                            let matched = matcher
+                                .score(&primary, &needle)
+                                .map(|m| m.positions)
+                                .unwrap_or_default();
+                            crate::finder::Row {
+                                primary,
+                                secondary,
+                                matched,
+                                is_dir: hit.is_dir,
+                            }
+                        })
+                        .collect();
+                    let status = if count == 0 {
+                        "No matching remote files".to_owned()
+                    } else if count == 1 {
+                        "1 remote match".to_owned()
+                    } else {
+                        format!("{count} remote matches")
+                    };
+                    self.finder.set_rows(rows, status);
+                }
+                Err(why) => {
+                    self.finder.set_rows(Vec::new(), format!("Search failed: {why}"));
+                }
+            }
         }
     }
 
@@ -6859,6 +7343,20 @@ impl NeutronApp {
             C::NewSmartFolder => Some(Action::NewSmartFolder),
             C::AskAntigravity => Some(Action::AskAgent(crate::agent::Agent::Antigravity)),
             C::NewWindow => Some(Action::NewWindow),
+            C::CopyGitBranch => Some(Action::CopyGitBranch),
+            C::RunNtrStatus => Some(Action::RunNtrStatus),
+            C::InspectNtrCi => Some(Action::InspectNtrCi),
+            C::ComparePanes => Some(Action::ToggleComparePanes),
+            C::SaveWorkspaceLayout | C::SwitchWorkspaceLayout => Some(Action::OpenLayouts),
+            C::SyncPanes => self.compare_pair().and_then(|(lg, _, rg, _)| {
+                if self.workspace.focused == lg {
+                    Some(Action::SyncPaneToOther { src: lg, dst: rg })
+                } else if self.workspace.focused == rg {
+                    Some(Action::SyncPaneToOther { src: rg, dst: lg })
+                } else {
+                    Some(Action::SyncPaneToOther { src: lg, dst: rg })
+                }
+            }),
 
             C::ConnectServer => Some(Action::OpenConnect),
             C::ReloadSites => Some(Action::ReloadSites),
@@ -6991,7 +7489,7 @@ impl NeutronApp {
             || !self.transfers.is_empty()
             || self.plugins.running_label().is_some()
             || self.download.is_some()
-            || self.remote_job.is_some()
+            || !self.remote_jobs.is_empty()
             || self.startup.frame_percentiles().is_some_and(|(_, p99)| p99 > 8.0)
     }
 
@@ -7383,6 +7881,32 @@ impl NeutronApp {
     /// Runs on an apartment thread like every other launch: creating a process
     /// reads the registry and can block, and the frame must not.
     fn open_terminal(&mut self) {
+        if let Some((site_id, remote_dir)) = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.location().as_remote())
+            .map(|(s, p)| (s.to_owned(), p.to_owned()))
+        {
+            let Some(site) = self.sites.get(&site_id).cloned() else {
+                self.notices.error(format!("No saved server called {site_id:?}"));
+                return;
+            };
+            if site.protocol != neutron_remote::Protocol::Sftp {
+                self.notices.info("SSH terminals work with SFTP servers only");
+                return;
+            }
+            let local_cwd = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let label = format!(
+                "{} — {}",
+                site.display(),
+                neutron_remote::path::file_name(&remote_dir),
+            );
+            let program = crate::term::Program::ssh(&site, &remote_dir);
+            self.open_program(local_cwd, program, &label);
+            return;
+        }
         let Some(dir) = self.focused_folder("open a terminal in") else {
             return;
         };
@@ -7391,10 +7915,99 @@ impl NeutronApp {
 
     /// Opens an agent on the focused folder, told what is selected there.
     fn ask_agent(&mut self, agent: crate::agent::Agent) {
+        if let Some((site_id, remote_dir)) = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.location().as_remote())
+            .map(|(s, p)| (s.to_owned(), p.to_owned()))
+        {
+            let Some(site) = self.sites.get(&site_id).cloned() else {
+                self.notices.error(format!("No saved server called {site_id:?}"));
+                return;
+            };
+            if site.protocol != neutron_remote::Protocol::Sftp {
+                self.notices.info("Remote agents require an SFTP server");
+                return;
+            }
+            let selected: Vec<String> = self
+                .workspace
+                .active_tab()
+                .map(|t| {
+                    visible_selection(t)
+                        .into_iter()
+                        .map(|i| t.list.name(i).to_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let local_cwd = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let label = format!("{} · {}", agent.label(), site.display());
+            let program = crate::agent::remote_program(agent, &site, &remote_dir, &selected);
+            self.open_program(local_cwd, program, &label);
+            return;
+        }
         let Some(dir) = self.focused_folder("ask an agent about") else { return };
         let selected = self.chosen_paths().unwrap_or_default();
         let program = crate::agent::program(agent, &dir, &selected);
         self.open_program(dir, program, agent.label());
+    }
+
+    fn copy_git_branch(&mut self, ctx: &egui::Context) {
+        let Some(tab) = self.workspace.active_tab() else { return };
+        let Some(branch) = self.vcs.peek(tab.location()).and_then(|v| v.branch.clone()) else {
+            self.notices.info("This folder is not inside a Git repository");
+            return;
+        };
+        ctx.copy_text(branch.clone());
+        self.notices.info(format!("Copied branch “{branch}”"));
+    }
+
+    fn run_ntr_terminal(&mut self, ci: bool) {
+        let Some(tab) = self.workspace.active_tab() else { return };
+        let loc = tab.location().clone();
+        let slug = self.vcs.peek(&loc).and_then(|v| v.ntr.as_ref().map(|n| n.slug.clone()));
+        let run_id = self
+            .vcs
+            .peek(&loc)
+            .and_then(|v| v.ntr.as_ref().and_then(|n| n.ci.as_ref().map(|(id, _)| id.clone())));
+
+        let snippet = match (ci, slug.as_deref(), run_id.as_deref()) {
+            (true, Some(s), Some(id)) => {
+                format!("ntr -r {s} runs && echo '' && ntr -r {s} run {id}")
+            }
+            (true, Some(s), None) => format!("ntr -r {s} runs"),
+            (false, Some(s), _) => format!("git status -sb && echo '' && ntr -r {s} runs | head -n 5"),
+            (_, None, _) => "git status -sb".to_owned(),
+        };
+        let label = if ci { "Neutrino CI" } else { "Neutrino Status" };
+
+        if let Some((site_id, remote_dir)) = loc.as_remote() {
+            let Some(site) = self.sites.get(site_id).cloned() else { return };
+            let dir_q = neutron_remote::sftp::shell_quote_posix(&neutron_remote::path::normalize(remote_dir));
+            let inner = format!("cd {dir_q} && export PATH=\"$HOME/.neutrino/bin:$PATH\"; {snippet}; exec ${{SHELL:-/bin/sh}} -l");
+            let mut argv = crate::term::ssh_base_args(&site);
+            argv.push(inner);
+            let local_cwd = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"));
+            self.open_program(
+                local_cwd,
+                crate::term::Program { command: Some(argv), env: Vec::new() },
+                label,
+            );
+            return;
+        }
+        if let Some(dir) = loc.as_path().map(Path::to_path_buf) {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+            let inner = format!("export PATH=\"$HOME/.neutrino/bin:$PATH\"; {snippet}; exec \"$0\" -l");
+            let argv = vec![shell.clone(), "-l".into(), "-c".into(), inner, shell];
+            self.open_program(
+                dir,
+                crate::term::Program { command: Some(argv), env: Vec::new() },
+                label,
+            );
+        }
     }
 
     /// Opens a terminal tab in the focused pane running `program` in `dir`.
@@ -7758,16 +8371,29 @@ impl NeutronApp {
 
     /// The running download, or what the last remote operation said.
     fn download_status(&self, ui: &mut egui::Ui, p: &Palette, actions: &mut Vec<Action>) {
-        if let Some(job) = self.remote_job.as_ref() {
+        for (idx, job) in self.remote_jobs.iter().enumerate() {
+            if idx >= 2 {
+                let more = self.remote_jobs.len() - idx;
+                ui.colored_label(p.text_faint, format!("+{more} queued"));
+                break;
+            }
             if ui
                 .add(egui::Button::new(egui::RichText::new("Stop").size(11.0)).small())
-                .on_hover_text("Stop after the item in progress. A partly sent file is removed.")
+                .on_hover_text("Stop after the item in progress. Any partial file is removed.")
                 .clicked()
             {
-                actions.push(Action::CancelRemoteJob);
+                actions.push(Action::CancelRemoteJob(job.id));
             }
             let sent = job.progress.bytes.load(std::sync::atomic::Ordering::Relaxed);
-            let label = if sent > 0 {
+            let bps = job.progress.throughput_bps();
+            let label = if sent > 0 && bps >= 1.0 {
+                format!(
+                    "{} — {} ({}/s)",
+                    job.label,
+                    neutron_ui::format::size(Some(sent)),
+                    neutron_ui::format::size(Some(bps as u64)),
+                )
+            } else if sent > 0 {
                 format!("{} — {}", job.label, neutron_ui::format::size(Some(sent)))
             } else {
                 format!("{}…", job.label)
@@ -8745,6 +9371,7 @@ impl NeutronApp {
                 .map(|(_, text)| text.as_str()),
             shown,
             total,
+            vcs: self.vcs.peek(tab.location()),
         };
         if let Some(a) = header::show(ui, p, group_id, &head) {
             // Every header control acts on its own pane, so using one focuses
@@ -8846,6 +9473,7 @@ impl NeutronApp {
             ) {
                 actions.push(match hit {
                     crate::dashboard::Chosen::Go(id) => Action::Navigate(id),
+                    crate::dashboard::Chosen::Inspect(id) => Action::OpenStorageLens(id),
                     crate::dashboard::Chosen::Open(path) => Action::OpenRecent(path),
                     crate::dashboard::Chosen::Forget(path) => Action::ForgetRecent(path),
                 });
@@ -8879,6 +9507,10 @@ impl NeutronApp {
             thumbs: &self.thumbs,
             texture: self.icon_texture,
             dir: tab.location().as_path().map(|p| p.to_path_buf()),
+            remote: tab
+                .location()
+                .as_remote()
+                .and_then(|(s, p)| self.sites.get(s).cloned().map(|site| (site, p.to_owned()))),
         };
 
         // Only when the cut happened in the folder this pane is showing:
@@ -8888,8 +9520,16 @@ impl NeutronApp {
             .then_some(&self.cut_names)
             .filter(|names| !names.is_empty());
 
+        let pane_diff = self.pane_diff_for(group_id, tab);
+        if let Some((_tags, other_group, only_count, newer_count, diff_count)) = &pane_diff {
+            self.draw_compare_strip(ui, p, group_id, *other_group, *only_count, *newer_count, *diff_count, actions);
+        }
+
+        let vcs_entries = self.vcs.peek(tab.location()).map(|v| &v.entries);
         let marks = file_list::Marks {
             selection: &tab.selection,
+            vcs: vcs_entries,
+            diff: pane_diff.as_ref().map(|(tags, ..)| tags),
             cut,
             // Only in the pane that owns it. A split showing the same
             // folder twice would otherwise draw two boxes, both bound to
@@ -9006,6 +9646,9 @@ impl NeutronApp {
                 thumbs: &self.thumbs,
                 texture: self.icon_texture,
                 dir: d.as_path().map(Path::to_path_buf),
+                remote: d
+                    .as_remote()
+                    .and_then(|(s, p)| self.sites.get(s).cloned().map(|site| (site, p.to_owned()))),
             })
             .collect();
 
@@ -9369,10 +10012,42 @@ impl NeutronApp {
         })
     }
 
-    /// Runs `work` against the server `tab` is showing, on a thread of its own.
-    ///
-    /// One at a time: a second write while the first is still going would
-    /// race it for the same names, and the status bar has room for one.
+    fn enqueue_remote_job(
+        &mut self,
+        tab: TabId,
+        extra_refresh_tab: Option<TabId>,
+        label: String,
+        rename_after: Option<String>,
+        work: impl FnOnce(&crate::remote_ops::Progress) -> Result<String, String> + Send + 'static,
+    ) {
+        let id = self.next_remote_job;
+        self.next_remote_job = self.next_remote_job.wrapping_add(1);
+        let progress = std::sync::Arc::new(crate::remote_ops::Progress::default());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let worker_progress = std::sync::Arc::clone(&progress);
+        let wake = self.ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("neutron-remote-{id}"))
+            .spawn(move || {
+                let _ = tx.send(work(&worker_progress));
+                wake.request_repaint();
+            });
+        if let Err(e) = spawned {
+            self.notices.error(format!("Could not start: {e}"));
+            return;
+        }
+        self.remote_jobs.push(RemoteJob {
+            id,
+            label,
+            tab,
+            extra_refresh_tab,
+            progress,
+            done: rx,
+            rename_after,
+        });
+    }
+
+    /// Runs `work` against the server `tab` is showing, on a worker thread.
     fn start_remote(
         &mut self,
         tab: TabId,
@@ -9382,10 +10057,6 @@ impl NeutronApp {
         + Send
         + 'static,
     ) {
-        if let Some(running) = self.remote_job.as_ref() {
-            self.notices.info(format!("Still busy: {}", running.label));
-            return;
-        }
         let Some((site_id, dir)) = self
             .workspace
             .tabs
@@ -9399,47 +10070,165 @@ impl NeutronApp {
             self.notices.error(format!("No saved server called {site_id:?}"));
             return;
         };
-
-        let progress = std::sync::Arc::new(crate::remote_ops::Progress::default());
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let worker_progress = std::sync::Arc::clone(&progress);
-        let wake = self.ctx.clone();
-        let spawned = std::thread::Builder::new()
-            .name("neutron-remote-write".into())
-            .spawn(move || {
-                let _ = tx.send(work(&site, &dir, &worker_progress));
-                wake.request_repaint();
-            });
-        if let Err(e) = spawned {
-            self.notices.error(format!("Could not start: {e}"));
-            return;
-        }
-        self.remote_job = Some(RemoteJob { label, tab, progress, done: rx, rename_after });
+        self.enqueue_remote_job(tab, None, label, rename_after, move |progress| {
+            work(&site, &dir, progress)
+        });
     }
 
     fn pump_remote_job(&mut self) {
-        let Some(job) = self.remote_job.as_ref() else {
+        if self.remote_jobs.is_empty() {
             return;
-        };
-        let Ok(outcome) = job.done.try_recv() else {
-            return;
-        };
-        let Some(job) = self.remote_job.take() else {
-            return;
-        };
-        match outcome {
-            Ok(receipt) => {
-                self.notices.info(receipt);
-                if let Some(name) = job.rename_after {
-                    self.pending_rename = Some((job.tab, name));
+        }
+        let mut completed = Vec::new();
+        let mut remaining = Vec::with_capacity(self.remote_jobs.len());
+        for job in std::mem::take(&mut self.remote_jobs) {
+            match job.done.try_recv() {
+                Ok(outcome) => completed.push((job, outcome)),
+                Err(crossbeam_channel::TryRecvError::Empty) => remaining.push(job),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    completed.push((job, Err("worker ended unexpectedly".to_owned())));
                 }
             }
-            Err(reason) => self.notices.error(format!("{} — {reason}", job.label)),
         }
-        // Re-read whatever happened, including a write that failed partway:
-        // the listing is the only account of the server that is true.
-        self.refresh_in_place(job.tab);
+        self.remote_jobs = remaining;
+        if completed.is_empty() {
+            return;
+        }
+        for (job, outcome) in completed {
+            match outcome {
+                Ok(receipt) => {
+                    self.notices.info(receipt);
+                    if let Some(name) = job.rename_after {
+                        self.pending_rename = Some((job.tab, name));
+                    }
+                }
+                Err(reason) => self.notices.error(format!("{} — {reason}", job.label)),
+            }
+            self.refresh_in_place(job.tab);
+            if let Some(other) = job.extra_refresh_tab {
+                if other != job.tab {
+                    self.refresh_in_place(other);
+                }
+            }
+        }
         self.columns.clear();
+    }
+
+    fn remote_tab_named(&self, site_id: &str, dir: &str) -> Option<TabId> {
+        self.workspace
+            .tabs
+            .iter()
+            .find_map(|(&id, tab)| match tab.location().as_remote() {
+                Some((s, p)) if s == site_id && p == dir => Some(id),
+                _ => None,
+            })
+    }
+
+    fn remote_clip(&mut self, cut: bool) {
+        let Some(tab_id) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let Some(t) = self.workspace.tabs.get(&tab_id) else {
+            return;
+        };
+        let Some((site_id, dir)) = t.location().as_remote().map(|(s, d)| (s.to_owned(), d.to_owned())) else {
+            return;
+        };
+        let entries: Vec<(String, neutron_core::EntryKind)> = visible_selection(t)
+            .into_iter()
+            .map(|i| (t.list.name(i).to_owned(), t.list.kind(i)))
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let count = entries.len();
+        let server = self.server_name(tab_id);
+        self.remote_clipboard = Some(RemoteClipboard { site_id, dir, entries, cut });
+        let noun = if count == 1 { "1 item" } else { &format!("{count} items") };
+        self.notices.info(if cut {
+            format!("Cut {noun} from {server} — open destination and Paste")
+        } else {
+            format!("Copied {noun} from {server} — open destination and Paste")
+        });
+    }
+
+    fn paste_remote_to_local(&mut self) {
+        let Some(tab) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let Some(local_dest) = self
+            .workspace
+            .tabs
+            .get(&tab)
+            .and_then(|t| t.location().as_path())
+            .map(|p| p.to_path_buf())
+        else {
+            return;
+        };
+        let Some(clip) = self.remote_clipboard.clone() else {
+            return;
+        };
+        let Some(site) = self.sites.get(&clip.site_id).cloned() else {
+            self.notices.error(format!("No saved server called {:?}", clip.site_id));
+            return;
+        };
+        if clip.cut {
+            self.remote_clipboard = None;
+        }
+        let src_tab = if clip.cut { self.remote_tab_named(&clip.site_id, &clip.dir) } else { None };
+        let label = format!(
+            "{} from {}",
+            if clip.cut { "Moving" } else { "Downloading" },
+            site.display(),
+        );
+        self.enqueue_remote_job(tab, src_tab, label, None, move |progress| {
+            crate::remote_ops::download_entries(
+                &site,
+                &clip.dir,
+                &clip.entries,
+                &local_dest,
+                clip.cut,
+                progress,
+            )
+        });
+    }
+
+    fn download_remote_to_downloads(&mut self) {
+        let Some(tab) = self.workspace.active_tab_id() else {
+            return;
+        };
+        let Some(downloads) = self
+            .known_folders
+            .iter()
+            .find(|p| p.name == "Downloads")
+            .and_then(|p| p.id.as_path())
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Downloads")))
+        else {
+            self.notices.error("Could not find the Downloads folder");
+            return;
+        };
+        let Some(t) = self.workspace.tabs.get(&tab) else {
+            return;
+        };
+        let Some((site_id, dir)) = t.location().as_remote().map(|(s, d)| (s.to_owned(), d.to_owned())) else {
+            return;
+        };
+        let entries: Vec<(String, neutron_core::EntryKind)> = visible_selection(t)
+            .into_iter()
+            .map(|i| (t.list.name(i).to_owned(), t.list.kind(i)))
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let Some(site) = self.sites.get(&site_id).cloned() else {
+            self.notices.error(format!("No saved server called {site_id:?}"));
+            return;
+        };
+        let label = format!("Downloading from {} to Downloads", site.display());
+        self.enqueue_remote_job(tab, None, label, None, move |progress| {
+            crate::remote_ops::download_entries(&site, &dir, &entries, &downloads, false, progress)
+        });
     }
 
     /// The server's display name for the focused tab, for labels.
@@ -9636,6 +10425,88 @@ impl NeutronApp {
             return;
         };
         let taken = self.listed_names(tab);
+
+        if let Some(clip) = self.remote_clipboard.clone() {
+            let Some((dst_site_id, dst_dir)) = self
+                .workspace
+                .tabs
+                .get(&tab)
+                .and_then(|t| t.location().as_remote())
+                .map(|(s, d)| (s.to_owned(), d.to_owned()))
+            else {
+                return;
+            };
+            let taken_refs: Vec<&str> = taken.iter().map(String::as_str).collect();
+            let clashes = crate::remote_ops::collisions(
+                clip.entries.iter().map(|(n, _)| n.as_str()),
+                &taken_refs,
+            );
+            if clip.site_id == dst_site_id && clip.dir == dst_dir {
+                self.notices.info("Items are already in this folder");
+                return;
+            }
+            if !clashes.is_empty() {
+                self.notices.error(format!(
+                    "{} already in this folder: {}",
+                    if clashes.len() == 1 { "This name is" } else { "These names are" },
+                    clashes.join(", "),
+                ));
+                return;
+            }
+            let src_tab = if clip.cut { self.remote_tab_named(&clip.site_id, &clip.dir) } else { None };
+            if clip.cut {
+                self.remote_clipboard = None;
+            }
+            if clip.site_id == dst_site_id {
+                let label = format!(
+                    "{} on {}",
+                    if clip.cut { "Moving" } else { "Copying" },
+                    self.server_name(tab),
+                );
+                let op = if clip.cut {
+                    crate::remote_ops::Op::MoveRemote {
+                        from_dir: clip.dir,
+                        entries: clip.entries,
+                    }
+                } else {
+                    crate::remote_ops::Op::CopyRemote {
+                        from_dir: clip.dir,
+                        entries: clip.entries,
+                    }
+                };
+                let Some(site) = self.sites.get(&dst_site_id).cloned() else {
+                    self.notices.error(format!("No saved server called {dst_site_id:?}"));
+                    return;
+                };
+                self.enqueue_remote_job(tab, src_tab, label, None, move |progress| {
+                    crate::remote_ops::run(&site, &dst_dir, &op, progress)
+                });
+                return;
+            }
+            let Some(src_site) = self.sites.get(&clip.site_id).cloned() else {
+                self.notices.error(format!("No saved server called {:?}", clip.site_id));
+                return;
+            };
+            let Some(dst_site) = self.sites.get(&dst_site_id).cloned() else {
+                self.notices.error(format!("No saved server called {dst_site_id:?}"));
+                return;
+            };
+            let label = format!("{} → {}", src_site.display(), dst_site.display());
+            self.enqueue_remote_job(tab, src_tab, label, None, move |progress| {
+                crate::remote_ops::transfer_between_servers(
+                    &src_site,
+                    &clip.dir,
+                    &clip.entries,
+                    &dst_site,
+                    &dst_dir,
+                    &taken,
+                    clip.cut,
+                    progress,
+                )
+            });
+            return;
+        }
+
         let label = format!("Uploading to {}", self.server_name(tab));
         self.start_remote(tab, label, None, move |site, dir, progress| {
             // Read here, on the worker: another process can hold the clipboard.
@@ -9644,6 +10515,273 @@ impl NeutronApp {
             };
             upload_new(site, dir, sources, &taken, progress)
         });
+    }
+
+    fn layout_dialog_overlay(&mut self, ctx: &egui::Context, p: &Palette, actions: &mut Vec<Action>) {
+        if let Some(hit) = self.layout_dialog.show(ctx, p, &self.layouts) {
+            actions.push(match hit {
+                crate::layouts::LayoutAction::Close => Action::CloseLayouts,
+                crate::layouts::LayoutAction::Save(name) => Action::SaveLayout(name),
+                crate::layouts::LayoutAction::Apply(name) => Action::ApplyLayout(name),
+                crate::layouts::LayoutAction::Delete(name) => Action::DeleteLayout(name),
+            });
+        }
+    }
+
+    fn storage_lens_overlay(&mut self, ctx: &egui::Context, p: &Palette, actions: &mut Vec<Action>) {
+        if let Some(hit) = self.storage_lens.show(ctx, p) {
+            actions.push(match hit {
+                crate::storage_lens::LensAction::Close => Action::CloseStorageLens,
+                crate::storage_lens::LensAction::Drill(node, label) => Action::DrillStorageLens(node, label),
+                crate::storage_lens::LensAction::GoUp => Action::UpStorageLens,
+                crate::storage_lens::LensAction::Rescan => Action::RescanStorageLens,
+                crate::storage_lens::LensAction::Open(node) => {
+                    self.storage_lens.close();
+                    Action::Navigate(node)
+                }
+                crate::storage_lens::LensAction::TrashLocal(path) => Action::TrashFromStorageLens(path),
+            });
+        }
+    }
+
+    fn compare_pair(&self) -> Option<(GroupId, TabId, GroupId, TabId)> {
+        let groups = self.workspace.layout.groups();
+        if groups.len() < 2 {
+            return None;
+        }
+        let g1 = groups[0];
+        let g2 = groups[1];
+        let t1 = self.workspace.groups.get(&g1)?.active_tab()?;
+        let t2 = self.workspace.groups.get(&g2)?.active_tab()?;
+        Some((g1, t1, g2, t2))
+    }
+
+    fn pane_diff_for(
+        &self,
+        group_id: GroupId,
+        _tab: &crate::workspace::Tab,
+    ) -> Option<(std::collections::HashMap<String, file_list::DiffTag>, GroupId, usize, usize, usize)> {
+        if !self.compare_panes {
+            return None;
+        }
+        let (lg, lt, rg, rt) = self.compare_pair()?;
+        if group_id != lg && group_id != rg {
+            return None;
+        }
+        let left_tab = self.workspace.tabs.get(&lt)?;
+        let right_tab = self.workspace.tabs.get(&rt)?;
+        if matches!(left_tab.location(), NodeId::Home) || matches!(right_tab.location(), NodeId::Home) {
+            return None;
+        }
+        let diff = crate::diff::compare_lists(&left_tab.list, &right_tab.list);
+        if group_id == lg {
+            Some((
+                diff.left_tags,
+                rg,
+                diff.summary.left_only,
+                diff.summary.left_newer,
+                diff.summary.different,
+            ))
+        } else {
+            Some((
+                diff.right_tags,
+                lg,
+                diff.summary.right_only,
+                diff.summary.right_newer,
+                diff.summary.different,
+            ))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_compare_strip(
+        &self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        src_group: GroupId,
+        dst_group: GroupId,
+        only_count: usize,
+        newer_count: usize,
+        diff_count: usize,
+        actions: &mut Vec<Action>,
+    ) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, p.elevated);
+        painter.line_segment(
+            [egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.bottom())],
+            egui::Stroke::new(1.0, p.border),
+        );
+
+        let badge = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 12.0, rect.center().y - 9.0),
+            egui::vec2(62.0, 18.0),
+        );
+        painter.rect_filled(badge, egui::CornerRadius::same(4), p.cloud.gamma_multiply(0.18));
+        painter.text(
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            "COMPARE",
+            theme::strong(ui.ctx(), 9.0),
+            p.cloud,
+        );
+
+        let summary = if only_count == 0 && newer_count == 0 && diff_count == 0 {
+            "Matches other pane".to_owned()
+        } else {
+            format!("{only_count} only here · {newer_count} newer · {diff_count} diff")
+        };
+        painter.text(
+            egui::pos2(badge.right() + 10.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            summary,
+            egui::FontId::proportional(11.5),
+            p.text_muted,
+        );
+
+        let mut right_x = rect.right() - 10.0;
+        let close_w = 50.0;
+        let close_rect = egui::Rect::from_min_size(
+            egui::pos2(right_x - close_w, rect.center().y - 10.0),
+            egui::vec2(close_w, 20.0),
+        );
+        let close_resp = ui.interact(close_rect, ui.id().with(("compare-close", src_group)), egui::Sense::click());
+        painter.rect_filled(
+            close_rect,
+            egui::CornerRadius::same(theme::RADIUS_CONTROL),
+            if close_resp.hovered() { p.hover } else { p.raised },
+        );
+        painter.text(
+            close_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Close",
+            egui::FontId::proportional(11.0),
+            p.text_muted,
+        );
+        if close_resp.clicked() {
+            actions.push(Action::ToggleComparePanes);
+        }
+        right_x = close_rect.left() - 8.0;
+
+        let to_sync = only_count + newer_count;
+        if to_sync > 0 {
+            let btn_label = format!("Sync {to_sync} →");
+            let btn_w = 82.0;
+            let sync_rect = egui::Rect::from_min_size(
+                egui::pos2(right_x - btn_w, rect.center().y - 10.0),
+                egui::vec2(btn_w, 20.0),
+            );
+            let sync_resp = ui.interact(sync_rect, ui.id().with(("compare-sync", src_group)), egui::Sense::click());
+            painter.rect_filled(
+                sync_rect,
+                egui::CornerRadius::same(theme::RADIUS_CONTROL),
+                if sync_resp.hovered() { p.accent } else { p.accent.gamma_multiply(0.85) },
+            );
+            painter.text(
+                sync_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                btn_label,
+                theme::strong(ui.ctx(), 10.5),
+                egui::Color32::WHITE,
+            );
+            if sync_resp.clicked() {
+                actions.push(Action::SyncPaneToOther {
+                    src: src_group,
+                    dst: dst_group,
+                });
+            }
+        }
+    }
+
+    fn sync_pane_to_other(&mut self, src_group: GroupId, dst_group: GroupId, ctx: &egui::Context) {
+        let Some(src_tab_id) = self.workspace.groups.get(&src_group).and_then(|g| g.active_tab()) else {
+            return;
+        };
+        let Some(dst_tab_id) = self.workspace.groups.get(&dst_group).and_then(|g| g.active_tab()) else {
+            return;
+        };
+        let (Some(src_tab), Some(dst_tab)) = (
+            self.workspace.tabs.get(&src_tab_id),
+            self.workspace.tabs.get(&dst_tab_id),
+        ) else {
+            return;
+        };
+
+        let diff = crate::diff::compare_lists(&src_tab.list, &dst_tab.list);
+        let idxs = crate::diff::sync_candidate_indices(&src_tab.list, &diff.left_tags);
+        if idxs.is_empty() {
+            self.notices.info("Nothing to sync — destination already has all missing/newer items");
+            return;
+        }
+
+        let src_loc = src_tab.location().clone();
+        let dst_loc = dst_tab.location().clone();
+        let names_kinds: Vec<(String, neutron_core::EntryKind)> = idxs
+            .iter()
+            .map(|&i| (src_tab.list.name(i).to_owned(), src_tab.list.kind(i)))
+            .collect();
+
+        match (&src_loc, &dst_loc) {
+            (NodeId::Path(src_dir), NodeId::Path(dst_dir)) => {
+                let paths: Vec<PathBuf> = names_kinds.iter().map(|(n, _)| src_dir.join(n)).collect();
+                self.start_transfer(
+                    crate::transfers::Request {
+                        tab: dst_tab_id,
+                        paths,
+                        destination: dst_dir.clone(),
+                        how: neutron_shell::fileops::Transfer::Copy,
+                    },
+                    neutron_shell::transfer::Clash::Replace,
+                );
+            }
+            (NodeId::Path(src_dir), NodeId::Remote { site: dst_site_id, path: _ }) => {
+                let paths: Vec<PathBuf> = names_kinds.iter().map(|(n, _)| src_dir.join(n)).collect();
+                let label = format!("Syncing {} items to {}", paths.len(), self.server_name(dst_tab_id));
+                self.start_remote(dst_tab_id, label, None, move |site, dir, progress| {
+                    crate::remote_ops::run(site, dir, &crate::remote_ops::Op::Upload { sources: paths }, progress)
+                });
+                let _ = dst_site_id;
+            }
+            (NodeId::Remote { site: src_site_id, path: src_dir }, NodeId::Path(dst_dir)) => {
+                let Some(site) = self.sites.get(src_site_id).cloned() else {
+                    self.notices.error(format!("No saved server called {:?}", src_site_id));
+                    return;
+                };
+                let dst_dir = dst_dir.clone();
+                let src_dir = src_dir.clone();
+                let label = format!("Syncing {} items from {}", names_kinds.len(), site.display());
+                self.enqueue_remote_job(dst_tab_id, None, label, None, move |progress| {
+                    crate::remote_ops::download_entries_sync(&site, &src_dir, &names_kinds, &dst_dir, progress)
+                });
+            }
+            (NodeId::Remote { site: src_site_id, path: src_dir }, NodeId::Remote { site: dst_site_id, path: dst_dir }) => {
+                let Some(src_site) = self.sites.get(src_site_id).cloned() else {
+                    self.notices.error(format!("No saved server called {:?}", src_site_id));
+                    return;
+                };
+                let Some(dst_site) = self.sites.get(dst_site_id).cloned() else {
+                    self.notices.error(format!("No saved server called {:?}", dst_site_id));
+                    return;
+                };
+                let src_dir = src_dir.clone();
+                let dst_dir = dst_dir.clone();
+                let label = format!("Syncing {} → {}", src_site.display(), dst_site.display());
+                self.enqueue_remote_job(dst_tab_id, None, label, None, move |progress| {
+                    crate::remote_ops::transfer_between_servers_sync(
+                        &src_site,
+                        &src_dir,
+                        &names_kinds,
+                        &dst_site,
+                        &dst_dir,
+                        progress,
+                    )
+                });
+            }
+            _ => {
+                self.notices.error("Smart Sync supports local and saved server folders");
+            }
+        }
+        let _ = ctx;
     }
 
     fn remote_upload(&mut self, tab: TabId, sources: Vec<PathBuf>) {
@@ -9725,6 +10863,7 @@ struct RowIcons<'a> {
     thumbs: &'a crate::thumbs::Thumbnails,
     texture: Option<egui::TextureId>,
     dir: Option<PathBuf>,
+    remote: Option<(neutron_remote::Site, String)>,
 }
 
 impl file_list::IconSource for RowIcons<'_> {
@@ -9743,11 +10882,19 @@ impl file_list::IconSource for RowIcons<'_> {
         Some(self.service.uv(slot))
     }
 
-    fn preview(&self, name: &str, _kind: neutron_core::EntryKind, modified: i64) -> Option<neutron_ui::thumb::Thumb> {
-        // A folder with no path — a server, a shell location — has nothing
-        // the system could preview.
-        let dir = self.dir.as_deref()?;
-        self.thumbs.get(&dir.join(name), modified, crate::thumbs::Grade::Small)
+    fn preview(&self, name: &str, kind: neutron_core::EntryKind, modified: i64) -> Option<neutron_ui::thumb::Thumb> {
+        if let Some(dir) = self.dir.as_deref() {
+            return self.thumbs.get(&dir.join(name), modified, crate::thumbs::Grade::Small);
+        }
+        if let Some((site, dir)) = &self.remote
+            && site.protocol == neutron_remote::Protocol::Sftp
+            && neutron_ui::thumb::wants_preview(name, kind)
+        {
+            if let Ok(full) = neutron_remote::path::join(dir, name) {
+                return self.thumbs.get_remote(site, &full, modified, crate::thumbs::Grade::Small);
+            }
+        }
+        None
     }
 }
 

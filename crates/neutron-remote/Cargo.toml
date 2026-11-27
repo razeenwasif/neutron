@@ -40,7 +40,7 @@ russh = { version = "0.63", default-features = false, features = [
 russh-sftp = "2.4"
 # Only ever a current-thread runtime driving one connection. russh is async and
 # there is no sync client worth using; this keeps that contained to one thread.
-tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time"] }
 # Root certificates for FTPS. The same set reqwest already uses for Drive.
 webpki-roots = "1"
 # SHA-256 for FTPS certificate fingerprints. Already linked through rustls and

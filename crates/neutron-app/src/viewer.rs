@@ -29,6 +29,9 @@ const PAGE_CACHE: usize = 24;
 pub enum Doc {
     Loading,
     Text(TextDoc),
+    Markdown(crate::viewer_formats::MarkdownDoc),
+    Table(crate::viewer_formats::TableDoc),
+    Tensor(crate::viewer_formats::TensorDoc),
     Pdf(PdfDoc),
     Image(ImageDoc),
     Failed(String),
@@ -86,6 +89,8 @@ pub struct View {
     pub selected: Option<(usize, usize)>,
     /// A line or page to bring into view on the next frame.
     pub reveal: Option<usize>,
+    /// For Markdown files, show raw source instead of rendered blocks.
+    pub markdown_raw: bool,
 }
 
 type Loaded = (PathBuf, Doc);
@@ -152,6 +157,7 @@ impl Viewers {
                     found_for: String::new(),
                     selected: None,
                     reveal: None,
+                    markdown_raw: false,
                 },
             );
         }
@@ -227,7 +233,11 @@ impl View {
         self.found_for = self.find.clone();
         self.matches.clear();
         self.current = 0;
-        let Doc::Text(text) = &self.doc else { return };
+        let text = match &self.doc {
+            Doc::Text(t) => t,
+            Doc::Markdown(md) => &md.raw,
+            _ => return,
+        };
         let needle = self.find.to_lowercase();
         if needle.is_empty() {
             return;
@@ -263,7 +273,11 @@ impl View {
 
     /// The selected lines, or the whole text, to copy.
     pub fn copy_text(&self) -> Option<String> {
-        let Doc::Text(text) = &self.doc else { return None };
+        let text = match &self.doc {
+            Doc::Text(t) => t,
+            Doc::Markdown(md) => &md.raw,
+            _ => return None,
+        };
         let (a, b) = self.selected.unwrap_or((0, text.lines.len().saturating_sub(1)));
         let (a, b) = (a.min(b), a.max(b).min(text.lines.len().saturating_sub(1)));
         Some((a..=b).map(|i| text.line(i)).collect::<Vec<_>>().join("\n"))
@@ -284,8 +298,33 @@ impl View {
 /// Reads and takes apart a file for viewing. Blocks on the disk.
 pub fn load(path: &Path) -> Doc {
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
-    if ext == "pdf" {
-        return pdf_doc(path);
+    match ext.as_str() {
+        "safetensors" => {
+            return match crate::viewer_formats::load_safetensors(path) {
+                Ok(doc) => Doc::Tensor(doc),
+                Err(e) => Doc::Failed(e),
+            };
+        }
+        "gguf" => {
+            return match crate::viewer_formats::load_gguf(path) {
+                Ok(doc) => Doc::Tensor(doc),
+                Err(e) => Doc::Failed(e),
+            };
+        }
+        "onnx" => {
+            return match crate::viewer_formats::load_onnx(path) {
+                Ok(doc) => Doc::Tensor(doc),
+                Err(e) => Doc::Failed(e),
+            };
+        }
+        "parquet" => {
+            return match crate::viewer_formats::load_parquet_summary(path) {
+                Ok(doc) => Doc::Table(doc),
+                Err(e) => Doc::Failed(e),
+            };
+        }
+        "pdf" => return pdf_doc(path),
+        _ => {}
     }
     if crate::preview::looks_like_image(path) {
         return load_image(path);
@@ -309,11 +348,25 @@ pub fn load(path: &Path) -> Doc {
     }
     let truncated = bytes.len() > MAX_TEXT;
     let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_TEXT)]).into_owned();
-    text_doc(text, path, truncated)
+    match ext.as_str() {
+        "md" | "markdown" => {
+            let blocks = crate::viewer_formats::parse_markdown(&text);
+            let raw = build_text_doc(text, path, truncated);
+            Doc::Markdown(crate::viewer_formats::MarkdownDoc { raw, blocks })
+        }
+        "csv" => Doc::Table(crate::viewer_formats::parse_delimited(&text, b',', "CSV", 100_000)),
+        "tsv" => Doc::Table(crate::viewer_formats::parse_delimited(&text, b'\t', "TSV", 100_000)),
+        "jsonl" | "ndjson" => Doc::Table(crate::viewer_formats::parse_jsonl(&text, 100_000)),
+        _ => text_doc(text, path, truncated),
+    }
 }
 
 /// Text taken apart into lines, each with the colouring state it begins in.
 pub fn text_doc(text: String, path: &Path, truncated: bool) -> Doc {
+    Doc::Text(build_text_doc(text, path, truncated))
+}
+
+fn build_text_doc(text: String, path: &Path, truncated: bool) -> TextDoc {
     let mut lines = Vec::new();
     let mut start = 0;
     for (at, _) in text.match_indices('\n') {
@@ -331,7 +384,7 @@ pub fn text_doc(text: String, path: &Path, truncated: bool) -> Doc {
         None => vec![Carry::None; lines.len()],
     };
     let widest = lines.iter().map(|r| text[r.clone()].chars().count()).max().unwrap_or(0);
-    Doc::Text(TextDoc { text, lines, carries, language, widest, truncated })
+    TextDoc { text, lines, carries, language, widest, truncated }
 }
 
 fn pdf_doc(path: &Path) -> Doc {
@@ -378,8 +431,8 @@ pub fn can_show(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let ext = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
     const TEXT: &[&str] = &[
-        "txt", "md", "markdown", "rst", "log", "csv", "tsv", "text", "tex", "org", "adoc", "srt", "vtt", "diff",
-        "patch",
+        "txt", "md", "markdown", "rst", "log", "csv", "tsv", "jsonl", "ndjson", "parquet",
+        "safetensors", "gguf", "onnx", "text", "tex", "org", "adoc", "srt", "vtt", "diff", "patch",
     ];
     ext == "pdf"
         || crate::preview::looks_like_image(Path::new(&lower))
@@ -413,6 +466,7 @@ mod tests {
             found_for: String::new(),
             selected: None,
             reveal: None,
+            markdown_raw: false,
         };
         view.refind();
         assert_eq!(view.matches, vec![(0, 0..5), (1, 0..5)]);

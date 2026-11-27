@@ -279,41 +279,41 @@
     <h1 class="display">Neutron Status <em>&amp;</em> Plan</h1>
     <p class="lede">Where Neutron stands after the Mac push, the order to work through what's left, what shipped since 14 October, and how to use all of it. Work the plan top to bottom: each step's status is saved here and updates as steps land.</p>
     <div class="facts">
-      <span>master <b><code>5b047b1</code></b> · 17 Oct</span>
-      <span><b class="num">79</b> commits</span>
-      <span><b class="num">28</b> since 14 Oct</span>
-      <span><b class="num">64,380</b> lines of Rust in <b class="num">11</b> crates</span>
-      <span>Page made <b>25 Oct</b></span>
+      <span>master <b><code>ff2d434</code></b> · 26 Nov</span>
+      <span><b class="num">84</b> commits</span>
+      <span><b class="num">33</b> since 14 Oct</span>
+      <span><b class="num">11</b> crates in workspace</span>
+      <span>Updated <b>26 Nov</b></span>
     </div>
     <section class="vitals" aria-label="Vitals">
       <div class="vital card">
-        <span class="label">CI on master</span>
-        <div class="head"><span class="big">Failing</span><span class="pill crit">Red</span></div>
+        <span class="label">CI &amp; Branch</span>
+        <div class="head"><span class="big">Clean</span><span class="pill ok">master</span></div>
         <ul class="jobs">
-          <li><span>macOS</span><span class="pill ok">Pass</span></li>
-          <li><span>Minimum Rust</span><span class="pill ok">Pass</span></li>
-          <li><span>Linux</span><span class="pill crit">1 test</span></li>
-          <li><span>Windows</span><span class="pill crit">Build</span></li>
+          <li><span>Neutrino origin</span><span class="pill ok">Synced</span></li>
+          <li><span>GitHub mirror</span><span class="pill ok">Synced</span></li>
+          <li><span>macOS bundle</span><span class="pill ok">Installed</span></li>
+          <li><span>Code signature</span><span class="pill ok">Valid</span></li>
         </ul>
-        <span class="when">Run on 5b047b1. Red since 14 Oct. See steps 1 and 2.</span>
+        <span class="when">At ff2d434 (26 Nov). Bundled &amp; verified on Apple Silicon.</span>
       </div>
       <div class="vital card">
         <span class="label">Tests</span>
-        <div class="head"><span class="big num">890 pass</span><span class="pill ok">Local</span></div>
-        <p>Plus 11 that open a real window or GPU (drops, spring-loading, terminal, viewer, screenshots), run by hand, all passing on 17 Oct.</p>
+        <div class="head"><span class="big num">934 pass</span><span class="pill ok">0 fail</span></div>
+        <p>Plus 11 ignored window/GPU tests across 11 crates, including POSIX/Windows SFTP volume &amp; parser suites.</p>
         <span class="when"><code>cargo test --workspace</code></span>
       </div>
       <div class="vital card">
-        <span class="label">Finder parity</span>
-        <div class="head"><span class="big">Core done</span><span class="pill ok">Shipped</span></div>
-        <p>All four views, Smart Folders, Get Info, Put Back, tags, batch rename, archives, plus a terminal, agents and a viewer the Finder doesn't have.</p>
-        <span class="when">As of 17 Oct</span>
+        <span class="label">UI &amp; Remotes</span>
+        <div class="head"><span class="big">Stratus UI</span><span class="pill ok">Shipped</span></div>
+        <p>Borderless pitch-black Stratus default, 7 themes, Lucide rail icons, custom cloud glyphs, dual-boot Amaterasu &amp; Kagutsuchi drives.</p>
+        <span class="when">As of 26 Nov</span>
       </div>
       <div class="vital card">
-        <span class="label">Hand checks</span>
-        <div class="head"><span class="big num">10 open</span><span class="pill warn">Untried</span></div>
-        <p>Features only exercised in the test harness, never on the real Mac: a real drag, Put Back, RAR, the window buttons with the sidebar hidden, and more.</p>
-        <span class="when">Steps 4 to 6</span>
+        <span class="label">Next Roadmap</span>
+        <div class="head"><span class="big num">6 phases</span><span class="pill info">Planned</span></div>
+        <p>SFTP pipeline &amp; transfer queue, SSH terminal, Git + <code>ntr</code> awareness, Storage Lens, split diff/sync, rich viewer &amp; refactor.</p>
+        <span class="when">See phases below</span>
       </div>
     </section>
   </header>
@@ -385,6 +385,14 @@
           <li><code>9c07004</code><span>Send a file to a running app rather than starting another</span></li>
           <li><code>0d8e8b6</code><span>Antigravity instead of the Gemini CLI</span></li>
           <li><code>5b047b1</code><span>Gallery, Smart Folders, Get Info, Put Back, more archives</span></li>
+        </ul>
+      </div>
+      <div class="day card">
+        <h3>23–26 Nov <span>3 major commits</span></h3>
+        <ul>
+          <li><code>0ccee1b</code><span>Unified Obsidian UI overhaul and 6-theme switcher</span></li>
+          <li><code>3f4bd96</code><span>Custom cloud icons, remote SFTP volumes, remote sidebar pins, Amaterasu support</span></li>
+          <li><code>ff2d434</code><span>Stratus pitch-black borderless redesign, Lucide rail icons, dual-boot Windows/Linux SFTP discovery &amp; auto-refresh</span></li>
         </ul>
       </div>
     </div>
@@ -562,10 +570,10 @@
         done: "docs/perf.md has Mac numbers", tags: ["docs/perf.md"] },
     ]},
     { title: "Later", sub: "Bigger, and waiting on a decision", steps: [
-      { id: "servers", size: "L", title: "Write to servers",
-        why: "Remote browsing in list, grid and column views plus SFTP writes (new folder, new file, rename, delete, paste/drop upload, and automatic save-back on edit).",
-        covers: ["Uploads via paste and drag-and-drop with collision checks", "Rename, delete, new folder, new file, and save-back on edit"],
-        done: "paste works into a server folder", tags: ["neutron-remote"] },
+      { id: "servers", size: "L", title: "Write to servers & discover drives",
+        why: "Remote browsing in list, grid and column views plus SFTP writes, remote volume probing, and sidebar folder pins.",
+        covers: ["Uploads via paste and drag-and-drop with collision checks", "Rename, delete, new folder, new file, and save-back on edit", "macOS/Linux/Windows SFTP volume cards with 60s & ⌘R live re-probe"],
+        done: "paste and drive cards work on server folders", tags: ["neutron-remote"] },
       { id: "notarize", size: "M", title: "Sign and notarize, to share it", you: true,
         why: "The app has an ad-hoc signature, which runs only on this Mac. Anyone else needs a Developer ID signature and notarization.",
         covers: ["An Apple Developer ID", "Sign and notarize in cargo xtask install"],
@@ -575,12 +583,94 @@
         covers: ["Built releases on GitHub, and a check for a newer one"],
         done: "Neutron offers its own update", tags: ["release"] },
     ]},
+    { title: "Phase 1 · Remote Power & Transfer Engine", sub: "Multiplexed SFTP, pipelining, and full bidirectional file ops", steps: [
+      { id: "ssh-pool", size: "M", title: "Persistent multiplexed SSH session pool",
+        why: "Probes, transfers, and edits currently open fresh TCP + SSH handshakes per operation. Sharing Arc<Handle> per site with keepalives makes remote work instant.",
+        covers: ["Pool warm russh client handles per site with single-retry reconnect", "Multiplex SFTP subsystems and SSH exec channels on the pooled handle", "In-flight probe guard preventing duplicate 60s/⌘R work on offline hosts"],
+        done: "listings, probes, and saves reuse one warm SSH connection", tags: ["neutron-remote", "remote.rs"] },
+      { id: "sftp-pipeline", size: "L", title: "Pipelined SFTP transfers & concurrent streaming",
+        why: "Stop-and-wait 64 KiB loops cap LAN/Tailscale transfer speed. Async in-flight windows and parallel workers unlock full link throughput.",
+        covers: ["Upgrade upload/download to pipelined 256–512 KiB windows (8–16 concurrent requests)", "Bounded 4-worker parallel file streaming for recursive folders", "Optional SSH-piped tar fast-path for large multi-file POSIX transfers"],
+        done: "multi-file & multi-GB SFTP transfers saturate the Tailscale link", tags: ["neutron-remote", "perf"] },
+      { id: "remote-copy-queue", size: "L", title: "Bidirectional remote Copy/Cut, server↔server sync & Transfer Queue",
+        why: "Copy and Cut are currently disabled on server folders. Users should copy off servers, move/copy within a server, and stream between two servers.",
+        covers: ["Enable RailAction::Copy/Cut + ⌘C/⌘X + Download to… on server folders", "Same-server instant SFTP move and SSH cp/robocopy without local round-trips", "Cross-server pane transfers (e.g. Kagutsuchi ↔ Amaterasu) + Transfer Queue popover (MB/s, ETA, pause/cancel)"],
+        done: "Copy, Cut, Paste, and drag work seamlessly local↔remote and remote↔remote", tags: ["rail.rs", "transfers.rs", "remote_ops.rs"] },
+    ]},
+    { title: "Phase 2 · Remote Terminal, Agents & Search", sub: "Make SFTP folders feel completely native", steps: [
+      { id: "remote-terminal", size: "M", title: "Integrated remote SSH terminal & remote AI agents",
+        why: "Ctrl+` and Ask Claude Code / Antigravity currently require a local path even though Neutron already holds every host's SSH coordinates.",
+        covers: ["Extend OpenTerminal / OpenTerminalAt for NodeId::Remote via ssh -t in PTY", "Land directly in the focused POSIX or Windows PowerShell remote folder", "Run Ask Claude Code / Ask Antigravity on the remote host with selection context"],
+        done: "Ctrl+` inside Kagutsuchi or Amaterasu drops an interactive shell into that folder", tags: ["term.rs", "agent.rs"] },
+      { id: "remote-search-sizes", size: "M", title: "Server-side search & remote folder sizes",
+        why: "⌘P search and Calculate Size should work inside SFTP folders via remote CLI tools without downloading files.",
+        covers: ["Transport::search using fd/rg/find (POSIX) and PowerShell Get-ChildItem (Windows)", "Transport::dir_size using du -sk / PowerShell with timeout & cancellation", "Wire ⌘P finder and View › Calculate All Sizes for remote tabs"],
+        done: "⌘P and Calculate Size answer quickly inside remote server folders", tags: ["sftp.rs", "finder.rs", "folder_sizes.rs"] },
+      { id: "remote-thumbs", size: "M", title: "Zero-stall remote thumbnails",
+        why: "Browsing remote media grids/galleries should fetch tiny cached thumbnails instead of pulling full images over SSH.",
+        covers: ["Remote <=256px thumbnail generation over SSH exec (sips/ffmpeg/magick) with graceful fallback", "LRU local cache keyed by site, path, size, and mtime"],
+        done: "remote image grids scroll smoothly without downloading full originals", tags: ["thumbs.rs", "sftp.rs"] },
+    ]},
+    { title: "Phase 3 · Git & Neutrino (ntr) Awareness", sub: "Repo status, branches, CI runs, PRs, and mirror health inline", steps: [
+      { id: "vcs-git-ntr", size: "L", title: "Background Git + Neutrino (ntr) worker & Stratus badges",
+        why: "Software folders across MacBook, Kagutsuchi, and Amaterasu benefit from instant visibility into dirty files, branches, and Neutrino CI state without touching the paint thread.",
+        covers: ["Non-blocking vcs.rs worker (local & SFTP via SSH) with mtime/generation cache", "Git status --porcelain=v2 --branch -z: branch pills, ahead/behind, per-row dirty dots", "Neutrino (ntr) detection via ~/.neutrino/bin/ntr (runs, pr, mirror): CI pass/fail pill, open PR count & mirror state in pane header"],
+        done: "repos show Git branch/dirty markers plus Neutrino CI & PR badges cleanly", tags: ["vcs.rs", "header.rs", "file_list.rs"] },
+      { id: "vcs-actions", size: "S", title: "Git & Neutrino quick actions",
+        why: "Turn status badges into actionable shortcuts from the right-click menu and command palette.",
+        covers: ["Context menu & ⌘⇧P actions: Run ntr status in Terminal, View Latest CI Run, Copy Branch"],
+        done: "one click opens ntr diagnostics or copies repo metadata", tags: ["commands.rs", "vcs.rs"] },
+    ]},
+    { title: "Phase 4 · Storage Lens & Split-Pane Diff / Sync", sub: "Actionable disk inspection and smart pane-to-pane sync", steps: [
+      { id: "storage-lens", size: "M", title: "Interactive Storage Lens on local & remote drive cards",
+        why: "Dashboard cards expose tight drives (e.g. Kagutsuchi 93%) — clicking Inspect should reveal what is consuming space and let you clean it.",
+        covers: ["Inspect button on every local and SFTP Dashboard drive card opening NodeId::StorageLens", "Proportional segment bar + largest-first folder list flagging target/, node_modules/, and caches", "One-click Open Folder, Trash/Delete, and rescan"],
+        done: "any Dashboard drive can be drilled down to pinpoint large folders", tags: ["storage_lens.rs", "dashboard.rs"] },
+      { id: "pane-diff-sync", size: "L", title: "Split-pane directory Diff & Smart Sync (⌥⌘D)",
+        why: "Comparing two local or remote folders side-by-side eliminates manual rsync commands for multi-machine workflows.",
+        covers: ["Compare Panes (⌥⌘D) diffing active split panes by name, size, mtime, and optional fast hash", "Tonal badges for Only here, Newer, Older, and Different", "One-click Sync Newer & Missing → confirmation flowing through Phase 1 transfers"],
+        done: "⌥⌘D diffs local↔remote panes and syncs selected changes safely", tags: ["diff.rs", "panes.rs"] },
+    ]},
+    { title: "Phase 5 · Rich Viewer & Multi-Machine Workspaces", sub: "Data/ML/Markdown intelligence and instant layout presets", steps: [
+      { id: "rich-viewer", size: "L", title: "Rendered Markdown, virtualized CSV/Parquet tables & ML tensor inspector",
+        why: "Extending viewer.rs for research and engineering files removes friction when inspecting docs, datasets, and checkpoints.",
+        covers: ["Clean Stratus Markdown renderer with raw/preview toggle", "Virtualized .csv/.tsv/.jsonl/.parquet table viewer with column sort & cell copy", "Zero-copy .safetensors/.gguf/.onnx header inspector (tensor count, param total, dtypes, shapes)"],
+        done: "Markdown, tabular datasets, and multi-GB model headers preview instantaneously", tags: ["viewer.rs", "viewer_ui.rs"] },
+      { id: "workspace-layouts", size: "M", title: "Saved multi-machine workspace layouts",
+        why: "Quickly snap between recurring setups (e.g. GPU Box, Mac mini Deploy, Research) via ⌘⇧P or Window › Layouts.",
+        covers: ["Persist named pane trees, remote paths, and terminals in layouts.json", "Save Workspace Layout… and Switch Workspace Layout… commands"],
+        done: "one shortcut restores a full multi-pane + remote + terminal workspace", tags: ["workspace.rs", "menubar.rs"] },
+    ]},
+    { title: "Phase 6 · Modularize app.rs & Refresh Mac Perf Baseline", sub: "Keep incremental builds fast and numbers current", steps: [
+      { id: "split-app-rs", size: "M", title: "Refactor 10,553-line app.rs into cohesive submodules",
+        why: "Splitting NeutronApp into focused modules (actions, remote_state, menus, dnd, chrome_ui, shortcuts) speeds up builds and reduces merge friction.",
+        covers: ["Split crates/neutron-app/src/app.rs into crates/neutron-app/src/app/*.rs", "Preserve zero UI-thread blocking and keep all 904+ tests green"],
+        done: "no single source module dominates neutron-app compilation", tags: ["neutron-app"] },
+      { id: "perf", size: "M", title: "Measure again on Apple Silicon + Tailscale",
+        why: "docs/perf.md reflects Windows 11 NTFS measurements from August.",
+        covers: ["Listing and scrolling a 100k-entry folder, cold start, idle CPU with Stratus/terminals", "Pipelined SFTP throughput benchmarks across MacBook ↔ Kagutsuchi ↔ Amaterasu"],
+        done: "docs/perf.md has current Apple Silicon & SFTP numbers", tags: ["docs/perf.md"] },
+    ]},
   ];
   const ALL = PHASES.flatMap(p => p.steps);
   const STORAGE_KEY = "neutron-status-v1";
   // Baseline step statuses maintained in source (Antigravity updates these as steps land).
   const DEFAULT_STATUSES = {
-    servers: { state: "done", at: "2026-11-24T00:00:00Z" },
+    readme: { state: "done", at: "2026-11-26T13:14:00Z" },
+    "progress-md": { state: "done", at: "2026-11-26T13:14:00Z" },
+    servers: { state: "done", at: "2026-11-26T13:14:00Z" },
+    "ssh-pool": { state: "done", at: "2026-11-27T11:24:00Z" },
+    "sftp-pipeline": { state: "done", at: "2026-11-27T11:24:00Z" },
+    "remote-copy-queue": { state: "done", at: "2026-11-27T11:24:00Z" },
+    "remote-terminal": { state: "done", at: "2026-11-27T12:31:00Z" },
+    "remote-search-sizes": { state: "done", at: "2026-11-27T12:31:00Z" },
+    "remote-thumbs": { state: "done", at: "2026-11-27T12:31:00Z" },
+    "vcs-git-ntr": { state: "done", at: "2026-11-27T13:00:00Z" },
+    "vcs-actions": { state: "done", at: "2026-11-27T13:00:00Z" },
+    "storage-lens": { state: "done", at: "2026-11-27T13:22:00Z" },
+    "pane-diff-sync": { state: "done", at: "2026-11-27T13:22:00Z" },
+    "rich-viewer": { state: "done", at: "2026-11-27T20:49:00Z" },
+    "workspace-layouts": { state: "done", at: "2026-11-27T20:49:00Z" },
   };
   const statuses = {};
   let canWrite = true;
@@ -719,18 +809,20 @@
       [["⌘Z", "⇧⌘Z"], "Undo and redo"],
       [["⌘⌫"], "Move to Trash; in the Trash, Put Back"],
       [["⌥⌘⌫"], "Delete immediately (asks first)"],
-      [["⌘I"], "Get Info"], [["⌘R"], "Show Original of an alias or link; otherwise refresh"],
+      [["⌘I"], "Get Info"], [["⌘R"], "Show Original of an alias/link; otherwise refresh (re-probes remote storage on Dashboard)"],
       [["Space"], "Quick Look; ⌘Y too"], [["⌥⌘O"], "Open in Viewer"],
-      [["⌘E"], "Eject the disk this folder is on"], [["⌃⌘T"], "Add the folder to the sidebar"],
+      [["⌘E"], "Eject the disk this folder is on"], [["⌃⌘T"], "Add local or remote folder to the sidebar"],
     ]],
     ["Views and windows", [
       [["⌘1", "⌘2", "⌘3", "⌘4"], "Grid, list, columns, gallery"],
+      [["⌘D"], "Cycle built-in themes (Stratus default, Obsidian, Midnight, Graphite, Catppuccin, Gruvbox, Light)"],
       [["⇧⌘."], "Show hidden files"],
       [["⌃⌘S"], "Hide or show the sidebar"], [["⌥⌘T"], "Hide or show the toolbar"],
       [["⌘\\"], "Split right"],
+      [["⌥⌘D"], "Compare split panes & Smart Sync"],
       [["⌘N"], "New window"], [["⌘T"], "New tab"], [["⌘W"], "Close the tab"],
       [["⇧⌘]", "⇧⌘["], "Next and previous tab; ⌃⇥ too"],
-      ["View menu", "Sort By, Group By, Calculate All Sizes, Show Preview"],
+      ["View menu", "Theme, Sort By, Group By, Calculate All Sizes, Show Preview"],
     ]],
     ["Finding", [
       [["⌘F"], "Filter this folder"],

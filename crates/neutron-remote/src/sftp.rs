@@ -32,20 +32,117 @@ use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
 use russh_sftp::client::SftpSession;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
 
 use crate::hostkey::{self, Decision};
 use crate::path;
 use crate::site::{Auth, Site};
-use crate::transport::{CHUNK, CONNECT_TIMEOUT, Continue, RemoteEntry, RemoteError, RemoteVolume, Transport};
+use crate::transport::{CHUNK, CONNECT_TIMEOUT, Continue, RemoteEntry, RemoteError, RemoteSearchHit, RemoteVolume, Transport};
 
-/// A connected SFTP session, and the runtime driving it.
-pub struct SftpTransport {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PoolKey {
+    host: String,
+    port: u16,
+    username: String,
+    auth: String,
+    secret_hash: u64,
+}
+
+impl PoolKey {
+    fn from_site(site: &Site, secret: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let auth = match &site.auth {
+            Auth::Password => "password".to_owned(),
+            Auth::Key { path } => format!("key:{path}"),
+            Auth::Agent => "agent".to_owned(),
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        secret.hash(&mut hasher);
+        Self {
+            host: site.host.clone(),
+            port: site.port(),
+            username: site.username.clone(),
+            auth,
+            secret_hash: hasher.finish(),
+        }
+    }
+}
+
+struct PooledHandle {
+    fingerprint: Option<String>,
+    handle: Arc<russh::client::Handle<Client>>,
+}
+
+struct SshPool {
     runtime: tokio::runtime::Runtime,
+    handles: parking_lot::Mutex<std::collections::HashMap<PoolKey, PooledHandle>>,
+}
+
+static SSH_POOL: std::sync::OnceLock<SshPool> = std::sync::OnceLock::new();
+
+fn ssh_pool(address: &str) -> Result<&'static SshPool, RemoteError> {
+    if let Some(pool) = SSH_POOL.get() {
+        return Ok(pool);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("neutron-ssh")
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|e| RemoteError::Connect {
+            address: address.to_owned(),
+            reason: format!("could not start the network runtime: {e}"),
+        })?;
+    let _ = SSH_POOL.set(SshPool {
+        runtime,
+        handles: parking_lot::Mutex::new(std::collections::HashMap::new()),
+    });
+    Ok(SSH_POOL.get().expect("initialized SSH_POOL"))
+}
+
+/// Drops all pooled SSH client handles (called when `sites.json` is reloaded).
+pub fn evict_ssh_pool() {
+    if let Some(pool) = SSH_POOL.get() {
+        pool.handles.lock().clear();
+    }
+}
+
+async fn open_sftp_session(
+    ssh: &russh::client::Handle<Client>,
+    address: &str,
+) -> Result<SftpSession, RemoteError> {
+    let channel = ssh
+        .channel_open_session()
+        .await
+        .map_err(|e| RemoteError::Connect {
+            address: address.to_owned(),
+            reason: e.to_string(),
+        })?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| RemoteError::Connect {
+            // The usual cause, and worth naming: SSH is fine and the
+            // server simply has no SFTP subsystem configured.
+            address: address.to_owned(),
+            reason: format!("the server would not start the sftp subsystem: {e}"),
+        })?;
+    SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| RemoteError::Connect {
+            address: address.to_owned(),
+            reason: e.to_string(),
+        })
+}
+
+/// A connected SFTP session, sharing a pooled multiplexed SSH connection.
+pub struct SftpTransport {
+    runtime: tokio::runtime::Handle,
     session: SftpSession,
-    /// Kept alive for the session's sake: dropping the SSH handle closes the
-    /// channel underneath the SFTP session.
-    _ssh: russh::client::Handle<Client>,
+    /// Kept alive for the session's sake: dropping the last clone closes the
+    /// SSH handle underneath the SFTP session.
+    _ssh: Arc<russh::client::Handle<Client>>,
     address: String,
     /// Set when this connection was the first to see the server's key, so the
     /// caller can record it against the site.
@@ -115,18 +212,61 @@ impl russh::client::Handler for Client {
 }
 
 impl SftpTransport {
-    /// Connects, checks the host key, authenticates, and opens the subsystem.
+    /// Connects, checks the host key, authenticates, and opens the subsystem,
+    /// reusing a pooled SSH connection when one is warm.
     pub fn connect(site: &Site, password: &str) -> Result<SftpTransport, RemoteError> {
         let address = site.address();
+        let username = if site.username.is_empty() {
+            // SSH has no anonymous mode; a site with no username is a
+            // misconfiguration worth naming rather than a login to attempt.
+            return Err(RemoteError::Auth { address });
+        } else {
+            site.username.clone()
+        };
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .map_err(|e| RemoteError::Connect {
-                address: address.clone(),
-                reason: format!("could not start the network runtime: {e}"),
-            })?;
+        // Validate credentials / decrypt key file *before* checking the pool so
+        // wrong passphrases or missing secrets fail immediately and never reuse
+        // an already-open handle authenticated under a different secret.
+        let login = Login::prepare(site, password, &address)?;
+
+        let pool = ssh_pool(&address)?;
+        let runtime = pool.runtime.handle().clone();
+        let key = PoolKey::from_site(site, password);
+
+        let cached = {
+            let mut map = pool.handles.lock();
+            if let Some(entry) = map.get(&key) {
+                let fp_ok = match (site.fingerprint.as_deref(), entry.fingerprint.as_deref()) {
+                    (Some(exp), Some(act)) => exp == act,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+                if fp_ok {
+                    Some(Arc::clone(&entry.handle))
+                } else {
+                    map.remove(&key);
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(ssh) = cached {
+            let addr_try = address.clone();
+            if let Ok(session) = runtime.block_on(async move { open_sftp_session(&ssh, &addr_try).await }) {
+                if let Some(entry) = pool.handles.lock().get(&key) {
+                    return Ok(SftpTransport {
+                        runtime,
+                        session,
+                        _ssh: Arc::clone(&entry.handle),
+                        address,
+                        new_fingerprint: None,
+                    });
+                }
+            }
+            pool.handles.lock().remove(&key);
+        }
 
         let presented = Arc::new(parking_lot::Mutex::new(None));
         let mismatch = Arc::new(parking_lot::Mutex::new(None));
@@ -142,22 +282,15 @@ impl SftpTransport {
 
         let host = site.host.clone();
         let port = site.port();
-        let username = if site.username.is_empty() {
-            // SSH has no anonymous mode; a site with no username is a
-            // misconfiguration worth naming rather than a login to attempt.
-            return Err(RemoteError::Auth { address });
-        } else {
-            site.username.clone()
-        };
-        // Read before anything is dialled: a missing key file or a forgotten
-        // passphrase is a problem on this machine, and finding out about it
-        // should not cost a round trip and a key exchange.
-        let login = Login::prepare(site, password, &address)?;
         let address_for_task = address.clone();
 
         let (ssh, session) = runtime.block_on(async move {
             let config = Arc::new(russh::client::Config {
                 inactivity_timeout: Some(std::time::Duration::from_secs(300)),
+                keepalive_interval: Some(std::time::Duration::from_secs(30)),
+                keepalive_max: 3,
+                window_size: 4 * 1024 * 1024,
+                maximum_packet_size: 32768,
                 ..Default::default()
             });
 
@@ -187,41 +320,26 @@ impl SftpTransport {
             };
 
             login.authenticate(&mut ssh, &username, &address_for_task).await?;
-
-            let channel = ssh
-                .channel_open_session()
-                .await
-                .map_err(|e| RemoteError::Connect {
-                    address: address_for_task.clone(),
-                    reason: e.to_string(),
-                })?;
-            channel
-                .request_subsystem(true, "sftp")
-                .await
-                .map_err(|e| RemoteError::Connect {
-                    address: address_for_task.clone(),
-                    // The usual cause, and worth naming: SSH is fine and the
-                    // server simply has no SFTP subsystem configured.
-                    reason: format!("the server would not start the sftp subsystem: {e}"),
-                })?;
-
-            let session = SftpSession::new(channel.into_stream()).await.map_err(|e| {
-                RemoteError::Connect {
-                    address: address_for_task.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
-
-            Ok((ssh, session))
+            let session = open_sftp_session(&ssh, &address_for_task).await?;
+            Ok((Arc::new(ssh), session))
         })?;
 
+        let actual_fingerprint = presented.lock().clone();
         let new_fingerprint = first_sight
             .load(Ordering::Relaxed)
-            .then(|| presented.lock().clone())
+            .then(|| actual_fingerprint.clone())
             .flatten();
         if let Some(fingerprint) = &new_fingerprint {
             tracing::info!(%address, %fingerprint, "recording host key on first connection");
         }
+
+        pool.handles.lock().insert(
+            key,
+            PooledHandle {
+                fingerprint: actual_fingerprint.or_else(|| site.fingerprint.clone()),
+                handle: Arc::clone(&ssh),
+            },
+        );
 
         Ok(SftpTransport {
             runtime,
@@ -564,7 +682,7 @@ impl Transport for SftpTransport {
         // `create` truncates, which is what replacing a file means. Opening for
         // append and hoping would leave the tail of whatever was there before
         // stuck on the end of the new file.
-        let mut file = self
+        let file = self
             .runtime
             .block_on(self.session.create(path.clone()))
             .map_err(|e| RemoteError::Server {
@@ -572,6 +690,7 @@ impl Transport for SftpTransport {
                 reason: describe(&address, &e),
             })?;
 
+        let mut writer = BufWriter::with_capacity(512 * 1024, file);
         let mut buffer = vec![0u8; CHUNK];
         let mut total = 0u64;
 
@@ -581,7 +700,7 @@ impl Transport for SftpTransport {
                 break;
             }
             self.runtime
-                .block_on(file.write_all(&buffer[..read]))
+                .block_on(writer.write_all(&buffer[..read]))
                 .map_err(RemoteError::Io)?;
             total += read as u64;
             if on_progress(total) == Continue::Stop {
@@ -592,7 +711,7 @@ impl Transport for SftpTransport {
         // Flushed before success is reported, so a write error on the last
         // buffer is not announced as a completed upload.
         self.runtime
-            .block_on(file.flush())
+            .block_on(writer.flush())
             .map_err(RemoteError::Io)?;
         Ok(total)
     }
@@ -621,13 +740,14 @@ impl Transport for SftpTransport {
             .block_on(file.seek(std::io::SeekFrom::Start(0)))
             .map_err(RemoteError::Io)?;
 
+        let mut reader = BufReader::with_capacity(512 * 1024, file);
         let mut buffer = vec![0u8; CHUNK];
         let mut total = 0u64;
 
         loop {
             let read = self
                 .runtime
-                .block_on(file.read(&mut buffer))
+                .block_on(reader.read(&mut buffer))
                 .map_err(RemoteError::Io)?;
             if read == 0 {
                 break;
@@ -680,6 +800,101 @@ impl Transport for SftpTransport {
         });
         Ok(out)
     }
+
+    fn exec(&mut self, cmd: &str, timeout: std::time::Duration) -> Result<String, RemoteError> {
+        self.exec_command(cmd, timeout)
+    }
+
+    fn copy_remote(&mut self, from: &str, to: &str) -> Result<(), RemoteError> {
+        let from = path::normalize(from);
+        let to = path::normalize(to);
+        let cmd = if let (Some(wf), Some(wt)) = (
+            windows_path_from_sftp(&from),
+            windows_path_from_sftp(&to),
+        ) {
+            format!(
+                r#"powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; Copy-Item -LiteralPath '{}' -Destination '{}' -Recurse -Force; Write-Output '__NEUTRON_OK__'""#,
+                ps_escape(&wf),
+                ps_escape(&wt),
+            )
+        } else {
+            format!(
+                "cp -a -- {} {} 2>&1 && printf '__NEUTRON_OK__'",
+                shell_quote_posix(&from),
+                shell_quote_posix(&to),
+            )
+        };
+        let out = self.exec_command(&cmd, crate::transport::IO_TIMEOUT)?;
+        if out.contains("__NEUTRON_OK__") {
+            Ok(())
+        } else {
+            let reason = out.trim();
+            Err(RemoteError::Server {
+                path: to,
+                reason: if reason.is_empty() {
+                    "server-side copy failed".to_owned()
+                } else {
+                    reason.to_owned()
+                },
+            })
+        }
+    }
+
+    fn search(
+        &mut self,
+        root: &str,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<RemoteSearchHit>, RemoteError> {
+        let root = path::normalize(root);
+        let needle = needle.trim();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cap = limit.clamp(1, 200);
+        let cmd = if let Some(win_root) = windows_path_from_sftp(&root) {
+            let ps_needle = ps_escape(needle);
+            format!(
+                r#"powershell -NoProfile -NonInteractive -Command "Get-ChildItem -LiteralPath '{}' -Recurse -Depth 5 -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -like '*{}*' }} | Select-Object -First {} | ForEach-Object {{ $k = if ($_.PSIsContainer) {{ 'D' }} else {{ 'F' }}; Write-Output ($k + [char]9 + $_.FullName) }}""#,
+                ps_escape(&win_root),
+                ps_needle,
+                cap,
+            )
+        } else {
+            // Quote wildcard pattern for POSIX find -iname without letting * or ? get expanded by shell.
+            let clean_needle = needle.replace(['*', '?', '[', ']'], "");
+            let script = r#"find "$1" -maxdepth 6 -iname "*$2*" 2>/dev/null | awk -v lim="$3" 'NR<=lim{print}' | while IFS= read -r p; do [ -d "$p" ] && printf "D	%s
+" "$p" || printf "F	%s
+" "$p"; done"#;
+            format!(
+                "sh -c {} _ {} {} {}",
+                shell_quote_posix(script),
+                shell_quote_posix(&root),
+                shell_quote_posix(&clean_needle),
+                cap,
+            )
+        };
+        let stdout = self.exec_command(&cmd, std::time::Duration::from_secs(10))?;
+        Ok(parse_remote_search(&stdout))
+    }
+
+    fn dir_size(&mut self, dir: &str) -> Result<u64, RemoteError> {
+        let dir = path::normalize(dir);
+        let cmd = if let Some(win_dir) = windows_path_from_sftp(&dir) {
+            format!(
+                r#"powershell -NoProfile -NonInteractive -Command "(Get-ChildItem -LiteralPath '{}' -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum""#,
+                ps_escape(&win_dir),
+            )
+        } else {
+            format!("du -sk -- {} 2>/dev/null", shell_quote_posix(&dir))
+        };
+        let stdout = self.exec_command(&cmd, std::time::Duration::from_secs(15))?;
+        Ok(if windows_path_from_sftp(&dir).is_some() {
+            parse_win_dir_size(&stdout)
+        } else {
+            parse_du_size(&stdout)
+        })
+    }
 }
 
 impl SftpTransport {
@@ -717,6 +932,76 @@ impl SftpTransport {
             })?
         })
     }
+}
+
+/// Quotes `arg` safely for a POSIX shell single-quoted literal.
+pub fn shell_quote_posix(arg: &str) -> String {
+    let escaped = arg.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
+fn ps_escape(arg: &str) -> String {
+    arg.replace('\'', "''")
+}
+
+/// Converts a normalized SFTP Windows path (`/C:/Users/Razeen` or `/C:`) to `C:\Users\Razeen` or `C:\`.
+pub fn windows_path_from_sftp(normalized: &str) -> Option<String> {
+    let bytes = normalized.as_bytes();
+    if bytes.len() < 3 || bytes[0] != b'/' || !bytes[1].is_ascii_alphabetic() || bytes[2] != b':' {
+        return None;
+    }
+    let drive = (bytes[1] as char).to_ascii_uppercase();
+    let rest = &normalized[3..];
+    if rest.is_empty() || rest == "/" {
+        Some(format!("{drive}:\\"))
+    } else {
+        let win_rest = rest.trim_start_matches('/').replace('/', "\\");
+        Some(format!("{drive}:\\{win_rest}"))
+    }
+}
+
+pub(crate) fn parse_remote_search(stdout: &str) -> Vec<RemoteSearchHit> {
+    let mut hits = Vec::new();
+    for raw in stdout.lines() {
+        let line = raw.trim_end_matches('\r');
+        let Some((kind, raw_path)) = line.split_once('\t') else {
+            continue;
+        };
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = if trimmed.len() >= 2
+            && trimmed.as_bytes()[0].is_ascii_alphabetic()
+            && trimmed.as_bytes()[1] == b':'
+        {
+            path::normalize(&format!("/{}", trimmed.replace('\\', "/")))
+        } else {
+            path::normalize(trimmed)
+        };
+        hits.push(RemoteSearchHit {
+            path: normalized,
+            is_dir: kind.trim() == "D",
+        });
+    }
+    hits
+}
+
+pub(crate) fn parse_du_size(stdout: &str) -> u64 {
+    stdout
+        .split_whitespace()
+        .next()
+        .and_then(|tok| tok.parse::<u64>().ok())
+        .map(|kb| kb.saturating_mul(1024))
+        .unwrap_or(0)
+}
+
+pub(crate) fn parse_win_dir_size(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Appends `/` to normalized Windows SFTP drive roots like `"/C:"` -> `"/C:/"`
@@ -1112,6 +1397,38 @@ Total bytes                     : 500,107,862,016 (465.7 GB)
 The device is not ready.
 ";
         assert!(super::parse_fsutil_volume('F', f_out).is_none());
+    }
+
+    #[test]
+    fn shell_quoting_and_windows_paths_handle_special_characters() {
+        assert_eq!(super::shell_quote_posix("/a/b'c d"), r#"'/a/b'\''c d'"#);
+        assert_eq!(
+            super::windows_path_from_sftp("/C:/Users/Razeen/My Docs"),
+            Some("C:\\Users\\Razeen\\My Docs".to_owned())
+        );
+        assert_eq!(super::windows_path_from_sftp("/d:"), Some("D:\\".to_owned()));
+        assert_eq!(super::windows_path_from_sftp("/home/razeen"), None);
+        super::evict_ssh_pool();
+    }
+
+    #[test]
+    fn parse_remote_search_handles_posix_and_windows_paths() {
+        let out = "D\t/home/razeen/src\nF\t/home/razeen/src/main.rs\nF\tC:\\Users\\Razeen\\notes.txt\n";
+        let hits = super::parse_remote_search(out);
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].path, "/home/razeen/src");
+        assert!(hits[0].is_dir);
+        assert_eq!(hits[1].path, "/home/razeen/src/main.rs");
+        assert!(!hits[1].is_dir);
+        assert_eq!(hits[2].path, "/C:/Users/Razeen/notes.txt");
+        assert!(!hits[2].is_dir);
+    }
+
+    #[test]
+    fn parse_du_and_win_sizes_decode_bytes() {
+        assert_eq!(super::parse_du_size("1024\t/Users/razeen/project\n"), 1024 * 1024);
+        assert_eq!(super::parse_win_dir_size("\r\n524288\r\n"), 524288);
+        assert_eq!(super::parse_win_dir_size(""), 0);
     }
 
     #[test]

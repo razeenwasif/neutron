@@ -37,6 +37,23 @@ pub fn show(ui: &mut Ui, p: &Palette, path: &Path, view: &mut View, pages: PageA
             let kind = t.language.map_or("Text", |l| l.name);
             format!("{kind} · {lines} line{}{}", if lines == 1 { "" } else { "s" }, if t.truncated { " · first 64 MB" } else { "" })
         }
+        Doc::Markdown(md) => {
+            let lines = md.raw.lines.len();
+            format!("Markdown · {lines} line{}", if lines == 1 { "" } else { "s" })
+        }
+        Doc::Table(tbl) => format!(
+            "{} · {} rows × {} cols{}",
+            tbl.format_label,
+            tbl.total_rows,
+            tbl.columns.len(),
+            if tbl.truncated { " (capped)" } else { "" }
+        ),
+        Doc::Tensor(ts) => format!(
+            "{} · {} params · {} tensors",
+            ts.format,
+            crate::viewer_formats::format_params(ts.total_params),
+            ts.tensors.len()
+        ),
         Doc::Pdf(pdf) => format!("PDF · {} page{}", pdf.pages.len(), if pdf.pages.len() == 1 { "" } else { "s" }),
         Doc::Image(img) => format!("Image · {} × {}", img.source[0], img.source[1]),
         Doc::Failed(_) => String::new(),
@@ -46,7 +63,13 @@ pub fn show(ui: &mut Ui, p: &Palette, path: &Path, view: &mut View, pages: PageA
         if ui.button("Open in App").on_hover_text("Open with the app that opens this kind of file").clicked() {
             ask = Some(Ask::Launch);
         }
-        if !matches!(view.doc, Doc::Failed(_) | Doc::Loading) {
+        if matches!(view.doc, Doc::Markdown(_)) {
+            let lbl = if view.markdown_raw { "Rendered" } else { "Raw" };
+            if ui.button(lbl).on_hover_text("Toggle between rendered Markdown and raw source").clicked() {
+                view.markdown_raw = !view.markdown_raw;
+            }
+        }
+        if matches!(view.doc, Doc::Text(_) | Doc::Markdown(_) | Doc::Pdf(_) | Doc::Image(_)) {
             if ui.button("+").on_hover_text("Zoom in").clicked() {
                 view.zoom = (view.zoom * 1.25).min(6.0);
             }
@@ -55,7 +78,10 @@ pub fn show(ui: &mut Ui, p: &Palette, path: &Path, view: &mut View, pages: PageA
                 view.zoom = (view.zoom / 1.25).max(0.25);
             }
         }
-        if matches!(view.doc, Doc::Text(_)) {
+        if matches!(view.doc, Doc::Tensor(_)) {
+            ui.add(egui::TextEdit::singleline(&mut view.find).hint_text("Filter tensors…").desired_width(190.0));
+        }
+        if matches!(view.doc, Doc::Text(_)) || (matches!(view.doc, Doc::Markdown(_)) && view.markdown_raw) {
             if ui.button("Copy").on_hover_text("Copy the selected lines, or everything").clicked() {
                 ask = view.copy_text().map(Ask::Copy);
             }
@@ -90,6 +116,25 @@ pub fn show(ui: &mut Ui, p: &Palette, path: &Path, view: &mut View, pages: PageA
         Doc::Failed(why) => note(&body_ui, body, why, p.text_muted),
         Doc::Text(text) => {
             if let Some(a) = text_body(&mut body_ui, p, text, zoom, &view.matches, view.current, &mut view.selected, reveal) {
+                ask = Some(a);
+            }
+        }
+        Doc::Markdown(md) => {
+            if view.markdown_raw {
+                if let Some(a) = text_body(&mut body_ui, p, &md.raw, zoom, &view.matches, view.current, &mut view.selected, reveal) {
+                    ask = Some(a);
+                }
+            } else {
+                markdown_body(&mut body_ui, p, md, zoom);
+            }
+        }
+        Doc::Table(tbl) => {
+            if let Some(a) = table_body(&mut body_ui, p, tbl) {
+                ask = Some(a);
+            }
+        }
+        Doc::Tensor(ts) => {
+            if let Some(a) = tensor_body(&mut body_ui, p, ts, &view.find) {
                 ask = Some(a);
             }
         }
@@ -278,4 +323,273 @@ fn image_body(ui: &mut Ui, texture: &egui::TextureHandle, size: [usize; 2], zoom
         let r = Rect::from_center_size(space.center(), shown);
         ui.painter().image(texture.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
     });
+}
+
+
+fn markdown_body(ui: &mut Ui, p: &Palette, md: &crate::viewer_formats::MarkdownDoc, zoom: f32) {
+    use crate::viewer_formats::MdBlock;
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        ui.add_space(18.0);
+        let max_w = (ui.available_width() - 48.0).clamp(280.0, 820.0);
+        let margin = ((ui.available_width() - max_w) / 2.0).max(20.0);
+        ui.horizontal(|ui| {
+            ui.add_space(margin);
+            ui.vertical(|ui| {
+                ui.set_width(max_w);
+                for block in &md.blocks {
+                    match block {
+                        MdBlock::Heading { level, text } => {
+                            let sz = match level {
+                                1 => 24.0,
+                                2 => 19.0,
+                                3 => 16.0,
+                                _ => 14.0,
+                            } * zoom;
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(text).font(theme::strong(ui.ctx(), sz)).color(p.text));
+                            if *level <= 2 {
+                                let r = ui.min_rect();
+                                ui.painter().hline(r.x_range(), r.bottom() + 2.0, Stroke::new(1.0, p.border));
+                                ui.add_space(4.0);
+                            }
+                            ui.add_space(4.0);
+                        }
+                        MdBlock::Paragraph(text) => {
+                            ui.label(egui::RichText::new(text).size(13.5 * zoom).color(p.text_soft()));
+                            ui.add_space(8.0);
+                        }
+                        MdBlock::Bullet { indent, text } => {
+                            ui.horizontal(|ui| {
+                                ui.add_space(12.0 + (*indent as f32) * 16.0);
+                                ui.label(egui::RichText::new("•").size(13.5 * zoom).color(p.accent));
+                                ui.add(egui::Label::new(egui::RichText::new(text).size(13.5 * zoom).color(p.text_soft())).wrap());
+                            });
+                            ui.add_space(3.0);
+                        }
+                        MdBlock::Quote(text) => {
+                            let resp = egui::Frame::new()
+                                .fill(p.raised)
+                                .inner_margin(egui::Margin::symmetric(12, 8))
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new(egui::RichText::new(text).italics().size(13.0 * zoom).color(p.text_muted)).wrap());
+                                })
+                                .response;
+                            let bar = Rect::from_min_max(resp.rect.min, pos2(resp.rect.left() + 3.0, resp.rect.bottom()));
+                            ui.painter().rect_filled(bar, 0.0, p.accent);
+                            ui.add_space(6.0);
+                        }
+                        MdBlock::CodeBlock { lang, code } => {
+                            egui::Frame::new()
+                                .fill(p.raised)
+                                .corner_radius(egui::CornerRadius::same(theme::RADIUS_CONTROL))
+                                .stroke(Stroke::new(1.0, p.border))
+                                .inner_margin(egui::Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.set_width(max_w);
+                                    if !lang.is_empty() {
+                                        ui.label(egui::RichText::new(lang).size(10.5).color(p.text_faint));
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(code)
+                                                .font(FontId::monospace(12.0 * zoom))
+                                                .color(p.text),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                            ui.add_space(8.0);
+                        }
+                        MdBlock::Rule => {
+                            ui.add_space(4.0);
+                            let (r, _) = ui.allocate_exact_size(vec2(max_w, 2.0), Sense::hover());
+                            ui.painter().hline(r.x_range(), r.center().y, Stroke::new(1.0, p.border));
+                            ui.add_space(8.0);
+                        }
+                    }
+                }
+            });
+        });
+        ui.add_space(24.0);
+    });
+}
+
+fn table_body(ui: &mut Ui, p: &Palette, tbl: &mut crate::viewer_formats::TableDoc) -> Option<Ask> {
+    let mut ask = None;
+    if !tbl.meta.is_empty() {
+        egui::Frame::new()
+            .fill(p.raised)
+            .inner_margin(egui::Margin::symmetric(14, 8))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (k, v) in &tbl.meta {
+                        ui.label(egui::RichText::new(format!("{k}:")).size(11.5).color(p.text_faint));
+                        ui.label(egui::RichText::new(v).size(11.5).color(p.text));
+                        ui.add_space(12.0);
+                    }
+                });
+            });
+    }
+
+    if tbl.columns.is_empty() {
+        ui.centered_and_justified(|ui| {
+            ui.label(egui::RichText::new("No rows to display").color(p.text_faint));
+        });
+        return None;
+    }
+
+    let col_w = 160.0_f32;
+    let total_w = (tbl.columns.len() as f32 * col_w).max(ui.available_width());
+    let row_h = 26.0_f32;
+
+    egui::ScrollArea::horizontal().auto_shrink([false; 2]).show(ui, |ui| {
+        ui.set_min_width(total_w);
+        // Header strip
+        let (hdr_rect, _) = ui.allocate_exact_size(vec2(total_w, 28.0), Sense::hover());
+        ui.painter().rect_filled(hdr_rect, 0.0, p.elevated);
+        let mut click_col = None;
+        for (c, col_name) in tbl.columns.iter().enumerate() {
+            let cell = Rect::from_min_size(pos2(hdr_rect.left() + c as f32 * col_w, hdr_rect.top()), vec2(col_w, 28.0));
+            let resp = ui.interact(cell, ui.id().with(("tbl-hdr", c)), Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(cell, 0.0, p.hover);
+            }
+            let arrow = match tbl.sort_col {
+                Some((sc, true)) if sc == c => " ▲",
+                Some((sc, false)) if sc == c => " ▼",
+                _ => "",
+            };
+            let clipped = ui.painter().with_clip_rect(cell.shrink2(vec2(8.0, 2.0)));
+            clipped.text(
+                pos2(cell.left() + 8.0, cell.center().y),
+                Align2::LEFT_CENTER,
+                format!("{col_name}{arrow}"),
+                theme::strong(ui.ctx(), 11.5),
+                p.text,
+            );
+            if resp.clicked() {
+                click_col = Some(c);
+            }
+        }
+        if let Some(c) = click_col {
+            tbl.sort_by(c);
+        }
+
+        // Virtualized rows
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(ui, row_h, tbl.order.len(), |ui, range| {
+            for idx in range {
+                let (r_rect, _) = ui.allocate_exact_size(vec2(total_w, row_h), Sense::hover());
+                if idx % 2 == 1 {
+                    ui.painter().rect_filled(r_rect, 0.0, theme::with_alpha(p.raised, 90));
+                }
+                if let Some(row) = tbl.ordered_row(idx) {
+                    for (c, val) in row.iter().enumerate() {
+                        let cell = Rect::from_min_size(pos2(r_rect.left() + c as f32 * col_w, r_rect.top()), vec2(col_w, row_h));
+                        let resp = ui.interact(cell, ui.id().with(("tbl-cell", idx, c)), Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(cell, 0.0, p.hover);
+                        }
+                        if resp.clicked() {
+                            ask = Some(Ask::Copy(val.clone()));
+                        }
+                        let clipped = ui.painter().with_clip_rect(cell.shrink2(vec2(8.0, 2.0)));
+                        clipped.text(
+                            pos2(cell.left() + 8.0, cell.center().y),
+                            Align2::LEFT_CENTER,
+                            val,
+                            FontId::monospace(11.5),
+                            p.text_soft(),
+                        );
+                    }
+                }
+            }
+        });
+    });
+    ask
+}
+
+fn tensor_body(ui: &mut Ui, p: &Palette, ts: &crate::viewer_formats::TensorDoc, filter: &str) -> Option<Ask> {
+    let mut ask = None;
+    let needle = filter.trim().to_ascii_lowercase();
+    let filtered: Vec<&crate::viewer_formats::TensorInfo> = ts
+        .tensors
+        .iter()
+        .filter(|t| needle.is_empty() || t.name.to_ascii_lowercase().contains(&needle) || t.dtype.to_ascii_lowercase().contains(&needle))
+        .collect();
+
+    egui::Frame::new()
+        .fill(p.raised)
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (k, v) in [
+                    ("Format", ts.format.to_owned()),
+                    ("File Size", neutron_ui::format::size(Some(ts.file_size))),
+                    ("Parameters", crate::viewer_formats::format_params(ts.total_params)),
+                    ("Tensors", ts.tensors.len().to_string()),
+                ] {
+                    ui.label(egui::RichText::new(format!("{k}:")).size(11.5).color(p.text_faint));
+                    ui.label(egui::RichText::new(v).font(theme::strong(ui.ctx(), 12.0)).color(p.text));
+                    ui.add_space(12.0);
+                }
+                for (dtype, cnt, params) in &ts.dtype_counts {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{dtype}: {cnt} ({})",
+                            crate::viewer_formats::format_params(*params)
+                        ))
+                        .size(11.0)
+                        .color(p.cloud),
+                    );
+                    ui.add_space(8.0);
+                }
+            });
+            if !ts.metadata.is_empty() {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (mk, mv) in ts.metadata.iter().take(8) {
+                        ui.label(egui::RichText::new(format!("{mk}={mv}")).size(11.0).color(p.text_muted));
+                        ui.add_space(10.0);
+                    }
+                });
+            }
+        });
+
+    let row_h = 26.0_f32;
+    let w = ui.available_width();
+    let (hdr, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
+    ui.painter().rect_filled(hdr, 0.0, p.elevated);
+    ui.painter().text(pos2(hdr.left() + 14.0, hdr.center().y), Align2::LEFT_CENTER, "Tensor Name (click to copy)", theme::strong(ui.ctx(), 11.0), p.text_faint);
+    ui.painter().text(pos2(hdr.right() - 280.0, hdr.center().y), Align2::LEFT_CENTER, "DType", theme::strong(ui.ctx(), 11.0), p.text_faint);
+    ui.painter().text(pos2(hdr.right() - 205.0, hdr.center().y), Align2::LEFT_CENTER, "Shape", theme::strong(ui.ctx(), 11.0), p.text_faint);
+    ui.painter().text(pos2(hdr.right() - 80.0, hdr.center().y), Align2::RIGHT_CENTER, "Params", theme::strong(ui.ctx(), 11.0), p.text_faint);
+    ui.painter().text(pos2(hdr.right() - 14.0, hdr.center().y), Align2::RIGHT_CENTER, "Bytes", theme::strong(ui.ctx(), 11.0), p.text_faint);
+
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(ui, row_h, filtered.len(), |ui, range| {
+        for idx in range {
+            let t = filtered[idx];
+            let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(rect, 0.0, p.hover);
+            } else if idx % 2 == 1 {
+                ui.painter().rect_filled(rect, 0.0, theme::with_alpha(p.raised, 70));
+            }
+            if resp.clicked() {
+                ask = Some(Ask::Copy(t.name.clone()));
+            }
+            let shape_str = if t.shape.is_empty() {
+                "[]".to_owned()
+            } else {
+                format!("[{}]", t.shape.iter().map(u64::to_string).collect::<Vec<_>>().join("×"))
+            };
+            let name_rect = Rect::from_min_max(pos2(rect.left() + 14.0, rect.top()), pos2((rect.right() - 290.0).max(rect.left() + 80.0), rect.bottom()));
+            let clipped = ui.painter().with_clip_rect(name_rect);
+            clipped.text(pos2(name_rect.left(), rect.center().y), Align2::LEFT_CENTER, &t.name, FontId::monospace(11.5), p.text);
+            ui.painter().text(pos2(rect.right() - 280.0, rect.center().y), Align2::LEFT_CENTER, &t.dtype, FontId::monospace(11.5), p.cloud);
+            ui.painter().text(pos2(rect.right() - 205.0, rect.center().y), Align2::LEFT_CENTER, shape_str, FontId::monospace(11.5), p.text_muted);
+            ui.painter().text(pos2(rect.right() - 80.0, rect.center().y), Align2::RIGHT_CENTER, crate::viewer_formats::format_params(t.params), FontId::monospace(11.5), p.text_soft());
+            ui.painter().text(pos2(rect.right() - 14.0, rect.center().y), Align2::RIGHT_CENTER, neutron_ui::format::size(Some(t.byte_size)), FontId::monospace(11.5), p.text_faint);
+        }
+    });
+    ask
 }

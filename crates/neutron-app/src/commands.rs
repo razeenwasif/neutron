@@ -18,6 +18,10 @@ pub enum CommandId {
     CloseTab,
     SplitRight,
     SplitDown,
+    ComparePanes,
+    SyncPanes,
+    SaveWorkspaceLayout,
+    SwitchWorkspaceLayout,
     FocusNextPane,
 
     GoUp,
@@ -82,6 +86,9 @@ pub enum CommandId {
     NewSmartFolder,
     AskAntigravity,
     NewWindow,
+    CopyGitBranch,
+    RunNtrStatus,
+    InspectNtrCi,
 }
 
 pub struct CommandDef {
@@ -104,6 +111,10 @@ pub const ALL: &[CommandDef] = &[
     CommandDef { id: CommandId::CloseTab, title: "Close tab", hint: "Ctrl+W" },
     CommandDef { id: CommandId::SplitRight, title: "Split pane right", hint: "Ctrl+\\" },
     CommandDef { id: CommandId::SplitDown, title: "Split pane down", hint: "Ctrl+Shift+\\" },
+    CommandDef { id: CommandId::ComparePanes, title: "Compare split panes", hint: if cfg!(target_os = "macos") { "Option+Cmd+D" } else { "Alt+Ctrl+D" } },
+    CommandDef { id: CommandId::SyncPanes, title: "Sync newer and missing to other pane", hint: "" },
+    CommandDef { id: CommandId::SaveWorkspaceLayout, title: "Save workspace layout", hint: "" },
+    CommandDef { id: CommandId::SwitchWorkspaceLayout, title: "Switch workspace layout", hint: "" },
     CommandDef { id: CommandId::FocusNextPane, title: "Focus next pane", hint: "F6" },
 
     CommandDef { id: CommandId::GoUp, title: "Go up one folder", hint: "Backspace" },
@@ -249,6 +260,21 @@ pub const ALL: &[CommandDef] = &[
     CommandDef {
         id: CommandId::SignOutDrive,
         title: "Disconnect Google Drive",
+        hint: "",
+    },
+    CommandDef {
+        id: CommandId::CopyGitBranch,
+        title: "Copy Git branch",
+        hint: "",
+    },
+    CommandDef {
+        id: CommandId::RunNtrStatus,
+        title: "Run Neutrino status",
+        hint: "",
+    },
+    CommandDef {
+        id: CommandId::InspectNtrCi,
+        title: "Inspect Neutrino CI",
         hint: "",
     },
 ];

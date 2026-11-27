@@ -35,6 +35,56 @@ impl Program {
     pub fn shell() -> Self {
         Program { command: None, env: Vec::new() }
     }
+
+    /// Opens an interactive SSH session landed inside `remote_dir`.
+    pub fn ssh(site: &neutron_remote::Site, remote_dir: &str) -> Self {
+        let mut argv = ssh_base_args(site);
+        let normalized = neutron_remote::path::normalize(remote_dir);
+        let remote_cmd =
+            if let Some(win_dir) = neutron_remote::sftp::windows_path_from_sftp(&normalized) {
+                let escaped = win_dir.replace('\'', "''");
+                format!("powershell -NoExit -Command \"Set-Location -LiteralPath \'{escaped}\'\"")
+            } else {
+                format!(
+                    "cd {} && exec ${{SHELL:-/bin/sh}} -l",
+                    neutron_remote::sftp::shell_quote_posix(&normalized)
+                )
+            };
+        argv.push(remote_cmd);
+        Program { command: Some(argv), env: Vec::new() }
+    }
+}
+
+pub(crate) fn ssh_base_args(site: &neutron_remote::Site) -> Vec<String> {
+    let mut argv = vec![
+        "ssh".to_owned(),
+        "-t".to_owned(),
+        "-p".to_owned(),
+        site.port().to_string(),
+    ];
+    if let neutron_remote::Auth::Key { path } = &site.auth {
+        let expanded = if let Some(rest) = path.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                std::path::PathBuf::from(home)
+                    .join(rest)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                path.clone()
+            }
+        } else {
+            path.clone()
+        };
+        argv.push("-i".to_owned());
+        argv.push(expanded);
+    }
+    let target = if site.username.is_empty() {
+        site.host.clone()
+    } else {
+        format!("{}@{}", site.username, site.host)
+    };
+    argv.push(target);
+    argv
 }
 
 /// Answers the questions a program asks its terminal and then waits on: where
@@ -272,5 +322,28 @@ mod tests {
         assert!(wait_for(&session, "hello"));
         session.resize(30, 100);
         assert_eq!(session.with_screen(|s| s.size()), Some((30, 100)));
+    }
+
+    #[test]
+    fn ssh_program_targets_posix_and_windows_folders() {
+        let site = neutron_remote::Site {
+            id: "mini".into(),
+            label: "Mac mini".into(),
+            protocol: neutron_remote::Protocol::Sftp,
+            host: "100.97.247.34".into(),
+            port: Some(2222),
+            username: "razeen".into(),
+            path: None,
+            fingerprint: None,
+            auth: neutron_remote::Auth::Key { path: "/Users/r/.ssh/id_ed25519".into() },
+            trusted_cert: None,
+        };
+        let posix = Program::ssh(&site, "/Users/razeen/dev").command.unwrap();
+        assert_eq!(posix[0..4], ["ssh", "-t", "-p", "2222"]);
+        assert_eq!(posix[4..7], ["-i", "/Users/r/.ssh/id_ed25519", "razeen@100.97.247.34"]);
+        assert!(posix[7].contains("cd '/Users/razeen/dev'"));
+
+        let win = Program::ssh(&site, "/C:/Users/Razeen/O'Reilly").command.unwrap();
+        assert!(win[7].contains(r"Set-Location -LiteralPath 'C:\Users\Razeen\O''Reilly'"));
     }
 }

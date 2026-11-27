@@ -29,6 +29,13 @@ pub struct RemoteVolume {
     pub free: u64,
 }
 
+/// A search hit reported by a remote host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSearchHit {
+    pub path: String,
+    pub is_dir: bool,
+}
+
 /// One entry in a remote directory.
 ///
 /// Deliberately not [`neutron_core::Entry`]: the conversion needs to happen
@@ -196,6 +203,43 @@ pub trait Transport: Send {
     fn volumes(&mut self) -> Result<Vec<RemoteVolume>, RemoteError> {
         Ok(Vec::new())
     }
+
+    /// Executes a remote shell command (supported by SFTP/SSH hosts).
+    fn exec(&mut self, _cmd: &str, _timeout: std::time::Duration) -> Result<String, RemoteError> {
+        Err(RemoteError::Server {
+            path: "/".to_owned(),
+            reason: "remote command execution is not supported by this protocol".to_owned(),
+        })
+    }
+
+    /// Copies a remote file or directory server-side from `from` to `to`.
+    fn copy_remote(&mut self, from: &str, _to: &str) -> Result<(), RemoteError> {
+        Err(RemoteError::Server {
+            path: from.to_owned(),
+            reason: "server-side copy is not supported by this protocol".to_owned(),
+        })
+    }
+
+    /// Searches beneath `root` for entries matching `needle`.
+    fn search(
+        &mut self,
+        root: &str,
+        _needle: &str,
+        _limit: usize,
+    ) -> Result<Vec<RemoteSearchHit>, RemoteError> {
+        Err(RemoteError::Server {
+            path: root.to_owned(),
+            reason: "server-side search is not supported by this protocol".to_owned(),
+        })
+    }
+
+    /// Measures the recursive byte size of a remote directory.
+    fn dir_size(&mut self, path: &str) -> Result<u64, RemoteError> {
+        Err(RemoteError::Server {
+            path: path.to_owned(),
+            reason: "remote directory size calculation is not supported by this protocol".to_owned(),
+        })
+    }
 }
 
 /// How long to wait for a server that is not answering.
@@ -217,7 +261,7 @@ pub const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Transfer chunk. Large enough that the syscall overhead disappears, small
 /// enough that progress moves visibly inside one big file.
-pub const CHUNK: usize = 64 * 1024;
+pub const CHUNK: usize = 256 * 1024;
 
 #[cfg(test)]
 mod tests {

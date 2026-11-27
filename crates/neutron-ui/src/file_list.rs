@@ -29,7 +29,7 @@
 //! Nothing here touches the filesystem. Rows render from the in-memory
 //! [`EntryList`] snapshot only; anything that could block belongs on a worker.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, TextStyle, Ui, pos2, vec2};
 use neutron_core::entry::{EntryKind, SyncState};
@@ -185,8 +185,46 @@ pub trait IconSource {
 /// Bundled rather than passed as separate arguments because both are read at
 /// every level of the draw, and a fifth and sixth positional `&` parameter
 /// threaded through five functions is where mix-ups live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcsStatus {
+    Modified,
+    Added,
+    Untracked,
+    Conflicted,
+    RepoClean,
+    RepoDirty,
+}
+
+fn vcs_dot_color(status: VcsStatus, p: &Palette) -> Color32 {
+    match status {
+        VcsStatus::Modified | VcsStatus::RepoDirty => p.warning,
+        VcsStatus::Added | VcsStatus::RepoClean => p.success,
+        VcsStatus::Untracked => p.cloud,
+        VcsStatus::Conflicted => p.danger,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffTag {
+    OnlyHere,
+    Newer,
+    Older,
+    Different,
+}
+
+fn diff_tag_style(tag: DiffTag, p: &Palette) -> (&'static str, Color32, Color32) {
+    match tag {
+        DiffTag::OnlyHere => ("ONLY", p.cloud, p.cloud.gamma_multiply(0.18)),
+        DiffTag::Newer => ("NEWER", p.success, p.success.gamma_multiply(0.18)),
+        DiffTag::Older => ("OLDER", p.text_faint, p.raised),
+        DiffTag::Different => ("DIFF", p.warning, p.warning.gamma_multiply(0.18)),
+    }
+}
+
 pub struct Marks<'a> {
     pub selection: &'a Selection,
+    pub vcs: Option<&'a HashMap<String, VcsStatus>>,
+    pub diff: Option<&'a HashMap<String, DiffTag>>,
     /// Names *in this directory* that sit on the clipboard as a cut.
     ///
     /// A set of bare names rather than paths, tested per visible row, so a
@@ -211,6 +249,14 @@ pub struct Marks<'a> {
 impl Marks<'_> {
     fn is_cut(&self, name: &str) -> bool {
         self.cut.is_some_and(|names| names.contains(name))
+    }
+
+    fn vcs_status(&self, name: &str) -> Option<VcsStatus> {
+        self.vcs.and_then(|map| map.get(name).copied())
+    }
+
+    fn diff_tag(&self, name: &str) -> Option<DiffTag> {
+        self.diff.and_then(|map| map.get(name).copied())
     }
 
     fn rename_text(&self, idx: usize) -> Option<(&'_ str, u64)> {
@@ -1352,14 +1398,51 @@ fn draw_row(
         );
     }
 
-    // Cloud-only badge, right-aligned within the name column.
-    if list.sync(idx) == SyncState::CloudOnly && marks.rename_text(idx).is_none() {
+    // Cloud-only, VCS, and Diff indicators, right-aligned within the name column.
+    let is_cloud_only = list.sync(idx) == SyncState::CloudOnly && marks.rename_text(idx).is_none();
+    if is_cloud_only {
         icons::draw(
             ui.painter(),
             pos2(name_rect.right() - 10.0, outer.center().y),
             icons::Glyph::Cloud,
             p.cloud,
         );
+    }
+    let vcs_opt = if marks.rename_text(idx).is_none() {
+        marks.vcs_status(list.name(idx))
+    } else {
+        None
+    };
+    if let Some(vcs) = vcs_opt {
+        let dot_x = if is_cloud_only { name_rect.right() - 24.0 } else { name_rect.right() - 10.0 };
+        ui.painter().circle_filled(
+            pos2(dot_x, outer.center().y),
+            2.5,
+            vcs_dot_color(vcs, p),
+        );
+    }
+    if marks.rename_text(idx).is_none()
+        && let Some(tag) = marks.diff_tag(list.name(idx))
+    {
+        let (label, fg, bg) = diff_tag_style(tag, p);
+        let right = name_rect.right()
+            - if is_cloud_only { 20.0 } else { 4.0 }
+            - if vcs_opt.is_some() { 14.0 } else { 0.0 };
+        let badge_w = 42.0;
+        let badge = Rect::from_min_size(
+            pos2(right - badge_w, outer.center().y - 8.0),
+            vec2(badge_w, 16.0),
+        );
+        if badge.left() > name_rect.left() + 80.0 {
+            ui.painter().rect_filled(badge, egui::CornerRadius::same(4), bg);
+            ui.painter().text(
+                badge.center(),
+                Align2::CENTER_CENTER,
+                label,
+                theme::strong(ui.ctx(), 9.0),
+                fg,
+            );
+        }
     }
     x += name_width - 6.0;
 
@@ -1779,6 +1862,13 @@ fn draw_tile(
             hidden,
         ),
     }
+    if let Some(vcs) = marks.vcs_status(name) {
+        ui.painter().circle_filled(
+            pos2(art.right() - 8.0, art.top() + 8.0),
+            3.0,
+            vcs_dot_color(vcs, p),
+        );
+    }
 
     // Renaming: the box takes the name's place under the icon. Without it a
     // rename started in the grid — F2, or New Folder — was open but invisible,
@@ -2044,7 +2134,7 @@ mod scroll_tests {
         fn frame(&mut self, events: Vec<egui::Event>) -> Option<FileListAction> {
             let mut view = self.state.clone();
             let mut action = None;
-            let marks = Marks { selection: &self.selection, cut: None, rename: None };
+            let marks = Marks { selection: &self.selection, vcs: None, diff: None, cut: None, rename: None };
             self.time += 0.25;
             let mut output = self.ctx.run_ui(
                 egui::RawInput {

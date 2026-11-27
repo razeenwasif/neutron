@@ -57,6 +57,7 @@ impl Sessions {
     /// the port or the credentials of a site that is currently connected, and a
     /// session that no longer matches its own definition is a trap.
     pub fn reload(&mut self) {
+        neutron_remote::evict_ssh_pool();
         let refreshed = Sessions::load();
         self.sites = refreshed.sites;
         self.sites_error = refreshed.sites_error;

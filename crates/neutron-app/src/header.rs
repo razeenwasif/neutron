@@ -88,6 +88,8 @@ pub struct Header<'a> {
     pub shown: usize,
     /// Total before filtering, so a narrowed listing can say so.
     pub total: usize,
+    /// Optional Git + Neutrino metadata for the current folder.
+    pub vcs: Option<&'a crate::vcs::FolderVcs>,
 }
 
 /// The id of a pane's filter field.
@@ -280,13 +282,64 @@ fn draw_title(ui: &Ui, p: &Palette, row: Rect, h: &Header<'_>) {
     } else {
         format!("{} of {}", h.shown, h.total)
     };
-    painter.text(
-        pos2(baseline.x + width + 12.0, row.center().y + 3.0),
-        egui::Align2::LEFT_CENTER,
-        count,
-        egui::FontId::proportional(13.0),
-        p.text_faint,
+    let count_galley = painter.layout_no_wrap(count, egui::FontId::proportional(13.0), p.text_faint);
+    let count_pos = pos2(
+        baseline.x + width + 12.0,
+        row.center().y + 3.0 - count_galley.size().y / 2.0,
     );
+    let mut pill_x = count_pos.x + count_galley.size().x + 12.0;
+    painter.galley(count_pos, count_galley, p.text_faint);
+
+    let Some(vcs) = h.vcs else {
+        return;
+    };
+    let pill_y = row.center().y + 2.0;
+
+    if let Some(branch) = &vcs.branch {
+        let mut label = branch.clone();
+        if vcs.ahead > 0 {
+            label.push_str(&format!(" ↑{}", vcs.ahead));
+        }
+        if vcs.behind > 0 {
+            label.push_str(&format!(" ↓{}", vcs.behind));
+        }
+        if vcs.dirty_count > 0 {
+            label.push_str(&format!(" · {} dirty", vcs.dirty_count));
+        }
+        let fg = if vcs.dirty_count > 0 { p.warning } else { p.text_muted };
+        let g = painter.layout_no_wrap(label, theme::strong(ui.ctx(), 11.0), fg);
+        let w = g.size().x + 14.0;
+        if pill_x + w <= row.right() - 12.0 {
+            let r = Rect::from_center_size(pos2(pill_x + w / 2.0, pill_y), vec2(w, 20.0));
+            painter.rect_filled(r, egui::CornerRadius::same(6), p.raised);
+            painter.galley(pos2(r.left() + 7.0, r.center().y - g.size().y / 2.0), g, fg);
+            pill_x += w + 6.0;
+        }
+    }
+
+    if let Some(ntr) = &vcs.ntr {
+        let (text, fg) = match &ntr.ci {
+            Some((id, crate::vcs::CiState::Pass)) => (format!("ntr #{id} · pass"), p.success),
+            Some((id, crate::vcs::CiState::Fail)) => (format!("ntr #{id} · fail"), p.danger),
+            Some((id, crate::vcs::CiState::Running)) => (format!("ntr #{id} · running"), p.accent),
+            Some((id, crate::vcs::CiState::Unknown)) => (format!("ntr #{id}"), p.text_muted),
+            None => (format!("ntr · {}", ntr.slug), p.accent),
+        };
+        let mut full = text;
+        if ntr.open_prs > 0 {
+            full.push_str(&format!(" · {} PR", ntr.open_prs));
+        }
+        if ntr.mirror_ok == Some(false) {
+            full.push_str(" · mirror!");
+        }
+        let g = painter.layout_no_wrap(full, theme::strong(ui.ctx(), 11.0), fg);
+        let w = g.size().x + 14.0;
+        if pill_x + w <= row.right() - 12.0 {
+            let r = Rect::from_center_size(pos2(pill_x + w / 2.0, pill_y), vec2(w, 20.0));
+            painter.rect_filled(r, egui::CornerRadius::same(6), theme::with_alpha(fg, 26));
+            painter.galley(pos2(r.left() + 7.0, r.center().y - g.size().y / 2.0), g, fg);
+        }
+    }
 }
 
 /// A square icon button. `active` gives it the held-down look used by the

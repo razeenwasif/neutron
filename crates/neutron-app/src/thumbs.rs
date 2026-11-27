@@ -61,11 +61,21 @@ enum State {
 
 /// The parts the paint path writes to. In a cell for the reason given on
 /// `icon_service::Wants`: views draw through `&self`.
+#[derive(Clone)]
+struct RemoteJob {
+    key: Key,
+    site: neutron_remote::Site,
+    remote_path: String,
+    px: u32,
+}
+
 #[derive(Default)]
 struct Wants {
     known: HashMap<Key, State>,
     /// Asked for this frame and not yet known, in the order asked.
     wanted: Vec<Key>,
+    /// Remote thumbnails asked for this frame and not yet known.
+    remote_wanted: Vec<RemoteJob>,
     seen: HashSet<Key>,
     frame: u64,
 }
@@ -74,6 +84,8 @@ struct Wants {
 const MAX_TEXTURES: usize = 240;
 /// Most requests in the workers' hands at once.
 const MAX_IN_FLIGHT: usize = 24;
+/// Bound concurrent remote SSH thumbnail commands to keep browsing snappy.
+const MAX_REMOTE_IN_FLIGHT: usize = 6;
 /// Previews to one helper call: enough to pay for starting it.
 const BATCH: usize = 8;
 const WORKERS: usize = 2;
@@ -81,8 +93,10 @@ const WORKERS: usize = 2;
 pub struct Thumbnails {
     wants: RefCell<Wants>,
     jobs: Sender<Vec<Key>>,
+    remote_jobs: Sender<RemoteJob>,
     results: Receiver<(Key, Option<egui::ColorImage>)>,
     in_flight: usize,
+    remote_in_flight: usize,
     ctx: egui::Context,
 }
 
@@ -96,6 +110,7 @@ impl Thumbnails {
     /// caches.
     fn with_cache(ctx: egui::Context, dir: Option<PathBuf>) -> Self {
         let (jobs, inbox) = crossbeam_channel::unbounded::<Vec<Key>>();
+        let (remote_jobs, remote_inbox) = crossbeam_channel::unbounded::<RemoteJob>();
         let (done, results) = crossbeam_channel::unbounded();
         for n in 0..WORKERS {
             let inbox = inbox.clone();
@@ -121,7 +136,65 @@ impl Thumbnails {
                     }
                 });
         }
-        Self { wants: RefCell::new(Wants::default()), jobs, results, in_flight: 0, ctx }
+        {
+            let done = done.clone();
+            let ctx = ctx.clone();
+            let dir = dir.clone();
+            let _ = std::thread::Builder::new()
+                .name("neutron-remote-thumbs".into())
+                .spawn(move || {
+                    while let Ok(job) = remote_inbox.recv() {
+                        let image = make_remote(dir.as_deref(), &job);
+                        if done.send((job.key, image)).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                    }
+                });
+        }
+        Self {
+            wants: RefCell::new(Wants::default()),
+            jobs,
+            remote_jobs,
+            results,
+            in_flight: 0,
+            remote_in_flight: 0,
+            ctx,
+        }
+    }
+
+    /// Requests or retrieves a cached thumbnail for a remote SFTP file.
+    pub fn get_remote(
+        &self,
+        site: &neutron_remote::Site,
+        remote_path: &str,
+        modified: i64,
+        grade: Grade,
+    ) -> Option<Thumb> {
+        let key = Key {
+            path: PathBuf::from(format!("sftp://{}/{}", site.id, remote_path)),
+            modified,
+            grade,
+        };
+        let mut wants = self.wants.borrow_mut();
+        let frame = wants.frame;
+        match wants.known.get_mut(&key) {
+            Some(State::Ready { texture, size, used }) => {
+                *used = frame;
+                return Some(Thumb { texture: texture.id(), size: *size });
+            }
+            Some(State::Pending | State::Missing) => return None,
+            None => {}
+        }
+        if wants.seen.insert(key.clone()) {
+            wants.remote_wanted.push(RemoteJob {
+                key,
+                site: site.clone(),
+                remote_path: remote_path.to_owned(),
+                px: grade.px(),
+            });
+        }
+        None
     }
 
     /// The preview of `path`, asking for it if this is the first time.
@@ -151,7 +224,11 @@ impl Thumbnails {
         wants.frame += 1;
 
         while let Ok((key, image)) = self.results.try_recv() {
-            self.in_flight = self.in_flight.saturating_sub(1);
+            if key.path.to_string_lossy().starts_with("sftp://") {
+                self.remote_in_flight = self.remote_in_flight.saturating_sub(1);
+            } else {
+                self.in_flight = self.in_flight.saturating_sub(1);
+            }
             let state = match image {
                 Some(image) => {
                     let size = egui::vec2(image.size[0] as f32, image.size[1] as f32);
@@ -182,6 +259,16 @@ impl Thumbnails {
                 if self.jobs.send(batch.to_vec()).is_err() {
                     return;
                 }
+            }
+        }
+
+        let remote_wanted = std::mem::take(&mut wants.remote_wanted);
+        let remote_room = MAX_REMOTE_IN_FLIGHT.saturating_sub(self.remote_in_flight);
+        for job in remote_wanted.into_iter().take(remote_room) {
+            wants.known.insert(job.key.clone(), State::Pending);
+            self.remote_in_flight += 1;
+            if self.remote_jobs.send(job).is_err() {
+                return;
             }
         }
 
@@ -260,6 +347,93 @@ fn decode(file: &Path) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()))
 }
 
+fn decode_bytes(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()))
+}
+
+fn make_remote(dir: Option<&Path>, job: &RemoteJob) -> Option<egui::ColorImage> {
+    let dir = dir?;
+    if neutron_remote::sftp::windows_path_from_sftp(&job.remote_path).is_some() {
+        return None;
+    }
+    let cache = dir.join(file_name(&job.key)).with_extension("jpg");
+    let refused = cache.with_extension("none");
+    if refused.is_file() {
+        return None;
+    }
+    if cache.is_file() {
+        return decode(&cache);
+    }
+
+    let script = r#"f="$1"; sz="$2"; tmp="/tmp/neutron-th-$$.jpg"; if command -v sips >/dev/null 2>&1; then sips -Z "$sz" -s format jpeg "$f" --out "$tmp" >/dev/null 2>&1 && base64 < "$tmp"; rm -f "$tmp"; elif command -v magick >/dev/null 2>&1; then magick "$f" -auto-orient -thumbnail "${sz}x${sz}>" jpeg:- 2>/dev/null | base64; elif command -v convert >/dev/null 2>&1; then convert "$f" -auto-orient -thumbnail "${sz}x${sz}>" jpeg:- 2>/dev/null | base64; fi"#;
+    let cmd = format!(
+        "sh -c {} _ {} {}",
+        neutron_remote::sftp::shell_quote_posix(script),
+        neutron_remote::sftp::shell_quote_posix(&job.remote_path),
+        job.px,
+    );
+    let Ok(mut transport) = crate::remote::connect_checked(&job.site) else {
+        return None;
+    };
+    let Ok(stdout) = transport.exec(&cmd, std::time::Duration::from_secs(6)) else {
+        return None;
+    };
+    let Some(bytes) = decode_base64(&stdout) else {
+        let _ = std::fs::write(&refused, b"");
+        return None;
+    };
+    let Some(img) = decode_bytes(&bytes) else {
+        let _ = std::fs::write(&refused, b"");
+        return None;
+    };
+    let _ = std::fs::write(&cache, &bytes);
+    Some(img)
+}
+
+pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut vals = Vec::with_capacity(input.len());
+    for b in input.bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if b == b'=' {
+            vals.push(255u8);
+            continue;
+        }
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        vals.push(v);
+    }
+    if vals.is_empty() || vals.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity((vals.len() / 4) * 3);
+    for chunk in vals.chunks_exact(4) {
+        let (a, b, c, d) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+        if a == 255 || b == 255 {
+            return None;
+        }
+        out.push((a << 2) | (b >> 4));
+        if c != 255 {
+            out.push((b << 4) | (c >> 2));
+            if d != 255 {
+                out.push((c << 6) | d);
+            }
+        } else if d != 255 {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 /// Where previews are kept between launches.
 fn cache_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches/Neutron/thumbnails");
@@ -296,7 +470,7 @@ fn prune(dir: &Path) {
         .filter(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            name.ends_with(".png") || name.ends_with(".none")
+            name.ends_with(".png") || name.ends_with(".jpg") || name.ends_with(".none")
         })
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
@@ -338,5 +512,12 @@ mod tests {
         // Sent, so pending: not asked for again.
         assert!(t.get(Path::new("/x.png"), 1, Grade::Small).is_none());
         assert!(t.wants.borrow().wanted.is_empty());
+    }
+
+    #[test]
+    fn base64_decoder_handles_multiline_and_rejects_garbage() {
+        assert_eq!(decode_base64("SGVs\nbG8=\n").as_deref(), Some(b"Hello".as_slice()));
+        assert!(decode_base64("").is_none());
+        assert!(decode_base64("not@valid").is_none());
     }
 }

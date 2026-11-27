@@ -84,7 +84,6 @@ impl RailAction {
         }
         if state.server_folder {
             match self {
-                Self::Copy | Self::Cut => return Some("Copying files off a server is not supported yet"),
                 Self::Extract | Self::Compress => return Some("Archives work on local folders only"),
                 _ => {}
             }
@@ -359,10 +358,17 @@ mod tests {
     #[test]
     fn a_server_folder_offers_the_writes_a_server_can_take() {
         let state = RailState { server_folder: true, selection_count: 1, has_cursor: true, ..Default::default() };
-        for action in [RailAction::Paste, RailAction::NewFolder, RailAction::Rename, RailAction::Delete] {
+        for action in [
+            RailAction::Copy,
+            RailAction::Cut,
+            RailAction::Paste,
+            RailAction::NewFolder,
+            RailAction::Rename,
+            RailAction::Delete,
+        ] {
             assert!(action.unavailable(&state).is_none(), "{action:?} should work on a server");
         }
-        for action in [RailAction::Copy, RailAction::Cut, RailAction::Extract, RailAction::Compress] {
+        for action in [RailAction::Extract, RailAction::Compress] {
             assert!(action.unavailable(&state).is_some(), "{action:?} should explain itself");
         }
     }

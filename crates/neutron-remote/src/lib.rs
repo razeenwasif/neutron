@@ -37,8 +37,9 @@ pub mod sftp;
 pub mod site;
 pub mod transport;
 
+pub use sftp::evict_ssh_pool;
 pub use site::{Auth, Protocol, Site, Sites};
-pub use transport::{Continue, RemoteEntry, RemoteError, RemoteVolume, Transport};
+pub use transport::{Continue, RemoteEntry, RemoteError, RemoteSearchHit, RemoteVolume, Transport};
 
 /// Reads the password saved for a site, if there is one.
 ///

@@ -71,6 +71,58 @@ pub fn program(agent: Agent, dir: &Path, selected: &[PathBuf]) -> crate::term::P
     crate::term::Program { command: Some(argv), env }
 }
 
+/// Runs an AI agent remotely over SSH inside `remote_dir`.
+pub fn remote_program(
+    agent: Agent,
+    site: &neutron_remote::Site,
+    remote_dir: &str,
+    selected: &[String],
+) -> crate::term::Program {
+    let mut argv = crate::term::ssh_base_args(site);
+    let normalized = neutron_remote::path::normalize(remote_dir);
+    let mut note = format!(
+        "You are running inside Neutron over SSH on host {} in remote folder {}.",
+        site.display(),
+        normalized
+    );
+    if !selected.is_empty() {
+        note.push_str(" Selected items:");
+        for item in selected.iter().take(50) {
+            note.push_str(&format!("\n- {item}"));
+        }
+    }
+    let remote_cmd =
+        if let Some(win_dir) = neutron_remote::sftp::windows_path_from_sftp(&normalized) {
+            let wd = win_dir.replace('\'', "''");
+            let n = note.replace('\'', "''");
+            match agent {
+                Agent::Claude => format!(
+                    "powershell -NoExit -Command \"Set-Location -LiteralPath '{wd}'; claude --permission-mode acceptEdits --append-system-prompt '{n}'\""
+                ),
+                Agent::Antigravity => format!(
+                    "powershell -NoExit -Command \"Set-Location -LiteralPath '{wd}'; agy --mode accept-edits\""
+                ),
+            }
+        } else {
+            let dir_q = neutron_remote::sftp::shell_quote_posix(&normalized);
+            match agent {
+                Agent::Claude => format!(
+                    "cd {dir_q} && exec ${{SHELL:-/bin/sh}} -l -c {} _ {}",
+                    neutron_remote::sftp::shell_quote_posix(
+                        "exec claude --permission-mode acceptEdits --append-system-prompt \"$1\""
+                    ),
+                    neutron_remote::sftp::shell_quote_posix(&note),
+                ),
+                Agent::Antigravity => format!(
+                    "cd {dir_q} && exec ${{SHELL:-/bin/sh}} -l -c {}",
+                    neutron_remote::sftp::shell_quote_posix("exec agy --mode accept-edits"),
+                ),
+            }
+        };
+    argv.push(remote_cmd);
+    crate::term::Program { command: Some(argv), env: Vec::new() }
+}
+
 /// What the agent is told about where it is.
 fn context(dir: &Path, selected: &[PathBuf]) -> String {
     let mut text = format!(
@@ -335,5 +387,32 @@ mod tests {
         let config = &argv[argv.iter().position(|a| a == "--mcp-config").unwrap() + 1];
         assert!(config.contains("\"--mcp\""));
         assert!(argv.last().unwrap().contains("/tmp/a.txt"), "told what was selected");
+    }
+
+    #[test]
+    fn remote_agents_launch_over_ssh_in_remote_folder() {
+        let site = neutron_remote::Site {
+            id: "mini".into(),
+            label: "Mac mini".into(),
+            protocol: neutron_remote::Protocol::Sftp,
+            host: "100.97.247.34".into(),
+            port: None,
+            username: "razeen".into(),
+            path: None,
+            fingerprint: None,
+            auth: neutron_remote::Auth::Agent,
+            trusted_cert: None,
+        };
+        let claude = remote_program(Agent::Claude, &site, "/Users/razeen/proj", &["main.rs".into()])
+            .command
+            .unwrap();
+        assert_eq!(claude[0..2], ["ssh", "-t"]);
+        assert!(claude.last().unwrap().contains("claude --permission-mode acceptEdits"));
+        assert!(claude.last().unwrap().contains("main.rs"));
+
+        let agy = remote_program(Agent::Antigravity, &site, "/Users/razeen/proj", &[])
+            .command
+            .unwrap();
+        assert!(agy.last().unwrap().contains("agy --mode accept-edits"));
     }
 }

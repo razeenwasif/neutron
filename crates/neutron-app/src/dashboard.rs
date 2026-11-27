@@ -87,6 +87,8 @@ pub fn show(
 pub enum Chosen {
     /// Go to a place.
     Go(NodeId),
+    /// Inspect storage breakdown for a volume in Storage Lens.
+    Inspect(NodeId),
     /// Open a file that was opened before.
     Open(std::path::PathBuf),
     /// Drop one from the recent list.
@@ -108,7 +110,7 @@ fn body(
 
     let mut chosen = None;
     if let Some(volume) = volumes.iter().find(|v| v.capacity.is_some()) {
-        chosen = storage_card(ui, p, volume).map(Chosen::Go).or(chosen);
+        chosen = storage_card(ui, p, volume).or(chosen);
         ui.add_space(14.0);
     }
 
@@ -117,7 +119,7 @@ fn body(
             continue;
         }
         section(ui, p, &format!("{server_name} · Storage"));
-        chosen = remote_storage_row(ui, p, vols).map(Chosen::Go).or(chosen);
+        chosen = remote_storage_row(ui, p, vols).or(chosen);
         ui.add_space(12.0);
     }
 
@@ -184,10 +186,16 @@ fn section(ui: &mut Ui, p: &Palette, label: &str) {
 }
 
 /// The startup volume: how much is free in large type, how full in a bar.
-fn storage_card(ui: &mut Ui, p: &Palette, volume: &Place) -> Option<NodeId> {
+fn storage_card(ui: &mut Ui, p: &Palette, volume: &Place) -> Option<Chosen> {
     let cap = volume.capacity?;
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 96.0), Sense::click());
-    card(ui, p, rect, response.hovered());
+    let inspect_rect = Rect::from_min_size(pos2(rect.right() - 78.0, rect.top() + 12.0), vec2(56.0, 22.0));
+    let inspect_resp = ui.interact(
+        inspect_rect,
+        ui.id().with(("dash-inspect-local", &volume.id)),
+        Sense::click(),
+    );
+    card(ui, p, rect, response.hovered() && !inspect_resp.hovered());
 
     let painter = ui.painter();
     let left = rect.left() + 22.0;
@@ -198,6 +206,7 @@ fn storage_card(ui: &mut Ui, p: &Palette, volume: &Place) -> Option<NodeId> {
         theme::strong(ui.ctx(), 10.0),
         p.text_faint,
     );
+    draw_inspect_pill(painter, p, inspect_rect, inspect_resp.hovered());
     let free = neutron_ui::format::size(Some(cap.free));
     let big = painter.layout_no_wrap(free, theme::strong(ui.ctx(), 30.0), p.text);
     let big_width = big.size().x;
@@ -234,11 +243,17 @@ fn storage_card(ui: &mut Ui, p: &Palette, volume: &Place) -> Option<NodeId> {
             x += 12.0 + width + 18.0;
         }
     }
-    response.clicked().then(|| volume.id.clone())
+    if inspect_resp.clicked() {
+        Some(Chosen::Inspect(volume.id.clone()))
+    } else if response.clicked() && !inspect_resp.hovered() {
+        Some(Chosen::Go(volume.id.clone()))
+    } else {
+        None
+    }
 }
 
 /// Side-by-side storage cards for a remote host's internal and external SSDs.
-fn remote_storage_row(ui: &mut Ui, p: &Palette, vols: &[Place]) -> Option<NodeId> {
+fn remote_storage_row(ui: &mut Ui, p: &Palette, vols: &[Place]) -> Option<Chosen> {
     let mut chosen = None;
     let columns = vols.len().clamp(1, 3);
     let width = ((ui.available_width() - GAP * (columns - 1) as f32) / columns as f32).floor();
@@ -249,8 +264,8 @@ fn remote_storage_row(ui: &mut Ui, p: &Palette, vols: &[Place]) -> Option<NodeId
                 if n > 0 {
                     ui.add_space(GAP);
                 }
-                if remote_storage_card(ui, p, vol, width) {
-                    chosen = Some(vol.id.clone());
+                if let Some(hit) = remote_storage_card(ui, p, vol, width) {
+                    chosen = Some(hit);
                 }
             }
         });
@@ -259,12 +274,18 @@ fn remote_storage_row(ui: &mut Ui, p: &Palette, vols: &[Place]) -> Option<NodeId
     chosen
 }
 
-fn remote_storage_card(ui: &mut Ui, p: &Palette, volume: &Place, width: f32) -> bool {
+fn remote_storage_card(ui: &mut Ui, p: &Palette, volume: &Place, width: f32) -> Option<Chosen> {
     let (rect, response) = ui.allocate_exact_size(vec2(width, 84.0), Sense::click());
     if !ui.is_rect_visible(rect) {
-        return response.clicked();
+        return None;
     }
-    card(ui, p, rect, response.hovered());
+    let inspect_rect = Rect::from_min_size(pos2(rect.right() - 104.0, rect.top() + 11.0), vec2(52.0, 20.0));
+    let inspect_resp = ui.interact(
+        inspect_rect,
+        ui.id().with(("dash-inspect-remote", &volume.id)),
+        Sense::click(),
+    );
+    card(ui, p, rect, response.hovered() && !inspect_resp.hovered());
 
     let painter = ui.painter();
     let plate = Rect::from_min_size(pos2(rect.left() + 16.0, rect.top() + 14.0), vec2(32.0, 32.0));
@@ -278,6 +299,7 @@ fn remote_storage_card(ui: &mut Ui, p: &Palette, volume: &Place, width: f32) -> 
         p.text,
     );
     painter.galley(pos2(text_left, rect.top() + 13.0), name_galley, p.text);
+    draw_inspect_pill(painter, p, inspect_rect, inspect_resp.hovered());
 
     if let Some(cap) = volume.capacity {
         let used = cap.total.saturating_sub(cap.free);
@@ -313,7 +335,32 @@ fn remote_storage_card(ui: &mut Ui, p: &Palette, volume: &Place, width: f32) -> 
         }
     }
 
-    response.clicked()
+    if inspect_resp.clicked() {
+        Some(Chosen::Inspect(volume.id.clone()))
+    } else if response.clicked() && !inspect_resp.hovered() {
+        Some(Chosen::Go(volume.id.clone()))
+    } else {
+        None
+    }
+}
+
+fn draw_inspect_pill(painter: &egui::Painter, p: &Palette, rect: Rect, hovered: bool) {
+    let fill = if hovered { p.hover } else { p.raised };
+    let fg = if hovered { p.text } else { p.text_muted };
+    painter.rect_filled(rect, egui::CornerRadius::same(theme::RADIUS_CONTROL), fill);
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(theme::RADIUS_CONTROL),
+        egui::Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Inspect",
+        egui::FontId::proportional(10.5),
+        fg,
+    );
 }
 
 /// Recent files, as a grid of cards.
