@@ -20,6 +20,41 @@ the binary cross-built from a Linux shell; that distribution is gone and the
 
 ---
 
+## Apple Silicon & Tailscale SFTP Baseline (2026-11-28)
+
+**Machine:** Apple M2 Pro, 16 GiB RAM (`17,179,869,184` bytes), macOS 27.0.1 (`aarch64-apple-darwin`).
+**Binary:** Release bundle `/Users/razeenwasif/Applications/Neutron.app/Contents/MacOS/neutron` (**20 MB**).
+**Test suite:** `934 passed, 0 failed, 11 ignored` across 11 crates (`crates/neutron-app/src/app/*.rs` modularized from 11,700-line `app.rs` into 8 submodules).
+
+### Live GUI App Footprint (Idle, 3s Post-Launch)
+
+| Metric | Measured | Command |
+|---|---:|---|
+| Idle RSS | **82.7 MiB** (`84,656 KB`) | `ps -o pid=,rss=,%cpu= -p 72340` |
+| Idle CPU | **0.0%** | `ps -o pid=,rss=,%cpu= -p 72340` |
+
+### Headless Directory Scaling — `neutron --bench <path> 8`
+
+First run is cold (excluded from warm statistics); remaining 7 runs are warm.
+
+| Directory | Entries | Cold Enumerate | Warm Median Enum | Warm Median Sort | Total (Warm Median) | Warm Mean µs/entry (Enum / Sort) |
+|---|---:|---:|---:|---:|---:|---:|
+| `/System/Library/Frameworks` | 340 | 101.06 ms | **10.06 ms** | **0.05 ms** | **10.11 ms** | 31.92 / 0.15 |
+| `/usr/bin` | 932 | 83.69 ms | **33.04 ms** | **0.25 ms** | **33.29 ms** | 36.26 / 0.29 |
+| Synthetic APFS dir (`/tmp/neutron-bench-100k`) | 100,000 | 2,548.82 ms | **2,488.90 ms** | **11.88 ms** | **2,500.78 ms** | 25.42 / 0.13 |
+
+- **Columnar sorting scales linearly at 0.13 µs/entry** (100,000 entries sorted in **11.88 ms** median).
+- APFS per-entry enumeration runs ~25.4 µs/entry because `FsNamespace::enumerate` reads POSIX metadata, Spotlight/Finder tags, and content-type information per entry inside a single synchronous pass; in the interactive GUI, enumeration runs strictly off the UI thread via `Loader`.
+
+### Tailscale & SFTP Transfer Baseline (`MacBook` ↔ `kagutsuchi.tailbc1fab.ts.net`)
+
+- **Tailscale RTT (3 packets, 0% loss):** min **71.00 ms**, avg **112.36 ms**, max **152.10 ms** (`stddev 33.13 ms`).
+- **64 MiB upload (`scp` baseline):** **3.274 s** (**19.55 MiB/s**).
+- **64 MiB download (`scp` baseline):** **2.180 s** (**29.36 MiB/s**).
+- Neutron's `neutron-remote` transport eliminates per-op TCP/SSH handshakes via a warm `Arc<Handle>` SSH pool, raises SFTP transfer windows to **4 MiB** with **256 KiB** chunks and **512 KiB** buffered I/O, and serves remote thumbnails from a local LRU cache.
+
+---
+
 ## ⚠ Historical: measuring from WSL needed `WSLENV`
 
 **This no longer applies.** The WSL distribution this was built from is gone and
