@@ -1034,13 +1034,11 @@ impl NeutronApp {
             C::InspectNtrCi => Some(Action::InspectNtrCi),
             C::ComparePanes => Some(Action::ToggleComparePanes),
             C::SaveWorkspaceLayout | C::SwitchWorkspaceLayout => Some(Action::OpenLayouts),
-            C::SyncPanes => self.compare_pair().and_then(|(lg, _, rg, _)| {
-                if self.workspace.focused == lg {
-                    Some(Action::SyncPaneToOther { src: lg, dst: rg })
-                } else if self.workspace.focused == rg {
-                    Some(Action::SyncPaneToOther { src: rg, dst: lg })
+            C::SyncPanes => self.compare_pair().map(|(lg, _, rg, _)| {
+                if self.workspace.focused == rg {
+                    Action::SyncPaneToOther { src: rg, dst: lg }
                 } else {
-                    Some(Action::SyncPaneToOther { src: lg, dst: rg })
+                    Action::SyncPaneToOther { src: lg, dst: rg }
                 }
             }),
 

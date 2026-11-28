@@ -701,9 +701,7 @@ fn draw_entry(
     let corners = egui::CornerRadius::same(crate::theme::RADIUS_WELL);
     if selected {
         ui.painter().rect_filled(rect, corners, p.selection);
-    } else if chosen {
-        ui.painter().rect_filled(rect, corners, p.card_hover);
-    } else if response.hovered() || is_cursor {
+    } else if chosen || response.hovered() || is_cursor {
         ui.painter().rect_filled(rect, corners, p.card_hover);
     }
 

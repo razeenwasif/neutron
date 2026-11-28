@@ -187,6 +187,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_7z_made_by_bsdtar_is_listed_and_extracted() {
         let dir = std::env::temp_dir().join(format!("neutron-7z-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);

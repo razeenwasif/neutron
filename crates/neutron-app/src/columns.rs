@@ -326,7 +326,7 @@ pub fn peek(tab: &Tab) -> Option<NodeId> {
     match tab.location() {
         NodeId::Path(dir) => {
             let full = dir.join(name);
-            (!is_package(&full)).then(|| NodeId::Path(full))
+            (!is_package(&full)).then_some(NodeId::Path(full))
         }
         NodeId::Remote { site, path } => {
             let joined = neutron_remote::path::join(path, name).ok()?;

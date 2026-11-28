@@ -1053,6 +1053,7 @@ mod outlines {
         p.circle_filled(u(c, 12.0, 17.0), 1.2 * k(), s.color);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_arc(
         out: &mut Vec<(f32, f32)>,
         cx: f32,

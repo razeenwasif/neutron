@@ -559,6 +559,7 @@ impl NeutronApp {
         Some((g1, t1, g2, t2))
     }
 
+    #[allow(clippy::type_complexity)]
     pub(super) fn pane_diff_for(
         &self,
         group_id: GroupId,

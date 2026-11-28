@@ -161,7 +161,6 @@ impl StorageLens {
                 }
                 let parent = match trimmed.rsplit_once('/') {
                     Some(("", _)) => "/",
-                    Some((p, _)) if p.is_empty() => "/",
                     Some((p, _)) => p,
                     None => "/",
                 };

@@ -483,6 +483,8 @@ struct SitesReply {
 }
 
 /// Incremental result from the sidebar scan.
+type RemoteSearchReply = (u64, String, String, Result<Vec<neutron_remote::RemoteSearchHit>, String>);
+
 enum PlacesUpdate {
     KnownFolders(Vec<Place>),
     Cloud(Place),
@@ -644,8 +646,8 @@ pub struct NeutronApp {
     last_remote_probe: Instant,
     remote_search_gen: u64,
     remote_search_site: Option<String>,
-    remote_search_tx: crossbeam_channel::Sender<(u64, String, String, Result<Vec<neutron_remote::RemoteSearchHit>, String>)>,
-    remote_search_rx: crossbeam_channel::Receiver<(u64, String, String, Result<Vec<neutron_remote::RemoteSearchHit>, String>)>,
+    remote_search_tx: crossbeam_channel::Sender<RemoteSearchReply>,
+    remote_search_rx: crossbeam_channel::Receiver<RemoteSearchReply>,
     remote_sizes: std::collections::HashMap<(String, String), u64>,
     remote_sizes_pending: std::collections::HashSet<(String, String)>,
     remote_sizes_version: u64,

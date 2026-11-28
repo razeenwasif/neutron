@@ -566,13 +566,13 @@ impl<'a> ThriftReader<'a> {
 
     fn skip_type(&mut self, ftype: u8) -> Result<(), String> {
         match ftype {
-            1 | 2 | 3 => {
+            1..=3 => {
                 // bool / i8
                 if ftype == 3 {
                     let _ = self.read_u8()?;
                 }
             }
-            4 | 5 | 6 => {
+            4..=6 => {
                 let _ = self.read_varint()?;
             }
             7 => {
