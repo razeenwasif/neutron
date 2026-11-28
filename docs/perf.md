@@ -24,27 +24,28 @@ the binary cross-built from a Linux shell; that distribution is gone and the
 
 **Machine:** Apple M2 Pro, 16 GiB RAM (`17,179,869,184` bytes), macOS 27.0.1 (`aarch64-apple-darwin`).
 **Binary:** Release bundle `/Users/razeenwasif/Applications/Neutron.app/Contents/MacOS/neutron` (**20 MB**).
-**Test suite:** `934 passed, 0 failed, 11 ignored` across 11 crates (`crates/neutron-app/src/app/*.rs` modularized from 11,700-line `app.rs` into 8 submodules).
+**Test suite:** `935 passed, 0 failed, 11 ignored` across 11 crates (`crates/neutron-app/src/app/*.rs` modularized from 11,700-line `app.rs` into 8 submodules).
 
 ### Live GUI App Footprint (Idle, 3s Post-Launch)
 
-| Metric | Measured | Command |
-|---|---:|---|
-| Idle RSS | **82.7 MiB** (`84,656 KB`) | `ps -o pid=,rss=,%cpu= -p 72340` |
-| Idle CPU | **0.0%** | `ps -o pid=,rss=,%cpu= -p 72340` |
+| Process | PID | RSS | Idle CPU | Notes |
+|---|---:|---:|---:|---|
+| **Neutron** (`/Applications/Neutron.app`) | `80303` | **78.8 MiB** (`80,656 KB`) | **0.0%** | Standalone Metal/`wgpu` UI + PTY + SFTP + PDF/viewer + fuzzy/search stack |
+| **Finder** (`/System/Library/CoreServices/Finder.app`) | `99380` | **20.9 MiB** (`21,424 KB`) | **0.2%** | System process backed by macOS shared AppKit/dyld framework cache |
 
-### Headless Directory Scaling — `neutron --bench <path> 8`
+### Headless Directory Scaling — `getattrlistbulk(2)` Deep-Dive (`neutron --bench <path> 8`)
 
-First run is cold (excluded from warm statistics); remaining 7 runs are warm.
+Replacing per-entry `std::fs::read_dir` + `lstat` + `getattrlist` + `getxattr` syscalls in `crates/neutron-shell/src/fs_macos.rs` with batched `getattrlistbulk(2)` (256 KiB kernel buffer, lazy `getxattr` only when `FinderInfo` carries color bits, and one-time UTI lookup per extension) yielded up to a **17.15× speedup** on APFS:
 
-| Directory | Entries | Cold Enumerate | Warm Median Enum | Warm Median Sort | Total (Warm Median) | Warm Mean µs/entry (Enum / Sort) |
+| Directory / Benchmark | Entries | Before (`read_dir` + `lstat`) | After (`getattrlistbulk`) | Sort (Warm Median) | Total (Warm Median) | Speedup vs Before |
 |---|---:|---:|---:|---:|---:|---:|
-| `/System/Library/Frameworks` | 340 | 101.06 ms | **10.06 ms** | **0.05 ms** | **10.11 ms** | 31.92 / 0.15 |
-| `/usr/bin` | 932 | 83.69 ms | **33.04 ms** | **0.25 ms** | **33.29 ms** | 36.26 / 0.29 |
-| Synthetic APFS dir (`/tmp/neutron-bench-100k`) | 100,000 | 2,548.82 ms | **2,488.90 ms** | **11.88 ms** | **2,500.78 ms** | 25.42 / 0.13 |
+| `/System/Library/Frameworks` | 340 | 10.06 ms | **6.64 ms** | 0.05 ms | **6.69 ms** | **1.5×** |
+| `/usr/bin` | 932 | 33.04 ms | **3.25 ms** | 0.16 ms | **3.41 ms** | **10.2×** |
+| Synthetic APFS dir (`/tmp/neutron-bench-100k`) | 100,000 | 2,488.90 ms | **145.11 ms** | 14.89 ms | **160.00 ms** | **17.15×** |
 
-- **Columnar sorting scales linearly at 0.13 µs/entry** (100,000 entries sorted in **11.88 ms** median).
-- APFS per-entry enumeration runs ~25.4 µs/entry because `FsNamespace::enumerate` reads POSIX metadata, Spotlight/Finder tags, and content-type information per entry inside a single synchronous pass; in the interactive GUI, enumeration runs strictly off the UI thread via `Loader`.
+- **vs. `/bin/ls -la` (warm median on the same 100,000-entry directory, piped to `/dev/null`):** `/bin/ls -la` took **771.00 ms** (`1,077.83 ms` cold, `min 749.19 ms`, `max 829.04 ms`). Neutron enumerated **and** natural-sorted all 100,000 entries in **160.00 ms** (**4.8× faster than `/bin/ls -la`**).
+- **100k budget check:** **160.00 ms** against Neutron's **200 ms** target ✅ (`1.47 µs/entry` enum mean, `0.176 µs/entry` sort mean).
+- **Cold run on 100,000 entries:** dropped from **2,548.82 ms** to **149.73 ms** (**17.0× faster**).
 
 ### Tailscale & SFTP Transfer Baseline (`MacBook` ↔ `kagutsuchi.tailbc1fab.ts.net`)
 

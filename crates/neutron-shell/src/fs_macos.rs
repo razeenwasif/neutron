@@ -14,45 +14,331 @@ impl Namespace for FsNamespace {
     fn handles(&self, id: &NodeId) -> bool { id.is_filesystem() }
     fn enumerate(&self, id: &NodeId) -> Result<EntryList, NamespaceError> {
         let path = id.as_path().ok_or_else(|| NamespaceError::Unsupported(id.to_string()))?;
-        let mut list = EntryList::new();
-        for entry in std::fs::read_dir(path)? {
-            let Ok(entry) = entry else { continue };
-            let Ok(meta) = entry.path().symlink_metadata() else { continue };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let link = meta.file_type().is_symlink();
-            let mut directory = meta.is_dir() || (link && entry.path().is_dir());
-            // An application, a Pages document, a photo library: a folder on
-            // disk, a single item to the user. Listed as a file so activating
-            // it opens it with its application, the way Finder does.
-            if directory && is_package(&entry.path(), link) { directory = false; }
-            let mut attrs = 0;
+        match enumerate_bulk(path) {
+            Ok(list) => Ok(list),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL)) => {
+                enumerate_fallback(path).map_err(Into::into)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+const ATTR_CMN_NAME: u32 = 0x0000_0001;
+const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
+const ATTR_CMN_CRTIME: u32 = 0x0000_0200;
+const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+const ATTR_CMN_FNDRINFO: u32 = 0x0000_4000;
+const ATTR_CMN_ACCESSMASK: u32 = 0x0002_0000;
+const ATTR_CMN_FLAGS: u32 = 0x0004_0000;
+const ATTR_CMN_ADDEDTIME: u32 = 0x1000_0000;
+const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
+const VREG: u32 = 1;
+const VDIR: u32 = 2;
+const VLNK: u32 = 5;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AttrSet {
+    commonattr: u32,
+    volattr: u32,
+    dirattr: u32,
+    fileattr: u32,
+    forkattr: u32,
+}
+
+unsafe extern "C" {
+    fn getattrlistbulk(
+        dirfd: libc::c_int,
+        alist: *mut libc::attrlist,
+        attributeBuffer: *mut libc::c_void,
+        bufferSize: libc::size_t,
+        options: libc::c_ulong,
+    ) -> libc::c_int;
+}
+
+struct OwnedFd(libc::c_int);
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { libc::close(self.0) };
+        }
+    }
+}
+
+#[inline]
+fn read_unaligned<T: Copy>(buf: &[u8], off: &mut usize) -> Option<T> {
+    let sz = std::mem::size_of::<T>();
+    if *off + sz > buf.len() {
+        return None;
+    }
+    let val = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(*off).cast::<T>()) };
+    *off += sz;
+    Some(val)
+}
+
+#[inline]
+fn ts_to_millis(sec: i64, nsec: i64) -> i64 {
+    sec.saturating_mul(1000).saturating_add(nsec / 1_000_000)
+}
+
+/// Fast macOS directory enumeration via `getattrlistbulk(2)`: fetches name,
+/// vnode type, timestamps, Finder info, permissions, BSD flags, added time,
+/// and file length in bulk batches without per-entry `lstat`/`getattrlist`/`getxattr`.
+fn enumerate_bulk(path: &Path) -> Result<EntryList, std::io::Error> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = OwnedFd(raw_fd);
+
+    let mut req = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: ATTR_CMN_RETURNED_ATTRS
+            | ATTR_CMN_NAME
+            | ATTR_CMN_OBJTYPE
+            | ATTR_CMN_CRTIME
+            | ATTR_CMN_MODTIME
+            | ATTR_CMN_FNDRINFO
+            | ATTR_CMN_ACCESSMASK
+            | ATTR_CMN_FLAGS
+            | ATTR_CMN_ADDEDTIME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: ATTR_FILE_DATALENGTH,
+        forkattr: 0,
+    };
+
+    let mut list = EntryList::new();
+    let mut buf = vec![0u8; 256 * 1024];
+
+    loop {
+        let count = unsafe {
+            getattrlistbulk(
+                fd.0,
+                &mut req,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::FSOPT_NOFOLLOW as u64,
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if count == 0 {
+            break;
+        }
+
+        let mut rec_off = 0usize;
+        for _ in 0..count {
+            if rec_off + 4 > buf.len() {
+                break;
+            }
+            let rec_len = unsafe {
+                std::ptr::read_unaligned(buf.as_ptr().add(rec_off).cast::<u32>())
+            } as usize;
+            if rec_len < 24 || rec_off + rec_len > buf.len() {
+                break;
+            }
+            let rec = &buf[rec_off..rec_off + rec_len];
+            rec_off += rec_len;
+
+            let mut off = 4usize;
+            let Some(ret) = read_unaligned::<AttrSet>(rec, &mut off) else { continue };
+            let cmn = ret.commonattr;
+
+            let mut name_owned: Option<String> = None;
+            if cmn & ATTR_CMN_NAME != 0 {
+                let name_field_off = off;
+                let Some(data_offset) = read_unaligned::<i32>(rec, &mut off) else { continue };
+                let Some(data_len) = read_unaligned::<u32>(rec, &mut off) else { continue };
+                let str_start = (name_field_off as isize + data_offset as isize) as usize;
+                let str_end = str_start.saturating_add(data_len as usize).min(rec.len());
+                if str_start <= str_end {
+                    let raw = &rec[str_start..str_end];
+                    let trimmed = match raw.iter().position(|&b| b == 0) {
+                        Some(z) => &raw[..z],
+                        None => raw,
+                    };
+                    name_owned = Some(String::from_utf8_lossy(trimmed).into_owned());
+                }
+            }
+            let Some(name) = name_owned else { continue };
+            if name.is_empty() || name == "." || name == ".." {
+                continue;
+            }
+
+            let mut obj_type = VREG;
+            if cmn & ATTR_CMN_OBJTYPE != 0 {
+                if let Some(t) = read_unaligned::<u32>(rec, &mut off) {
+                    obj_type = t;
+                }
+            }
+
+            let mut created = 0i64;
+            if cmn & ATTR_CMN_CRTIME != 0 {
+                if let (Some(sec), Some(nsec)) = (
+                    read_unaligned::<i64>(rec, &mut off),
+                    read_unaligned::<i64>(rec, &mut off),
+                ) {
+                    created = ts_to_millis(sec, nsec);
+                }
+            }
+
+            let mut modified = 0i64;
+            if cmn & ATTR_CMN_MODTIME != 0 {
+                if let (Some(sec), Some(nsec)) = (
+                    read_unaligned::<i64>(rec, &mut off),
+                    read_unaligned::<i64>(rec, &mut off),
+                ) {
+                    modified = ts_to_millis(sec, nsec);
+                }
+            }
+
+            let mut alias = false;
+            let mut has_label_color = false;
+            if cmn & ATTR_CMN_FNDRINFO != 0 {
+                if let Some(fndr) = read_unaligned::<[u8; 32]>(rec, &mut off) {
+                    let fndr_flags = u16::from_be_bytes([fndr[8], fndr[9]]);
+                    alias = (fndr_flags & 0x8000) != 0;
+                    has_label_color = (fndr_flags & 0x000E) != 0;
+                }
+            }
+
+            let mut readonly = false;
+            if cmn & ATTR_CMN_ACCESSMASK != 0 {
+                if let Some(mode) = read_unaligned::<u32>(rec, &mut off) {
+                    readonly = (mode & 0o222) == 0;
+                }
+            }
+
+            let mut st_flags = 0u32;
+            if cmn & ATTR_CMN_FLAGS != 0 {
+                if let Some(flags) = read_unaligned::<u32>(rec, &mut off) {
+                    st_flags = flags;
+                }
+            }
+
+            let mut added = 0i64;
+            if cmn & ATTR_CMN_ADDEDTIME != 0 {
+                if let (Some(sec), Some(nsec)) = (
+                    read_unaligned::<i64>(rec, &mut off),
+                    read_unaligned::<i64>(rec, &mut off),
+                ) {
+                    added = ts_to_millis(sec, nsec);
+                }
+            }
+
+            let mut size = 0u64;
+            if ret.fileattr & ATTR_FILE_DATALENGTH != 0 {
+                if let Some(len) = read_unaligned::<i64>(rec, &mut off) {
+                    size = len.max(0) as u64;
+                }
+            }
+
+            let link = obj_type == VLNK;
+            let is_dir_raw = obj_type == VDIR;
+            let mut directory = is_dir_raw;
+
+            // Only materialize a Child PathBuf when an entry is a symlink, a
+            // directory with an extension (possible .app/.rtfd package), a tagged
+            // item, or a file with a never-before-seen extension.
+            let mut child_buf: Option<std::path::PathBuf> = None;
+
+            if link {
+                let cp = child_buf.get_or_insert_with(|| path.join(&name)).as_path();
+                directory = cp.is_dir();
+                if directory && is_package(cp, true) {
+                    directory = false;
+                }
+            } else if directory && name.contains('.') {
+                let cp = child_buf.get_or_insert_with(|| path.join(&name)).as_path();
+                if is_package(cp, false) {
+                    directory = false;
+                }
+            }
+
+            let mut attrs = 0u32;
             if directory { attrs |= attr::DIRECTORY; }
             if link { attrs |= attr::REPARSE_POINT; }
-            // Dot-files, and items carrying UF_HIDDEN the way Finder hides ~/Library.
-            if name.starts_with('.') || meta.st_flags() & UF_HIDDEN != 0 { attrs |= attr::HIDDEN; }
-            if meta.permissions().readonly() { attrs |= attr::READONLY; }
-            // Its tag colours, for the dots beside its name: one attribute
-            // read, which for an untagged file is a quick "not there".
-            attrs |= (crate::tags::colors(&entry.path()) as u32) << attr::TAG_SHIFT;
-            let kind = if directory { EntryKind::Directory }
-                else if link { EntryKind::Symlink } else { EntryKind::File };
-            // The system's name for this kind of file, learned from the first
-            // file of each extension met: once per extension, not per file.
-            if kind == EntryKind::File {
-                learn_kind(&entry.path());
+            if name.starts_with('.') || (st_flags & UF_HIDDEN) != 0 { attrs |= attr::HIDDEN; }
+            if readonly { attrs |= attr::READONLY; }
+            if has_label_color {
+                let cp = child_buf.get_or_insert_with(|| path.join(&name)).as_path();
+                attrs |= (crate::tags::colors(cp) as u32) << attr::TAG_SHIFT;
             }
-            list.push(&Entry { name, kind, size: meta.len(), attrs,
-                modified: millis(meta.modified()), created: millis(meta.created()),
-                sync: sync_state(meta.st_flags()) });
-            let (added, alias) = facts(&entry.path());
-            if alias {
-                let i = list.len() - 1;
-                list.mark(i, attr::ALIAS);
+
+            let kind = if directory {
+                EntryKind::Directory
+            } else if link {
+                EntryKind::Symlink
+            } else {
+                EntryKind::File
+            };
+            if kind == EntryKind::File
+                && let Some((_, ext)) = name.rsplit_once('.')
+                && !neutron_core::kinds::known(ext)
+            {
+                let cp = child_buf.get_or_insert_with(|| path.join(&name)).as_path();
+                learn_kind(cp);
             }
-            list.set_added(list.len() - 1, added);
+
+            list.push(&Entry {
+                name,
+                kind,
+                size,
+                attrs,
+                modified,
+                created,
+                sync: sync_state(st_flags),
+            });
+            let idx = list.len() - 1;
+            if alias || link {
+                list.mark(idx, attr::ALIAS);
+            }
+            list.set_added(idx, added);
         }
-        Ok(list)
     }
+
+    Ok(list)
+}
+
+fn enumerate_fallback(path: &Path) -> Result<EntryList, std::io::Error> {
+    let mut list = EntryList::new();
+    for entry in std::fs::read_dir(path)? {
+        let Ok(entry) = entry else { continue };
+        let Ok(meta) = entry.path().symlink_metadata() else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let link = meta.file_type().is_symlink();
+        let mut directory = meta.is_dir() || (link && entry.path().is_dir());
+        if directory && is_package(&entry.path(), link) { directory = false; }
+        let mut attrs = 0;
+        if directory { attrs |= attr::DIRECTORY; }
+        if link { attrs |= attr::REPARSE_POINT; }
+        if name.starts_with('.') || meta.st_flags() & UF_HIDDEN != 0 { attrs |= attr::HIDDEN; }
+        if meta.permissions().readonly() { attrs |= attr::READONLY; }
+        attrs |= (crate::tags::colors(&entry.path()) as u32) << attr::TAG_SHIFT;
+        let kind = if directory { EntryKind::Directory }
+            else if link { EntryKind::Symlink } else { EntryKind::File };
+        if kind == EntryKind::File {
+            learn_kind(&entry.path());
+        }
+        list.push(&Entry { name, kind, size: meta.len(), attrs,
+            modified: millis(meta.modified()), created: millis(meta.created()),
+            sync: sync_state(meta.st_flags()) });
+        let (added, alias) = facts(&entry.path());
+        if alias {
+            let i = list.len() - 1;
+            list.mark(i, attr::ALIAS);
+        }
+        list.set_added(list.len() - 1, added);
+    }
+    Ok(list)
 }
 
 /// The sync state implied by a file's BSD flags.
@@ -287,6 +573,38 @@ mod tests {
         let opened = last_opened(Path::new(&first));
         assert!(opened > 1_600_000_000_000, "{first}: {opened}");
         assert_eq!(last_opened(Path::new("/definitely/not/here")), 0);
+    }
+
+    #[test]
+    fn bulk_enumerate_captures_metadata_aliases_hidden_and_tags() {
+        let dir = std::env::temp_dir().join(format!("neutron-bulk-enum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, "123456789").unwrap();
+        std::fs::write(dir.join(".secret"), "h").unwrap();
+        std::os::unix::fs::symlink("hello.txt", dir.join("sym")).unwrap();
+        crate::tags::toggle_color(std::slice::from_ref(&file), 6, true).unwrap();
+
+        let list = FsNamespace.enumerate(&NodeId::path(&dir)).unwrap();
+        let find = |n: &str| (0..list.len()).find(|&i| list.name(i) == n).unwrap();
+
+        let hi = find("hello.txt");
+        assert_eq!(list.size(hi), 9);
+        assert!(list.added(hi) > 0);
+        assert_eq!(list.tag_colors(hi), 1 << (6 - 1));
+
+        let si = find("sub");
+        assert_eq!(list.kind(si), EntryKind::Directory);
+
+        let di = find(".secret");
+        assert!(list.attrs(di) & attr::HIDDEN != 0);
+
+        let li = find("sym");
+        assert_eq!(list.kind(li), EntryKind::Symlink);
+        assert!(list.is_alias(li));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
