@@ -40,6 +40,10 @@ fn main() {
         "install" => install(&rest),
         #[cfg(target_os = "macos")]
         "bundle" => macos::bundle(&rest).map(|_| ()),
+        #[cfg(target_os = "macos")]
+        "sign" => macos::sign(&rest),
+        #[cfg(target_os = "macos")]
+        "notarize" => macos::notarize(&rest),
         "uninstall" => uninstall(),
         "where" => show_paths(),
         other => {
@@ -61,6 +65,10 @@ const USAGE: &str = "\
 cargo xtask <command>
 
   bundle [--debug]    build target/<profile>/Neutron.app (macOS)
+  sign [app] [--identity <id>]
+                      sign Neutron.app with Developer ID + runtime (macOS)
+  notarize [app] [--profile <p>] [--identity <id>] [--no-dmg]
+                      notarize, staple, and package Neutron.dmg (macOS)
   install [--debug]   build and copy Neutron into %LOCALAPPDATA%\\Programs\\Neutron
   uninstall           remove that folder
   where               print the paths involved and what is currently installed";
