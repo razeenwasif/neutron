@@ -58,24 +58,98 @@ pub fn show(ui: &mut Ui, p: &Palette, id: Id, screen: &vt100::Screen, exited: bo
         });
     }
 
-    // --- selection, in cells ---
+    // --- selection, or SGR mouse reporting when a program asks for it ---
     let cell_at = |pos: egui::Pos2| -> Cell {
         let col = ((pos.x - grid.left()) / cell_w).floor().clamp(0.0, (cols - 1) as f32) as u16;
         let row = ((pos.y - grid.top()) / cell_h).floor().clamp(0.0, (rows - 1) as f32) as u16;
         (row, col)
     };
+    let (events, shift_held) = ui.input(|i| (i.events.clone(), i.modifiers.shift));
+    let mouse_mode = screen.mouse_protocol_mode();
+    let mouse_app = mouse_mode != vt100::MouseProtocolMode::None && !shift_held;
+
+    let btn_id = id.with("mouse_btn");
+    let cell_id = id.with("mouse_cell");
     let sel_id = id.with("selection");
-    let mut selection: Option<(Cell, Cell)> = ui.data(|d| d.get_temp(sel_id));
-    if response.drag_started() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            selection = Some((cell_at(pos), cell_at(pos)));
+    let mut selection: Option<(Cell, Cell)> = if mouse_app { None } else { ui.data(|d| d.get_temp(sel_id)) };
+
+    if mouse_app {
+        let mut active_btn: Option<u8> = ui.data(|d| d.get_temp(btn_id));
+        let mut last_cell: Option<Cell> = ui.data(|d| d.get_temp(cell_id));
+        for event in &events {
+            match event {
+                egui::Event::PointerButton { pos, button, pressed: true, .. } if rect.contains(*pos) => {
+                    if let Some(code) = pointer_code(*button) {
+                        let cell = cell_at(*pos);
+                        out.input.extend_from_slice(&sgr_mouse_bytes(code, cell.0, cell.1, true));
+                        active_btn = Some(code);
+                        last_cell = Some(cell);
+                    }
+                }
+                egui::Event::PointerButton { pos, button, pressed: false, .. } => {
+                    if let Some(code) = pointer_code(*button)
+                        && (active_btn == Some(code) || rect.contains(*pos))
+                    {
+                        if !matches!(mouse_mode, vt100::MouseProtocolMode::Press) {
+                            let cell = cell_at(*pos);
+                            out.input.extend_from_slice(&sgr_mouse_bytes(code, cell.0, cell.1, false));
+                        }
+                        if active_btn == Some(code) {
+                            active_btn = None;
+                            last_cell = None;
+                        }
+                    }
+                }
+                egui::Event::PointerMoved(pos) => {
+                    let report_drag = matches!(
+                        mouse_mode,
+                        vt100::MouseProtocolMode::ButtonMotion | vt100::MouseProtocolMode::AnyMotion
+                    ) && active_btn.is_some();
+                    let report_any = matches!(mouse_mode, vt100::MouseProtocolMode::AnyMotion)
+                        && active_btn.is_none()
+                        && rect.contains(*pos);
+                    if report_drag || report_any {
+                        let cell = cell_at(*pos);
+                        if last_cell != Some(cell) {
+                            last_cell = Some(cell);
+                            let code = active_btn.map_or(35, |b| 32 + b);
+                            out.input.extend_from_slice(&sgr_mouse_bytes(code, cell.0, cell.1, true));
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
-    } else if response.dragged() {
-        if let (Some(pos), Some((start, _))) = (response.interact_pointer_pos(), selection) {
-            selection = Some((start, cell_at(pos)));
+        ui.data_mut(|d| {
+            match active_btn {
+                Some(b) => {
+                    d.insert_temp(btn_id, b);
+                }
+                None => d.remove::<u8>(btn_id),
+            }
+            match last_cell {
+                Some(c) => {
+                    d.insert_temp(cell_id, c);
+                }
+                None => d.remove::<Cell>(cell_id),
+            }
+        });
+    } else {
+        ui.data_mut(|d| {
+            d.remove::<u8>(btn_id);
+            d.remove::<Cell>(cell_id);
+        });
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                selection = Some((cell_at(pos), cell_at(pos)));
+            }
+        } else if response.dragged() {
+            if let (Some(pos), Some((start, _))) = (response.interact_pointer_pos(), selection) {
+                selection = Some((start, cell_at(pos)));
+            }
+        } else if response.clicked() {
+            selection = None;
         }
-    } else if response.clicked() {
-        selection = None;
     }
     ui.data_mut(|d| match selection {
         Some(s) => {
@@ -177,10 +251,18 @@ pub fn show(ui: &mut Ui, p: &Palette, id: Id, screen: &vt100::Screen, exited: bo
 
     // --- keys ---
     if focused {
-        let events = ui.input(|i| i.events.clone());
-        for event in events {
+        let meta_key_handled = events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::Key { key, pressed: true, modifiers, .. }
+                    if modifiers.alt && key_bytes(*key, *modifiers, screen.application_cursor()).is_some()
+            )
+        });
+        for event in &events {
             match event {
-                egui::Event::Text(text) => out.input.extend_from_slice(text.as_bytes()),
+                egui::Event::Text(text) if !meta_key_handled => {
+                    out.input.extend_from_slice(text.as_bytes());
+                }
                 egui::Event::Paste(text) => {
                     let text = text.replace("\r\n", "\r").replace('\n', "\r");
                     if screen.bracketed_paste() {
@@ -197,7 +279,7 @@ pub fn show(ui: &mut Ui, p: &Palette, id: Id, screen: &vt100::Screen, exited: bo
                     }
                 }
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                    if let Some(bytes) = key_bytes(key, modifiers, screen.application_cursor()) {
+                    if let Some(bytes) = key_bytes(*key, *modifiers, screen.application_cursor()) {
                         out.input.extend_from_slice(&bytes);
                     }
                 }
@@ -259,9 +341,60 @@ pub fn key_bytes(key: Key, mods: Modifiers, application_cursor: bool) -> Option<
         Key::PageDown => b"\x1b[6~",
         Key::Delete => b"\x1b[3~",
         Key::Insert => b"\x1b[2~",
-        _ => return None,
+        _ => {
+            if mods.alt
+                && let Some(b) = alt_byte(key, mods.shift)
+            {
+                return Some(vec![0x1b, b]);
+            }
+            return None;
+        }
     };
     Some(seq.to_vec())
+}
+
+fn alt_byte(key: Key, shift: bool) -> Option<u8> {
+    let name = key.name();
+    if name.len() == 1 {
+        let b = name.as_bytes()[0];
+        if b.is_ascii_alphabetic() {
+            return Some(if shift { b } else { b.to_ascii_lowercase() });
+        }
+        if b.is_ascii_digit() && !shift {
+            return Some(b);
+        }
+    }
+    match key {
+        Key::Space => Some(b' '),
+        Key::Period => Some(if shift { b'>' } else { b'.' }),
+        Key::Comma => Some(if shift { b'<' } else { b',' }),
+        Key::Minus => Some(if shift { b'_' } else { b'-' }),
+        Key::Plus => Some(b'+'),
+        Key::Equals => Some(if shift { b'+' } else { b'=' }),
+        Key::Slash => Some(if shift { b'?' } else { b'/' }),
+        Key::Backslash => Some(if shift { b'|' } else { b'\\' }),
+        Key::OpenBracket => Some(if shift { b'{' } else { b'[' }),
+        Key::CloseBracket => Some(if shift { b'}' } else { b']' }),
+        Key::Semicolon => Some(if shift { b':' } else { b';' }),
+        Key::Quote => Some(if shift { b'"' } else { b'\'' }),
+        Key::Backtick => Some(if shift { b'~' } else { b'`' }),
+        _ => None,
+    }
+}
+
+fn pointer_code(button: egui::PointerButton) -> Option<u8> {
+    match button {
+        egui::PointerButton::Primary => Some(0),
+        egui::PointerButton::Middle => Some(1),
+        egui::PointerButton::Secondary => Some(2),
+        _ => None,
+    }
+}
+
+/// Encodes an SGR mouse event (`\x1b[<btn;col;rowM` or `m`).
+pub fn sgr_mouse_bytes(button: u8, row: u16, col: u16, press: bool) -> Vec<u8> {
+    let suffix = if press { 'M' } else { 'm' };
+    format!("\x1b[<{button};{};{}{suffix}", col + 1, row + 1).into_bytes()
 }
 
 /// A cell's text and background colours; `None` for the default background.
@@ -341,6 +474,20 @@ mod tests {
         assert_eq!(key_bytes(Key::Tab, Modifiers::SHIFT, false), Some(b"\x1b[Z".to_vec()));
         assert_eq!(key_bytes(Key::A, none, false), None, "arrives as text");
         assert_eq!(key_bytes(Key::W, Modifiers::MAC_CMD, false), None, "Command is Neutron's");
+        assert_eq!(key_bytes(Key::F, Modifiers::ALT, false), Some(b"\x1bf".to_vec()), "Option-F sends Esc+f");
+        assert_eq!(
+            key_bytes(Key::F, Modifiers::ALT | Modifiers::SHIFT, false),
+            Some(b"\x1bF".to_vec()),
+            "Option-Shift-F sends Esc+F"
+        );
+        assert_eq!(key_bytes(Key::Period, Modifiers::ALT, false), Some(b"\x1b.".to_vec()));
+    }
+
+    #[test]
+    fn sgr_mouse_encodes_press_drag_and_release() {
+        assert_eq!(sgr_mouse_bytes(0, 4, 9, true), b"\x1b[<0;10;5M");
+        assert_eq!(sgr_mouse_bytes(0, 4, 9, false), b"\x1b[<0;10;5m");
+        assert_eq!(sgr_mouse_bytes(32, 0, 0, true), b"\x1b[<32;1;1M");
     }
 
     #[test]

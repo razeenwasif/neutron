@@ -9,3 +9,8 @@ pub fn pages(_path: &Path) -> Result<Vec<[f32; 2]>, String> {
 pub fn render(_path: &Path, _page: usize, _width: usize) -> Result<(usize, usize, Vec<u8>), String> {
     Err("PDFs are drawn only on the Mac".to_owned())
 }
+
+
+pub fn page_texts(_path: &Path) -> Result<Vec<String>, String> {
+    Err("PDFs are drawn only on the Mac".to_owned())
+}

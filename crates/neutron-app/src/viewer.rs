@@ -59,6 +59,8 @@ impl TextDoc {
 pub struct PdfDoc {
     /// Each page's size, in points.
     pub pages: Vec<[f32; 2]>,
+    /// Extracted text of each page (empty when no text layer exists).
+    pub texts: Vec<String>,
     /// Pages drawn, by page and the width in pixels they were drawn at.
     pub drawn: HashMap<(usize, u32), egui::TextureHandle>,
     asked: HashSet<(usize, u32)>,
@@ -233,15 +235,35 @@ impl View {
         self.found_for = self.find.clone();
         self.matches.clear();
         self.current = 0;
-        let text = match &self.doc {
-            Doc::Text(t) => t,
-            Doc::Markdown(md) => &md.raw,
-            _ => return,
-        };
         let needle = self.find.to_lowercase();
         if needle.is_empty() {
             return;
         }
+        match &self.doc {
+            Doc::Text(text) => Self::find_in_lines(text, &needle, &mut self.matches),
+            Doc::Markdown(md) => Self::find_in_lines(&md.raw, &needle, &mut self.matches),
+            Doc::Pdf(pdf) => {
+                for (page, content) in pdf.texts.iter().enumerate() {
+                    let lower = content.to_lowercase();
+                    let mut from = 0;
+                    while let Some(at) = lower[from..].find(&needle) {
+                        self.matches.push((page, 0..0));
+                        from += at + needle.len().max(1);
+                        if self.matches.len() >= 100_000 {
+                            break;
+                        }
+                    }
+                    if self.matches.len() >= 100_000 {
+                        break;
+                    }
+                }
+            }
+            _ => return,
+        }
+        self.reveal = self.matches.first().map(|(line, _)| *line);
+    }
+
+    fn find_in_lines(text: &TextDoc, needle: &str, matches: &mut Vec<(usize, Range<usize>)>) {
         for (i, range) in text.lines.iter().enumerate() {
             let line = text.text[range.clone()].to_lowercase();
             // Lowercasing can change byte lengths outside ASCII; matches are
@@ -250,15 +272,14 @@ impl View {
                 continue;
             }
             let mut from = 0;
-            while let Some(at) = line[from..].find(&needle) {
-                self.matches.push((i, from + at..from + at + needle.len()));
+            while let Some(at) = line[from..].find(needle) {
+                matches.push((i, from + at..from + at + needle.len()));
                 from += at + needle.len().max(1);
-                if self.matches.len() >= 100_000 {
+                if matches.len() >= 100_000 {
                     return;
                 }
             }
         }
-        self.reveal = self.matches.first().map(|(line, _)| *line);
     }
 
     /// Moves to the next match, or the one before.
@@ -271,8 +292,18 @@ impl View {
         self.reveal = Some(self.matches[self.current].0);
     }
 
-    /// The selected lines, or the whole text, to copy.
+    /// The selected lines, or the whole text (or PDF text), to copy.
     pub fn copy_text(&self) -> Option<String> {
+        if let Doc::Pdf(pdf) = &self.doc {
+            let joined = pdf
+                .texts
+                .iter()
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            return (!joined.is_empty()).then_some(joined);
+        }
         let text = match &self.doc {
             Doc::Text(t) => t,
             Doc::Markdown(md) => &md.raw,
@@ -390,7 +421,11 @@ fn build_text_doc(text: String, path: &Path, truncated: bool) -> TextDoc {
 fn pdf_doc(path: &Path) -> Doc {
     match neutron_shell::pdf::pages(path) {
         Ok(pages) if pages.is_empty() => Doc::Failed("This PDF has no pages.".into()),
-        Ok(pages) => Doc::Pdf(PdfDoc { pages, drawn: HashMap::new(), asked: HashSet::new(), used: Vec::new() }),
+        Ok(pages) => {
+            let mut texts = neutron_shell::pdf::page_texts(path).unwrap_or_default();
+            texts.resize(pages.len(), String::new());
+            Doc::Pdf(PdfDoc { pages, texts, drawn: HashMap::new(), asked: HashSet::new(), used: Vec::new() })
+        }
         Err(e) => Doc::Failed(format!("This PDF cannot be shown: {e}")),
     }
 }
@@ -488,5 +523,32 @@ mod tests {
         assert!(matches!(load(&dir.join("notes")), Doc::Text(_)));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(can_show("paper.pdf") && can_show("main.rs") && can_show("README") && !can_show("movie.mov"));
+    }
+
+    #[test]
+    fn pdf_find_and_copy_use_extracted_page_texts() {
+        let pdf = PdfDoc {
+            pages: vec![[612.0, 792.0], [612.0, 792.0]],
+            texts: vec!["First page summary".into(), "Second page TARGET target".into()],
+            drawn: HashMap::new(),
+            asked: HashSet::new(),
+            used: Vec::new(),
+        };
+        let mut view = View {
+            doc: Doc::Pdf(pdf),
+            zoom: 1.0,
+            find: "target".into(),
+            matches: Vec::new(),
+            current: 0,
+            found_for: String::new(),
+            selected: None,
+            reveal: None,
+            markdown_raw: false,
+        };
+        view.refind();
+        assert_eq!(view.matches, vec![(1, 0..0), (1, 0..0)]);
+        assert_eq!(view.reveal, Some(1));
+        let copied = view.copy_text().expect("copyable text");
+        assert!(copied.contains("First page") && copied.contains("Second page"));
     }
 }

@@ -81,9 +81,17 @@ pub fn show(ui: &mut Ui, p: &Palette, path: &Path, view: &mut View, pages: PageA
         if matches!(view.doc, Doc::Tensor(_)) {
             ui.add(egui::TextEdit::singleline(&mut view.find).hint_text("Filter tensors…").desired_width(190.0));
         }
-        if matches!(view.doc, Doc::Text(_)) || (matches!(view.doc, Doc::Markdown(_)) && view.markdown_raw) {
-            if ui.button("Copy").on_hover_text("Copy the selected lines, or everything").clicked() {
-                ask = view.copy_text().map(Ask::Copy);
+        let searchable = matches!(view.doc, Doc::Text(_) | Doc::Pdf(_))
+            || (matches!(view.doc, Doc::Markdown(_)) && view.markdown_raw);
+        if searchable {
+            let copy_text = view.copy_text();
+            let hint = if matches!(view.doc, Doc::Pdf(_)) {
+                "Copy extracted text from this PDF"
+            } else {
+                "Copy the selected lines, or everything"
+            };
+            if ui.add_enabled(copy_text.is_some(), egui::Button::new("Copy")).on_hover_text(hint).clicked() {
+                ask = copy_text.map(Ask::Copy);
             }
             let total = view.matches.len();
             if ui.add_enabled(total > 0, egui::Button::new("↓")).clicked() {
@@ -138,7 +146,10 @@ pub fn show(ui: &mut Ui, p: &Palette, path: &Path, view: &mut View, pages: PageA
                 ask = Some(a);
             }
         }
-        Doc::Pdf(pdf) => pdf_body(&mut body_ui, p, pdf, zoom, &pages),
+        Doc::Pdf(pdf) => {
+            let active_page = view.matches.get(view.current).map(|(pg, _)| *pg);
+            pdf_body(&mut body_ui, p, pdf, zoom, &pages, PdfFind { matches: &view.matches, active_page, reveal });
+        }
         Doc::Image(_) => {
             let size = match &view.doc {
                 Doc::Image(img) => img.size,
@@ -258,9 +269,15 @@ fn text_body(
     })
 }
 
+struct PdfFind<'a> {
+    matches: &'a [(usize, std::ops::Range<usize>)],
+    active_page: Option<usize>,
+    reveal: Option<usize>,
+}
+
 /// A PDF: its pages one above the next, drawn as they come into view, at the
 /// width they are shown.
-fn pdf_body(ui: &mut Ui, p: &Palette, pdf: &mut PdfDoc, zoom: f32, pages: &PageAsker<'_>) {
+fn pdf_body(ui: &mut Ui, p: &Palette, pdf: &mut PdfDoc, zoom: f32, pages: &PageAsker<'_>, find: PdfFind<'_>) {
     let rect = ui.max_rect();
     let fit = (rect.width() - 48.0).clamp(200.0, 1100.0);
     let width = fit * zoom;
@@ -280,7 +297,13 @@ fn pdf_body(ui: &mut Ui, p: &Palette, pdf: &mut PdfDoc, zoom: f32, pages: &PageA
     // Drawn at a width rounded up to a step, so zooming does not draw every
     // page again for every few points.
     let pixels = (((width * ppp) / 256.0).ceil() * 256.0) as u32;
-    egui::ScrollArea::both().auto_shrink([false; 2]).id_salt("viewer-pdf").show_viewport(ui, |ui, shown| {
+    let mut scroll = egui::ScrollArea::both().auto_shrink([false; 2]).id_salt("viewer-pdf");
+    if let Some(target) = find.reveal
+        && let Some(&top) = tops.get(target)
+    {
+        scroll = scroll.vertical_scroll_offset((top - PAGE_GAP).max(0.0));
+    }
+    scroll.show_viewport(ui, |ui, shown| {
         let full = (width + 48.0).max(rect.width());
         ui.set_min_size(vec2(full, total));
         let origin = ui.max_rect().min;
@@ -306,9 +329,18 @@ fn pdf_body(ui: &mut Ui, p: &Palette, pdf: &mut PdfDoc, zoom: f32, pages: &PageA
                     ui.painter().text(r.center(), Align2::CENTER_CENTER, format!("Page {}", page + 1), FontId::proportional(12.0), Color32::GRAY);
                 }
             }
+            let hits = find.matches.iter().filter(|(pg, _)| *pg == page).count();
+            if hits > 0 {
+                let active = find.active_page == Some(page);
+                let stroke = Stroke::new(if active { 2.0 } else { 1.5 }, theme::with_alpha(p.accent, if active { 235 } else { 140 }));
+                ui.painter().rect_stroke(r, 2.0, stroke, egui::StrokeKind::Outside);
+                let tag = if hits == 1 { "1 match".to_owned() } else { format!("{hits} matches") };
+                let badge = Rect::from_min_size(pos2(r.right() - 78.0, r.top() + 8.0), vec2(70.0, 20.0));
+                ui.painter().rect_filled(badge, 4.0, theme::with_alpha(p.accent, 225));
+                ui.painter().text(badge.center(), Align2::CENTER_CENTER, tag, FontId::proportional(11.0), Color32::WHITE);
+            }
         }
     });
-    let _ = p;
 }
 
 /// An image: fitted to the pane, never enlarged past its size, then zoomed.

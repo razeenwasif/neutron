@@ -36,6 +36,38 @@ pub fn pages(path: &Path) -> Result<Vec<[f32; 2]>, String> {
         .collect())
 }
 
+#[link(name = "PDFKit", kind = "framework")]
+unsafe extern "C" {}
+
+/// Extracts plain text for each page using PDFKit. Blocks on the disk: call it from a worker.
+pub fn page_texts(path: &Path) -> Result<Vec<String>, String> {
+    use objc2::msg_send;
+    use objc2::rc::{Allocated, Retained};
+    use objc2::runtime::AnyClass;
+    use objc2_foundation::{NSObject, NSString, NSURL};
+
+    let cls = AnyClass::get(c"PDFDocument").ok_or("PDFKit is unavailable")?;
+    let path_str = path.to_str().ok_or("the PDF's path cannot be named to macOS")?;
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
+    let raw: Allocated<NSObject> = unsafe { msg_send![cls, alloc] };
+    let doc: Option<Retained<NSObject>> = unsafe { msg_send![raw, initWithURL: &*url] };
+    let doc = doc.ok_or("this is not a PDF macOS can extract text from")?;
+    let count: usize = unsafe { msg_send![&*doc, pageCount] };
+    let mut texts = Vec::with_capacity(count);
+    for i in 0..count {
+        let page: Option<Retained<NSObject>> = unsafe { msg_send![&*doc, pageAtIndex: i] };
+        let text = page
+            .and_then(|p| unsafe {
+                let s: Option<Retained<NSString>> = msg_send![&*p, string];
+                s
+            })
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        texts.push(text);
+    }
+    Ok(texts)
+}
+
 /// Page `page` (from zero) drawn `width` pixels wide on white: its width,
 /// height and RGBA pixels. Blocks: call it from a worker.
 pub fn render(path: &Path, page: usize, width: usize) -> Result<(usize, usize, Vec<u8>), String> {
@@ -117,6 +149,14 @@ mod tests {
         assert_eq!(at(10, 390), [0, 0, 0], "the square, at the bottom left");
         assert_eq!(at(150, 10), [255, 255, 255], "white paper at the top right");
         assert_eq!(at(110, 390), [255, 255, 255], "the square ends at half the width");
+        assert_eq!(page_texts(&path).unwrap(), vec![String::new()]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_pdf_fails_cleanly_for_pages_and_text() {
+        let bogus = std::env::temp_dir().join("neutron-nonexistent-test.pdf");
+        assert!(pages(&bogus).is_err());
+        assert!(page_texts(&bogus).is_err());
     }
 }

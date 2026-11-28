@@ -66,6 +66,9 @@ pub fn program(agent: Agent, dir: &Path, selected: &[PathBuf]) -> crate::term::P
             argv.push(me);
             // Reads and edits without asking, as Claude Code is started.
             argv.extend(["--mode".into(), "accept-edits".into()]);
+            if !selected.is_empty() {
+                argv.extend(["--prompt-interactive".into(), context(dir, selected)]);
+            }
         }
     }
     crate::term::Program { command: Some(argv), env }
@@ -99,9 +102,17 @@ pub fn remote_program(
                 Agent::Claude => format!(
                     "powershell -NoExit -Command \"Set-Location -LiteralPath '{wd}'; claude --permission-mode acceptEdits --append-system-prompt '{n}'\""
                 ),
-                Agent::Antigravity => format!(
-                    "powershell -NoExit -Command \"Set-Location -LiteralPath '{wd}'; agy --mode accept-edits\""
-                ),
+                Agent::Antigravity => {
+                    if selected.is_empty() {
+                        format!(
+                            "powershell -NoExit -Command \"Set-Location -LiteralPath '{wd}'; agy --mode accept-edits\""
+                        )
+                    } else {
+                        format!(
+                            "powershell -NoExit -Command \"Set-Location -LiteralPath '{wd}'; agy --mode accept-edits --prompt-interactive '{n}'\""
+                        )
+                    }
+                }
             }
         } else {
             let dir_q = neutron_remote::sftp::shell_quote_posix(&normalized);
@@ -113,10 +124,22 @@ pub fn remote_program(
                     ),
                     neutron_remote::sftp::shell_quote_posix(&note),
                 ),
-                Agent::Antigravity => format!(
-                    "cd {dir_q} && exec ${{SHELL:-/bin/sh}} -l -c {}",
-                    neutron_remote::sftp::shell_quote_posix("exec agy --mode accept-edits"),
-                ),
+                Agent::Antigravity => {
+                    if selected.is_empty() {
+                        format!(
+                            "cd {dir_q} && exec ${{SHELL:-/bin/sh}} -l -c {}",
+                            neutron_remote::sftp::shell_quote_posix("exec agy --mode accept-edits"),
+                        )
+                    } else {
+                        format!(
+                            "cd {dir_q} && exec ${{SHELL:-/bin/sh}} -l -c {} _ {}",
+                            neutron_remote::sftp::shell_quote_posix(
+                                "exec agy --mode accept-edits --prompt-interactive \"$1\""
+                            ),
+                            neutron_remote::sftp::shell_quote_posix(&note),
+                        )
+                    }
+                }
             }
         };
     argv.push(remote_cmd);
@@ -414,5 +437,17 @@ mod tests {
             .command
             .unwrap();
         assert!(agy.last().unwrap().contains("agy --mode accept-edits"));
+
+        let local_ctx = program(Agent::Antigravity, Path::new("/tmp"), &[PathBuf::from("/tmp/main.rs")])
+            .command
+            .unwrap();
+        let idx = local_ctx.iter().position(|a| a == "--prompt-interactive").expect("prompt-interactive flag");
+        assert!(local_ctx[idx + 1].contains("/tmp/main.rs"));
+
+        let remote_ctx = remote_program(Agent::Antigravity, &site, "/Users/razeen/proj", &["main.rs".into()])
+            .command
+            .unwrap();
+        assert!(remote_ctx.last().unwrap().contains("--prompt-interactive"));
+        assert!(remote_ctx.last().unwrap().contains("main.rs"));
     }
 }

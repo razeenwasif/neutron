@@ -94,7 +94,9 @@ impl Kind {
             Kind::Image => "kMDItemContentTypeTree == \"public.image\"",
             Kind::Movie => "kMDItemContentTypeTree == \"public.movie\"",
             Kind::Music => "kMDItemContentTypeTree == \"public.audio\"",
-            Kind::Code => "kMDItemContentTypeTree == \"public.source-code\"",
+            Kind::Code => {
+                "(kMDItemContentTypeTree == \"public.source-code\" || kMDItemFSName == \"*.rs\"c || kMDItemFSName == \"*.toml\"c || kMDItemFSName == \"*.ts\"c || kMDItemFSName == \"*.tsx\"c || kMDItemFSName == \"*.js\"c || kMDItemFSName == \"*.jsx\"c || kMDItemFSName == \"*.mjs\"c || kMDItemFSName == \"*.py\"c || kMDItemFSName == \"*.go\"c || kMDItemFSName == \"*.zig\"c || kMDItemFSName == \"*.swift\"c || kMDItemFSName == \"*.c\"c || kMDItemFSName == \"*.h\"c || kMDItemFSName == \"*.cpp\"c || kMDItemFSName == \"*.hpp\"c || kMDItemFSName == \"*.java\"c || kMDItemFSName == \"*.kt\"c || kMDItemFSName == \"*.rb\"c || kMDItemFSName == \"*.sh\"c || kMDItemFSName == \"*.sql\"c || kMDItemFSName == \"*.yaml\"c || kMDItemFSName == \"*.yml\"c || kMDItemFSName == \"*.json\"c || kMDItemFSName == \"*.css\"c || kMDItemFSName == \"*.html\"c)"
+            }
             Kind::Application => "kMDItemContentType == \"com.apple.application-bundle\"",
             Kind::Archive => "kMDItemContentTypeTree == \"public.archive\"",
         }
@@ -295,6 +297,9 @@ mod tests {
         );
         let contents = Query { text: "x".into(), contents: true, ..Default::default() };
         assert!(contents.predicate().contains("kMDItemTextContent"));
+        let code = Query { kind: Some(Kind::Code), ..Default::default() };
+        let pred = code.predicate();
+        assert!(pred.contains("public.source-code") && pred.contains("*.rs") && pred.contains("*.toml") && pred.contains("*.tsx"));
         assert!(Query::default().is_empty());
     }
 
